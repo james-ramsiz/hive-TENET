@@ -1,0 +1,8 @@
+model User {
+  id             String   @id @default(uuid())
+  worldIdHash    String   @unique // Prevents multi-accounting
+  walletAddress  String   @unique
+  accuracyScore  Float    @default(100.0) // Used in Layer 3
+  isShadowBanned Boolean  @default(false)
+  createdAt      DateTime @default(now())
+}
