@@ -1,0 +1,39 @@
+import { Queue, Worker } from 'bullmq';
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
+const connection = { host: 'localhost', port: 6379 };
+
+// Queue where jobs go after 3 users have swiped right
+const consensusQueue = new Queue('job-consensus', { connection });
+
+// Worker that processes the consensus
+const worker = new Worker('job-consensus', async (job) => {
+  const { jobId, submissions } = job.data; 
+  // submissions = [{ userId: '1', answer: 'cat' }, { userId: '2', answer: 'cat' }, { userId: '3', answer: 'dog' }]
+
+  // 1. Find the majority answer
+  const answers = submissions.map(s => s.answer);
+  const counts = {};
+  answers.forEach(ans => counts[ans] = (counts[ans] || 0) + 1);
+  
+  const majorityAnswer = Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b);
+  const majorityCount = counts[majorityAnswer];
+
+  // 2. If 2 out of 3 agree
+  if (majorityCount >= 2) {
+    // Pay the users who got it right
+    for (const sub of submissions) {
+      if (sub.answer === majorityAnswer) {
+        await payoutTokens(sub.userId, 10); // Mint 10 tokens
+      } else {
+        // The bot/attacker submitted the wrong answer
+        await penalizeAccuracy(sub.userId);
+      }
+    }
+  } else {
+    // No consensus (e.g., all 3 gave different answers). 
+    // Job is rejected, sent back to the queue for a new batch of 3 users.
+    await returnJobToPool(jobId);
+  }
+}, { connection });
