@@ -1,0 +1,15 @@
+gig-swipe-app/
+├── apps/
+│   ├── mobile-app/             # React Native (Expo) - Swipe UI, lightweight
+│   ├── admin-panel/            # React.js - Manage job postings, ban bots
+│   └── services/
+│       ├── matching-service/   # Go or Node.js - Handles Redis swipe logic
+│       ├── job-service/        # Node.js - CRUD for jobs
+│       └── token-service/      # Node.js - Ledger for token balances
+├── packages/
+│   ├── database/               # Postgres for users/jobs, Prisma schemas
+│   ├── redis-client/           # Shared Redis connection logic
+│   └── types/                  # Shared TypeScript types
+└── infrastructure/
+    ├── docker-compose.yml
+    └── terraform/              # AWS/GCP infra
