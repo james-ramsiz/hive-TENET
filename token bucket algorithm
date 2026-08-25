@@ -1,0 +1,34 @@
+// rate-limiter.ts
+import Redis from 'ioredis';
+
+const redis = new Redis();
+
+export async function checkAndConsumeLimit(apiKey: string, estimatedInputTokens: number, tier: 'free' | 'pro') {
+  const limits = tier === 'free' 
+    ? { tpm: 10000, rpd: 50 } // Free tier: 10k tokens/min, 50 requests/day
+    : { tpm: 200000, rpd: 5000 }; // Pro tier
+
+  const now = Date.now();
+  const minuteKey = `rl:tokens:${apiKey}`;
+  const dayKey = `rl:requests:${apiKey}`;
+
+  // 1. Check Daily Request Limit (Fixed Window)
+  const dailyRequests = await redis.incr(dayKey);
+  if (dailyRequests === 1) await redis.expireat(dayKey, Math.floor(now / 1000) + 86400); // expire in 24h
+  if (dailyRequests > limits.rpd) throw new Error('Daily request limit exceeded');
+
+  // 2. Check Tokens Per Minute (Sliding Window / Bucket)
+  // We subtract the tokens we are ABOUT to use from the bucket.
+  // Claude estimates input tokens before generation to prevent overloads.
+  const remainingTokens = await redis.get(minuteKey) || limits.tpm;
+  
+  if (parseInt(remainingTokens) < estimatedInputTokens) {
+    throw new Error('TPM Rate limit exceeded. Please wait.');
+  }
+
+  // Consume the tokens
+  const newCount = parseInt(remainingTokens) - estimatedInputTokens;
+  await redis.set(minuteKey, newCount, 'EX', 60); // Reset bucket in 60s
+
+  return true;
+}
