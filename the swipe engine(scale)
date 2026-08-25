@@ -1,0 +1,58 @@
+// packages/matching-service/src/swipe.engine.ts
+import { createClient } from 'redis';
+
+const redis = createClient();
+await redis.connect();
+
+// We use Redis Sets to track who swiped what, and to find matches
+const JOB_QUEUE_KEY = 'active_job_queue'; // List of job IDs currently being swiped
+const JOB_SWIPES_KEY = (jobId: string) => `job:${jobId}:swipes`; // Set of user IDs who swiped right
+const USER_HISTORY_KEY = (userId: string) => `user:${userId}:seen_jobs`; // Set of jobs user already saw
+
+export async function processSwipe(userId: string, jobId: string, direction: 'left' | 'right') {
+  // 1. Record that the user has seen this job so we don't show it again
+  await redis.sAdd(USER_HISTORY_KEY(userId), jobId);
+
+  if (direction === 'left') {
+    return { status: 'DECLINED' };
+  }
+
+  // 2. If RIGHT, add the user to the job's potential candidates set
+  // Using SADD: Atomic operation, safe under high concurrency
+  const added = await redis.sAdd(JOB_SWIPES_KEY(jobId), userId);
+
+  if (!added) {
+    // User already swiped on this job (duplicate request/network retry)
+    return { status: 'ALREADY_APPLIED' };
+  }
+
+  // 3. Check if the job poster wants to auto-assign (first come, first serve) 
+  // OR if they want to manually review candidates.
+  // For a "get money quick" app, auto-assign is usually best.
+  const jobCapacity = 1; // How many people can do this job?
+  
+  // Atomic pop from the set to grab the winner
+  const winner = await redis.sPop(JOB_SWIPES_KEY(jobId), jobCapacity);
+  
+  if (winner.length > 0 && winner.includes(userId)) {
+    // 4. Trigger job assignment via Kafka/Event Bus
+    // publishToKafka('job.assigned', { jobId, userId: winner[0] });
+    
+    // Clear the remaining swipes to free up Redis memory
+    await redis.del(JOB_SWIPES_KEY(jobId));
+    
+    return { status: 'MATCHED', jobId };
+  }
+
+  return { status: 'PENDING' };
+}
+
+// Function to get the "Deck of Cards" for the user
+export async function getJobDeck(userId: string, limit: number = 10) {
+  // Get jobs the user hasn't seen yet using SDIFF
+  // Active Jobs MINUS Jobs User Has Seen
+  const unseenJobs = await redis.sDiff(JOB_QUEUE_KEY, USER_HISTORY_KEY(userId));
+  
+  // Return the top 'limit' jobs
+  return unseenJobs.slice(0, limit).map(jobId => ({ id: jobId, /* fetch job details from cache */ }));
+}
