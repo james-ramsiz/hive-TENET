@@ -1,0 +1,33 @@
+import { PrismaClient } from '@prisma/client';
+import Redis from 'ioredis';
+
+const prisma = new PrismaClient();
+const redis = new Redis();
+
+export async function getJobDeck(userId: string) {
+  // 1. Fetch user state
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  
+  // 2. Shadow Ban Logic: If accuracy drops below 70%, starve them of jobs
+  if (user.accuracyScore < 70.0 || user.isShadowBanned) {
+    // Return an empty deck. The attacker's app shows "Loading..." or "No jobs"
+    // This drains their battery and wastes their time without alerting them they are banned
+    return []; 
+  }
+
+  // 3. Fetch jobs normally if they are a good actor
+  // (Using Redis SDIFF logic from the previous answer)
+  const unseenJobs = await redis.sDiff('active_job_queue', `user:${userId}:seen`);
+  
+  return unseenJobs.slice(0, 10).map(jobId => ({ id: jobId }));
+}
+
+// Helper function called by the Consensus Engine
+export async function penalizeAccuracy(userId: string) {
+  await prisma.user.update({
+    where: { id: userId },
+    data: { 
+      accuracyScore: { decrement: 15.0 } // Drop score by 15% per wrong consensus
+    }
+  });
+}
