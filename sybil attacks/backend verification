@@ -1,0 +1,40 @@
+import { verifyCloudProof } from '@worldcoin/idkit';
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+export async function handleSignup(req, res) {
+  const { proof, signal } = req.body; // signal is usually the user's wallet address
+
+  try {
+    // 1. Verify the ZKP with World ID's servers
+    const verifyResponse = await verifyCloudProof(proof, {
+      app_id: process.env.WORLD_APP_ID,
+      action: 'signup',
+      signal: signal,
+    });
+
+    if (!verifyResponse.success) {
+      return res.status(401).json({ error: 'World ID verification failed' });
+    }
+
+    // 2. Extract the unique hash
+    const nullifierHash = verifyResponse.nullifier_hash;
+
+    // 3. Attempt to create user. 
+    // If the attacker tries to sign up again, Prisma throws a P2002 Unique Constraint error
+    const user = await prisma.user.create({
+      data: {
+        worldIdHash: nullifierHash,
+        walletAddress: signal,
+      },
+    });
+
+    return res.status(201).json({ userId: user.id });
+  } catch (error) {
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'You already have an account.' });
+    }
+    return res.status(500).json({ error: 'Server error' });
+  }
+}
