@@ -1,0 +1,20 @@
+microgig/
+├── infra/
+│   ├── terraform/             # VPC, MSK, RDS, Elasticache
+│   └── helm/                 # per-service Helm charts
+├── libs/
+│   ├── proto/                # .proto definitions
+│   ├── tokensec/            # token economics library
+│   └── redistool/           # Lua scripts + helpers
+├── services/
+│   ├── auth/
+│   ├── swipe/
+│   ├── job/
+│   ├── profile/
+│   ├── batch-adapter/
+│   └── workers/
+│       ├── ledger/
+│       ├── reputation/
+│       └── notifier/
+└── gateway/
+    └── envoy.yaml
