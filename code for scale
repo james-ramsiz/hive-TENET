@@ -1,0 +1,67 @@
+// packages/payment-service/src/services/escrow.service.ts
+import { PrismaClient, Prisma } from '@prisma/client';
+
+const prisma = new PrismaClient();
+
+export async function releaseEscrow(bountyId: string, bidderId: string) {
+  // We use a serializable transaction to prevent race conditions
+  return await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    
+    // 1. Lock the Bounty row. `FOR UPDATE` prevents other transactions from reading/writing.
+    const bounty = await tx.bounty.findUnique({
+      where: { id: bountyId },
+    });
+
+    if (!bounty) throw new Error('Bounty not found');
+    if (bounty.status !== 'IN_PROGRESS') throw new Error('Bounty is not in progress');
+    if (bounty.winnerId !== bidderId) throw new Error('Unauthorized: Not the winner');
+
+    // 2. Lock the User wallet row to prevent double spending
+    const buyerWallet = await tx.wallet.findUnique({
+      where: { userId: bounty.creatorId },
+    });
+
+    if (!buyerWallet || buyerWallet.escrowBalance < bounty.amount) {
+      throw new Error('Insufficient escrow balance');
+    }
+
+    // 3. Debit buyer's escrow
+    await tx.wallet.update({
+      where: { userId: bounty.creatorId },
+      data: { 
+        escrowBalance: { decrement: bounty.amount } 
+      },
+    });
+
+    // 4. Calculate platform fee (e.g., 10%)
+    const platformFee = bounty.amount * 0.10;
+    const bidderPayout = bounty.amount - platformFee;
+
+    // 5. Credit the bidder's available balance
+    await tx.wallet.upsert({
+      where: { userId: bidderId },
+      update: { availableBalance: { increment: bidderPayout } },
+      create: { userId: bidderId, availableBalance: bidderPayout },
+    });
+
+    // 6. Credit platform's revenue account
+    await tx.wallet.update({
+      where: { userId: 'platform-revenue-account' },
+      data: { availableBalance: { increment: platformFee } },
+    });
+
+    // 7. Update bounty status
+    await tx.bounty.update({
+      where: { id: bountyId },
+      data: { status: 'COMPLETED', completedAt: new Date() },
+    });
+
+    // 8. Emit event to Kafka/Message broker (fire and forget)
+    // publishToKafka('bounty.completed', { bountyId, bidderId, payout: bidderPayout });
+
+    return { success: true, payout: bidderPayout };
+  }, {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable, // Highest isolation
+    timeout: 10000 // 10 seconds
+  });
+}
