@@ -1,0 +1,19 @@
+bounty-platform/
+├── apps/
+│   ├── web-app/                 # Next.js (React) - User Interface
+│   ├── admin-dashboard/         # React (Vite) - Internal Admin tools
+│   ├── api-gateway/             # Express/Fastify - Routes traffic
+│   └── services/
+│       ├── identity-service/    # Auth & Users
+│       ├── bounty-service/      # Job CRUD & Search
+│       ├── bidding-service/     # Bid logic
+│       └── payment-service/     # Escrow & Stripe integration
+├── packages/
+│   ├── database/               # Prisma schema, TypeORM entities, migrations
+│   ├── config/                 # ESLint, Tsconfig, Prettier
+│   ├── ui/                     # Shared React component library
+│   └── types/                  # Shared TypeScript types (e.g., Bounty, Bid interfaces)
+└── infrastructure/
+    ├── docker-compose.yml      # Local dev environment
+    ├── terraform/              # AWS/GCP infrastructure as code
+    └── k8s/                    # Kubernetes manifests for production deployment
