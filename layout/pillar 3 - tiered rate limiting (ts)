@@ -1,0 +1,24 @@
+import { Redis } from 'ioredis';
+import { TIER_LIMITS, Tier } from '@microgig/redistool';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+// Sliding window with two counters (current + previous hour)
+// Allows O(1) rate check; industry-standard approximation.
+export async function rateLimitAllow(userId: string, tier: Tier) {
+  const lim = TIER_LIMITS[tier];
+  const now = Date.now();
+  const hourBucket = Math.floor(now / 3_600_000);
+
+  const curKey  = `rl:${userId}:${hourBucket}`;
+  const prevKey = `rl:${userId}:${hourBucket - 1}`;
+
+  const [cur, prev] = await redis.mget(curKey, prevKey);
+  const count = Number(cur || 0) + Number(prev || 0);
+
+  if (count >= lim.swipesPerHour) return false;
+
+  await redis.incr(curKey);
+  await redis.expire(curKey, 7200); // keep prev bucket around
+  return true;
+}
