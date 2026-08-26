@@ -1,0 +1,47 @@
+import { Redis } from 'ioredis';
+import fs from 'fs';
+import path from 'path';
+
+const redis = new Redis(process.env.REDIS_URL!);
+const LOCK_LUA = fs.readFileSync(
+  path.join(__dirname, '../../lua/lock.lua'), 'utf8'
+);
+const LOCK_SHA = redis.script('LOAD', LOCK_LUA);
+
+export async function swipeRight(req, reply) {
+  const { jobId } = req.body as { jobId: string };
+  const userId = req.user.id;
+
+  // --- 1. Tiered rate limit (Pillar 3, see below) ---
+  const tier = await getTier(userId);
+  if (!await rateLimitAllow(userId, tier)) {
+    return reply.code(429).send({ err: 'rate_limited', retryIn });
+  }
+
+  // --- 2. Look up job reward (cached in Redis for ~60s) ---
+  const job = await getJobCached(jobId);
+  if (!job) return reply.code(404).send({ err: 'not_found' });
+
+  // --- 3. Pre-flight lock (atomic via Lua) ---
+  const ok = await redis.evalsha(
+    await LOCK_SHA, 3,
+    `lock:job:${jobId}`,
+    `usr:${userId}:pending`,
+    `usr:${userId}:balance`,
+    userId, job.reward_tokens, 300  // 5 min TTL
+  );
+
+  if (ok === 0)  return reply.code(409).send({ err: 'job_taken' });
+  if (ok === -1) return reply.code(402).send({ err: 'insufficient_tokens' });
+
+  // --- 4. Emit swipe.created (async) ---
+  await producer.send({
+    topic: 'swipe.created',
+    messages: [{
+      key: userId,
+      value: JSON.stringify({ userId, jobId, ts: Date.now() })
+    }]
+  });
+
+  return reply.send({ status: 'locked', jobId, reward: job.reward_tokens });
+}
