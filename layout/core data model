@@ -1,0 +1,15 @@
+CREATE TABLE users (
+  id            UUID PRIMARY KEY,
+  email         TEXT UNIQUE,
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  status        TEXT DEFAULT 'active'   -- active|banned|paused
+);
+
+CREATE TABLE reputation (
+  user_id           UUID PRIMARY KEY REFERENCES users(id),
+  tier              SMALLINT DEFAULT 1,             -- 1..5
+  accuracy_score    NUMERIC(4,3) DEFAULT 0.0,       -- 0.000..1.000
+  jobs_completed    INT DEFAULT 0,
+  jobs_rejected     INT DEFAULT 0,
+  updated_at        TIMESTAMPTZ DEFAULT now()
+);
