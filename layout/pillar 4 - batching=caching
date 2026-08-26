@@ -1,0 +1,44 @@
+import { Kafka } from 'kafkajs';
+import { Redis } from 'ioredis';
+import { randomUUID } from 'crypto';
+
+const kafka = new Kafka({ brokers: ['kafka:9092'] });
+const consumer = kafka.consumer({ groupId: 'batch-adapter' });
+const producer = kafka.producer();
+const redis = new Redis(process.env.REDIS_URL!);
+
+await consumer.connect();
+await consumer.subscribe({ topic: 'job.batch_requested', fromBeginning: true });
+
+await consumer.run({
+  eachMessage: async ({ message }) => {
+    const req = JSON.parse(message.value!.toString());
+    const batchId = randomUUID();
+
+    // 1. Create N "virtual" job slots, but only hydrate 10 in Redis.
+    const initialCount = Math.min(10, req.totalCount);
+    const jobIds: string[] = [];
+    for (let i = 0; i < initialCount; i++) {
+      const jobId = randomUUID();
+      jobIds.push(jobId);
+      await redis.hset(`job:${jobId}`, {
+        batchId, reward: req.reward, payload: JSON.stringify(req.items[i]),
+        posterId: req.posterId
+      });
+      await redis.expire(`job:${jobId}`, 86400);
+    }
+
+    // 2. Store remaining items in a Redis list (FIFO queue)
+    await redis.lpush(`batchq:${batchId}`,
+      ...req.items.slice(initialCount).map(JSON.stringify));
+
+    // 3. Publish batch metadata so the swipe deck knows about it
+    await producer.send({
+      topic: 'batch.published',
+      messages: [{
+        key: req.posterId,
+        value: JSON.stringify({ batchId, total: req.totalCount, initialJobs: jobIds })
+      }]
+    });
+  }
+});
