@@ -1,0 +1,9 @@
+export const TIER_LIMITS = {
+  1: { swipesPerHour: 10,  maxPending: 5 },     // new users / suspected bots
+  2: { swipesPerHour: 50,  maxPending: 25 },    // high accuracy
+  3: { swipesPerHour: 200, maxPending: 100 },   // verified pros
+  4: { swipesPerHour: 1000,maxPending: 500 },  // internal workforce
+  5: { swipesPerHour: 5000,maxPending: 2500 }  // enterprise API keys
+} as const;
+
+export type Tier = keyof typeof TIER_LIMITS;
