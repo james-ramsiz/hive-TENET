@@ -1,0 +1,18 @@
+// inside swipe service — called after a swipe locks a job
+async function refillBatch(batchId: string) {
+  const next = await redis.rpop(`batchq:${batchId}`);   // FIFO pop
+  if (!next) {
+    // Batch exhausted: emit batch.completed
+    await producer.send({
+      topic: 'batch.completed',
+      messages: [{ key: batchId, value: JSON.stringify({ batchId }) }]
+    });
+    return;
+  }
+  const jobId = randomUUID();
+  await redis.hset(`job:${jobId}`, {
+    batchId, reward: (await redis.hget(`batch:${batchId}`, 'reward'))!,
+    payload: next
+  });
+  await redis.sadd(`batch:${batchId}:jobs`, jobId);   // track active
+}
