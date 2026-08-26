@@ -1,0 +1,13 @@
+// services/swipe/src/lib/balance.ts
+export async function getBalance(userId: string): Promise<number> {
+  const cached = await redis.get(`bal:${userId}`);
+  if (cached) return Number(cached);
+
+  const row = await pool.query(
+    'SELECT balance, pending FROM token_balance WHERE user_id=$1', [userId]
+  );
+  const bal = row.rows[0]?.balance ?? 0;
+  // Cache for 5s — long enough to absorb a burst, short enough for freshness
+  await redis.set(`bal:${userId}`, bal, 'EX', 5);
+  return bal;
+}
