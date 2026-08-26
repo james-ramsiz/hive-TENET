@@ -1,0 +1,3 @@
+// services/workers/deck-builder/main.go
+// Reads new jobs from Kafka `job.published` and inserts into
+// Redis ZSET `deck:global` with score = reward*100 + freshnessBonus.
