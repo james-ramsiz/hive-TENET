@@ -1,0 +1,98 @@
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    "github.com/segmentio/kafka-go"
+    "github.com/jackc/pgx/v5/pgxpool"
+    "github.com/redis/go-redis/v9"
+)
+
+type CompletedEvent struct {
+    EventID   string `json:"eventId"`
+    UserID    string `json:"userId"`
+    JobID     string `json:"jobId"`
+    Reward    int    `json:"reward"`
+    TS        int64  `json:"ts"`
+    Idempotency string `json:"idempotency"`
+}
+
+func main() {
+    r := kafka.NewReader(kafka.ReaderConfig{
+        Brokers:  []string{"kafka:9092"},
+        Topic:    "job.completed",
+        GroupID:  "ledger-worker",
+        MinBytes: 1, MaxBytes: 10e6,
+    })
+    pool, _ := pgxpool.New(context.Background(), "postgres://ledger@db:5432/microgig")
+    rdb := redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+    for {
+        m, err := r.ReadMessage(context.Background())
+        if err != nil { continue }
+        var ev CompletedEvent
+        if err := json.Unmarshal(m.Value, &ev); err != nil { continue }
+
+        if err := applyLedger(pool, rdb, ev); err != nil {
+            fmt.Printf("ledger apply failed: %v\n", err)
+            // backoff + retry; Dead-letter topic after N attempts
+        }
+    }
+}
+
+func applyLedger(pool *pgxpool.Pool, rdb *redis.Client, ev CompletedEvent) error {
+    ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+    defer cancel()
+
+    tx, err := pool.Begin(ctx)
+    if err != nil { return err }
+    defer tx.Rollback(ctx)
+
+    // a) Idempotency guard in DB
+    var exists bool
+    if err := tx.QueryRow(ctx,
+        `SELECT EXISTS(SELECT 1 FROM token_ledger WHERE idempotency=$1)`,
+        ev.Idempotency).Scan(&exists); err != nil {
+        return err
+    }
+    if exists { return nil }     // already applied
+
+    // b) Update balance atomically using SELECT ... FOR UPDATE
+    var bal, pending int
+    var ver int64
+    if err := tx.QueryRow(ctx,
+        `SELECT balance, pending, version
+           FROM token_balance
+          WHERE user_id=$1
+          FOR UPDATE`, ev.UserID).Scan(&bal, &pending, &ver); err != nil {
+        return err
+    }
+
+    newBal := bal + ev.Reward
+    newPending := pending - ev.Reward   // we had pre-locked this reward
+
+    if _, err := tx.Exec(ctx,
+        `UPDATE token_balance
+            SET balance=$2, pending=$3, version=$4
+          WHERE user_id=$1 AND version=$5`,
+        ev.UserID, newBal, newPending, ver+1, ver); err != nil {
+        return err
+    }
+
+    if _, err := tx.Exec(ctx,
+        `INSERT INTO token_ledger
+           (user_id, delta, reason, ref_id, idempotency, balance_after)
+         VALUES ($1,$2,'job.completed',$3,$4,$5)`,
+        ev.UserID, ev.Reward, ev.JobID, ev.Idempotency, newBal); err != nil {
+        return err
+    }
+
+    if err := tx.Commit(ctx); err != nil { return err }
+
+    // c) Bust the cached balance in Redis so reads reflect truth
+    rdb.Del(ctx, "bal:"+ev.UserID)
+    return nil
+}
