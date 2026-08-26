@@ -1,0 +1,9 @@
+// Recomputes tier from accuracy_score every 1k events or 15 min, whichever first
+func recomputeTier(jobsDone, jobsRejected int, accuracy float64) int16 {
+    switch {
+    case accuracy >= 0.98 && jobsDone > 5000: return 4
+    case accuracy >= 0.95 && jobsDone > 1000: return 3
+    case accuracy >= 0.85 && jobsDone > 100:  return 2
+    default:                                  return 1
+    }
+}
