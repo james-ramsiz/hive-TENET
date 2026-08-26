@@ -1,0 +1,18 @@
+-- KEYS[1] = lock:job:<jobId>
+-- KEYS[2] = usr:<userId>:pending
+-- KEYS[3] = usr:<userId>:balance
+-- ARGV[1] = userId
+-- ARGV[2] = rewardTokens
+-- ARGV[3] = ttlSeconds
+
+local holder = redis.call('GET', KEYS[1])
+if holder then return 0 end                    -- job already locked
+
+local bal = tonumber(redis.call('GET', KEYS[3]) or '0')
+local pend = tonumber(redis.call('GET', KEYS[2]) or '0')
+local avail = bal - pend
+if avail < tonumber(ARGV[2]) then return -1 end   -- insufficient
+
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+redis.call('INCRBY', KEYS[2], ARGV[2])
+return 1
