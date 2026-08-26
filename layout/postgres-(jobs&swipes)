@@ -1,0 +1,20 @@
+CREATE TABLE jobs (
+  id            UUID PRIMARY KEY,
+  poster_id     UUID NOT NULL,
+  type          TEXT NOT NULL,        -- 'image_label' | 'data_entry' ...
+  reward_tokens INT NOT NULL,
+  status        TEXT DEFAULT 'open',  -- open|matched|done|cancelled
+  batch_id      UUID,                 -- if part of a batch
+  payload       JSONB,
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE swipes (
+  id            BIGSERIAL PRIMARY KEY,
+  user_id       UUID NOT NULL,
+  job_id        UUID NOT NULL,
+  decision      TEXT NOT NULL,        -- 'accept'|'reject'|'skip'
+  idempotency   TEXT UNIQUE,
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX ON swipes(user_id, created_at DESC);
