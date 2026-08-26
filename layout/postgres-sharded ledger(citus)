@@ -1,0 +1,19 @@
+-- Distributed by user_id so each user's ledger lives on one shard
+CREATE TABLE token_ledger (
+  id            BIGSERIAL,
+  user_id       UUID NOT NULL,
+  delta         INT  NOT NULL,        -- +reward / -spend
+  reason        TEXT NOT NULL,        -- 'job.completed' | 'job.cancelled'
+  ref_id        UUID,                 -- job_id
+  idempotency   TEXT UNIQUE,          -- dedup key from client
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  balance_after INT
+);
+SELECT create_distributed_table('token_ledger','user_id');
+
+CREATE TABLE token_balance (
+  user_id       UUID PRIMARY KEY,
+  balance       INT NOT NULL DEFAULT 0,
+  pending       INT NOT NULL DEFAULT 0,   -- locked, not yet finalized
+  version       BIGINT NOT NULL DEFAULT 0  -- optimistic concurrency
+);
