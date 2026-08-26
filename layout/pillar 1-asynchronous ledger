@@ -1,0 +1,45 @@
+import { Kafka } from 'kafkajs';
+import { randomUUID } from 'crypto';
+import { Redis } from 'ioredis';
+import type { JobRepo } from '../repos/JobRepo';
+
+const kafka = new Kafka({ brokers: process.env.KAFKA!.split(',') });
+const producer = kafka.producer();
+const redis = new Redis(process.env.REDIS_URL!);
+
+export async function completeJob(req, reply) {
+  const { jobId } = req.body as { jobId: string };
+  const userId = req.user.id;
+  const idempotency = `complete:${userId}:${jobId}`;
+
+  // 1. Idempotency check (Redis SETNX, TTL 24h)
+  const seen = await redis.set(idempotency, '1', 'NX', 'EX', 86400);
+  if (seen !== 'OK') return reply.code(409).send({ err: 'duplicate' });
+
+  // 2. Validate job + that this user holds the lock
+  const job = await JobRepo.find(jobId);
+  if (!job) return reply.code(404).send({ err: 'not_found' });
+
+  const lockKey = `lock:job:${jobId}`;
+  const holder  = await redis.get(lockKey);
+  if (holder !== userId) return reply.code(403).send({ err: 'not_holder' });
+
+  // 3. Emit the completion event — DO NOT write to Postgres here
+  await producer.send({
+    topic: 'job.completed',
+    messages: [{
+      key: userId,                                  // co-partition by user
+      value: JSON.stringify({
+        eventId: randomUUID(),
+        userId, jobId,
+        reward: job.reward_tokens,
+        ts: Date.now(),
+        idempotency
+      }),
+      headers: { 'content-type': 'application/json' }
+    }]
+  });
+
+  // 4. Optimistic UI: tell the client "pending"
+  return reply.send({ status: 'pending', jobId });
+}
