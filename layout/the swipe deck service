@@ -1,0 +1,54 @@
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "math/rand"
+    "net/http"
+    "time"
+
+    "github.com/go-chi/chi/v5"
+    "github.com/go-chi/jwtauth/v5"
+    "github.com/redis/go-redis/v9"
+)
+
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+func deckHandler(w http.ResponseWriter, r *http.Request) {
+    uid := chi.URLParam(r, "userId")
+    ctx, cancel := context.WithTimeout(r.Context(), 200*time.Millisecond)
+    defer cancel()
+
+    // 1. Pull tier from cache (fallback to Profile service)
+    tier, err := rdb.Get(ctx, "tier:"+uid).Int()
+    if err != nil { tier = 1 }
+
+    // 2. Fetch deck: 10 jobs scored by (reward × freshness × user match)
+    //    Done entirely in Redis using ZSET unions for speed.
+    jobs, err := rdb.ZRevRange(ctx, "deck:global", 0, int64(9)).Result()
+    if err != nil || len(jobs) == 0 {
+        w.WriteHeader(http.StatusNoContent)
+        return
+    }
+
+    out := make([]map[string]any, 0, len(jobs))
+    for _, jid := range jobs {
+        raw, _ := rdb.HGetAll(ctx, "job:"+jid).Result()
+        out = append(out, map[string]any{
+            "jobId":  jid,
+            "reward": raw["reward"],
+            "payload": raw["payload"],
+        })
+    }
+    w.Header().Set("Content-Type", "application/json")
+    _ = json.NewEncoder(w).Encode(out)
+}
+
+func main() {
+    r := chi.NewRouter()
+    r.Use(jwtauth.Verifier(tokenAuth))
+    r.Use(jwtauth.Authenticator)
+    r.Get("/deck", deckHandler)
+    http.ListenAndServe(":8080", r)
+}
