@@ -1,0 +1,38 @@
+# workers/reputation/dawid_skene.py
+import numpy as np
+
+def dawid_skene(answers, n_classes, n_iter=30, tol=1e-6):
+    """
+    answers: list of (worker_id, item_id, given_class)
+    Returns: (item posteriors P(truth=c)[J,C], worker confusion matrices [I,C,C], class prior [C])
+    """
+    wid, iid = {}, {}
+    for w, j, _ in answers:
+        wid.setdefault(w, len(wid)); iid.setdefault(j, len(iid))
+    I, J, C = len(wid), len(iid), n_classes
+
+    # init: smoothed majority vote
+    counts = np.full((J, C), 0.1)
+    for w, j, c in answers:
+        counts[iid[j], c] += 1
+    resp = counts / counts.sum(axis=1, keepdims=True)
+
+    for _ in range(n_iter):
+        # ---- M-step: confusion matrix per worker, class prior
+        prior = resp.mean(axis=0)
+        pi = np.full((I, C, C), 0.05)                      # Dirichlet smoothing
+        for w, j, c in answers:
+            pi[wid[w], :, c] += resp[iid[j]]               # P(truth=·) mass to the observed column
+        pi /= pi.sum(axis=2, keepdims=True)
+
+        # ---- E-step: P(truth=c | all answers) ∝ prior_c · Π_i π_i[c, answer_i]
+        logp = np.tile(np.log(prior + 1e-12), (J, 1))
+        for w, j, c in answers:
+            logp[iid[j]] += np.log(pi[wid[w], :, c] + 1e-12)
+        logp -= logp.max(axis=1, keepdims=True)
+        new = np.exp(logp); new /= new.sum(axis=1, keepdims=True)
+
+        if np.abs(new - resp).max() < tol:
+            resp = new; break
+        resp = new
+    return resp, pi, prior
