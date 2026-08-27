@@ -1,0 +1,18 @@
+CREATE TABLE gold_templates (
+  id            UUID PRIMARY KEY,
+  task_type     TEXT NOT NULL,
+  difficulty    SMALLINT NOT NULL DEFAULT 2,     -- 1..5
+  payload       JSONB NOT NULL,                  -- template with placeholders
+  answer_key    JSONB NOT NULL,                  -- expected answer + acceptable variants
+  active        BOOLEAN DEFAULT true,
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  retired_at    TIMESTAMPTZ                      -- rotate monthly
+);
+
+-- Track exposure per template so no template becomes over-familiar
+CREATE TABLE gold_exposure (
+  template_id   UUID REFERENCES gold_templates(id),
+  user_id       UUID,
+  shown_at      TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (template_id, user_id)
+);
