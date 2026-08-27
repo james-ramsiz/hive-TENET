@@ -1,0 +1,20 @@
+// workers/janitor/main.go
+// On lock creation, also ZADD pending:expiry score=expiry_ts
+// Janitor polls every 5s:
+func reapExpiredLocks(rdb *redis.Client, producer *kafka.Writer) {
+    ctx := context.Background()
+    now := float64(time.Now().Unix())
+
+    // Atomically grab everything expired
+    expired, _ := rdb.ZRangeByScore(ctx, "pending:expiry",
+        &redis.ZRangeBy{Min: "0", Max: fmt.Sprintf("%f", now)}).Result()
+
+    for _, lockKey := range expired {
+        userId, reward := parseLock(lockKey) // lock:job:<id> → owner + amount
+        rdb.DecrBy(ctx, "usr:"+userId+":pending", reward)
+        rdb.Del(ctx, lockKey)
+        rdb.ZRem(ctx, "pending:expiry", lockKey)
+        // Emit job.lock_expired → job goes BACK into the deck
+        publishEvent(producer, "job.lock_expired", lockKey)
+    }
+}
