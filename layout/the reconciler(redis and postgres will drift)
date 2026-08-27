@@ -1,0 +1,7 @@
+-- The invariant: this must always be zero rows.
+-- If not, you have money (tokens) unaccounted for.
+SELECT b.user_id, b.balance, b.pending, COALESCE(SUM(l.delta), 0) AS ledger_sum
+FROM token_balance b
+LEFT JOIN token_ledger l ON l.user_id = b.user_id
+WHERE b.balance + b.pending != COALESCE(SUM(l.delta), 0)
+GROUP BY b.user_id;
