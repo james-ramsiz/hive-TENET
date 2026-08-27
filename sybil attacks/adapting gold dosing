@@ -1,0 +1,10 @@
+func GoldDose(baseRate float64, fraudScore float64) float64 {
+    switch {
+    case fraudScore > 0.70:
+        return 0.40 // near-certain scrutiny; also near the UX ceiling
+    case fraudScore > 0.40:
+        return 0.20 // suspicious: raise the evidence collection rate
+    default:
+        return baseRate // 0.05
+    }
+}
