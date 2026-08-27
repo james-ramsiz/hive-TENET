@@ -1,0 +1,19 @@
+# workers/fraud/features.py
+import numpy as np
+
+def cadence_features(intervals_ms):
+    a = np.asarray(intervals_ms, dtype=float)
+    return {
+        "cv": float(a.std() / a.mean()),        # humans ≈ 0.4–0.9; bots < 0.15
+        "min_ms": float(a.min()),               # < 180ms = sub-human reading time
+        "lag1_autocorr": float(np.corrcoef(a[:-1], a[1:])[0, 1]),  # periodicity ≈ bot timer
+        "p10_ms": float(np.percentile(a, 10)),  # 10% of swipes under ~400ms = suspicious
+    }
+
+def circadian_uptime(active_hours_7d):
+    return len(active_hours_7d) / 168           # humans sleep; > 0.7 = 24/7 operation
+
+def answer_entropy(answer_counts):              # over multiple-choice options
+    p = answer_counts / answer_counts.sum()
+    p = p[p > 0]
+    return float(-(p * np.log(p)).sum())        # random-clickers ≈ max entropy
