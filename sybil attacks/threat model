@@ -1,0 +1,9 @@
+| Adversary | Goal | Cost to them | Primary defense |
+|---|---|---|---|
+| **Bot farmer** | Auto-complete tasks for tokens | ~$0 (scripts) | Gold tasks + cadence entropy |
+| **Sybil operator** | 300 fake accounts × tier-1 limits | $0.05/account (SMS bypass) | Redemption gating + phone verify |
+| **Lazy human** | Minimum effort, maximum swipes | Low | Gold + difficulty weighting |
+| **Collusion ring** | Poster + workers wash tokens (poster pays worker for garbage, they split) | Medium | Consensus verification + graph analysis |
+| **Answer copier** | Copies another worker's answers in real time | Low | Independent timing + Jaccard detection |
+| **Gold detector** | Learns which tasks are gold, aces only those | High | Parametric gold + detection monitoring |
+
