@@ -1,0 +1,35 @@
+package reputation
+
+import "gonum.org/v1/gonum/stat/distuv"
+
+type Scorer struct {
+    Alpha0, Beta0 float64 // empirical-Bayes prior
+    HalfLifeTasks float64 // decay: reputations rot
+}
+
+// Accumulate applies a new gold result with difficulty weighting and decay.
+// h, m are the user's current (decayed) hit/miss counts; d is tasks since last update.
+func (s *Scorer) Accumulate(h, m float64, d int, correct bool, difficulty int) (float64, float64) {
+    // 1. Decay old evidence (half-life ~300 tasks): a great June shouldn't cover a sloppy October
+    k := math.Pow(0.5, float64(d)/s.HalfLifeTasks)
+    h, m = h*k, m*k
+
+    // 2. Difficulty weight: acing hard gold counts more, flubbing easy gold counts more against you
+    w := map[int]float64{1: 0.5, 2: 1.0, 3: 1.25, 4: 1.5, 5: 2.0}[difficulty]
+    if correct {
+        h += w
+    } else {
+        m += w
+    }
+    return h, m
+}
+
+func (s *Scorer) ConfidentAbove(h, m, threshold, confidence float64) bool {
+    post := distuv.Beta{Alpha: s.Alpha0 + h, Beta: s.Beta0 + m}
+    return 1 - post.CDF(threshold) >= confidence // P(θ > threshold)
+}
+
+func (s *Scorer) LCB(h, m, q float64) float64 { // e.g., q = 0.1 → 10th percentile
+    post := distuv.Beta{Alpha: s.Alpha0 + h, Beta: s.Beta0 + m}
+    return post.CDF(q)
+}
