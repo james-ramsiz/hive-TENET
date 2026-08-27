@@ -1,0 +1,9 @@
+{
+  "template": "image_label_contains_cat",
+  "params": {
+    "image": "{pick:verified_cats_pool}",        // rotated asset pool
+    "option_order": "{permute:seeded}",          // answers never in same position
+    "phrasing": "{pick:['Does this contain a cat?','Is a cat visible?','Mark if a cat appears']}"
+  },
+  "answer_key": { "value": "yes", "accept": ["yes", "y"] }
+}
