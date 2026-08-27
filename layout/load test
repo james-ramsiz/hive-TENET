@@ -1,0 +1,35 @@
+// loadtests/swipe_stampede.js — k6
+import http from 'k6/http';
+import { check } from 'k6';
+
+export let options = {
+  scenarios: {
+    // THE test: 10,000 users swiping in the same second (your stated requirement)
+    thundering_herd: {
+      executor: 'ramping-arrival-rate',
+      startRate: 1,
+      timeUnit: '1s',
+      preAllocatedVUs: 2000,
+      maxVUs: 10000,
+      stages: [
+        { target: 10000, duration: '30s' },  // ramp to 10k/s
+        { target: 10000, duration: '60s' },  // hold it
+        { target: 0,     duration: '10s' },
+      ],
+    },
+  },
+  thresholds: {
+    http_req_duration: ['p(99)<50'],        // swipe p99 under 50ms
+    checks: ['rate>0.99'],
+  },
+};
+
+export default function () {
+  const res = http.post(
+    `${__ENV.BASE_URL}/swipe`,
+    JSON.stringify({ jobId: `stress-job-${__VU % 100}` }),
+    { headers: { 'Content-Type': 'application/json',
+                 Authorization: `Bearer ${__ENV.TOKEN}` } }
+  );
+  check(res, { 'locked or taken': (r) => [200, 409, 429].includes(r.status) });
+}
