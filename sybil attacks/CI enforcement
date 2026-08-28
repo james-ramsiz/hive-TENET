@@ -1,0 +1,13 @@
+# .github/workflows/proto.yml
+- name: Lint & breaking-change check
+  run: |
+    buf lint libs/proto
+    buf breaking libs/proto --against \
+      "https://github.com/${{ github.repository }}.git#branch=main,subdir=libs/proto"
+
+- name: Generate stubs (Go + TS)
+  run: buf generate libs/proto
+
+- name: Publish schemas to registry (main only)
+  if: github.ref == 'refs/heads/main'
+  run: buf push libs/proto --create
