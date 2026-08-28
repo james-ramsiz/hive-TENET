@@ -1,0 +1,10 @@
+SELECT a.user_id AS u1, b.user_id AS u2,
+       countIf(a.answer = b.answer AND a.is_correct = 0) AS same_wrong,
+       count() AS overlap
+FROM submissions a
+INNER JOIN submissions b ON a.item_id = b.item_id AND a.user_id < b.user_id
+WHERE a.batch_id = {batch:String}
+  AND a.answered_at BETWEEN b.answered_at - INTERVAL 30 SECOND
+                        AND b.answered_at + INTERVAL 30 SECOND   -- temporal coupling
+GROUP BY u1, u2
+HAVING overlap >= 20 AND same_wrong / overlap > 0.5
