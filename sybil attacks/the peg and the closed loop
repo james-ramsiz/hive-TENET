@@ -1,0 +1,9 @@
+Poster buys:   1,000 tokens for $12.50   ($0.0125/token)
+Worker redeems: 1,000 tokens for $10.00  ($0.0100/token)
+Blended take rate: 1 − (0.0100/0.0125) = 20%
+
+Poster publishes ──► tokens move: poster balance → ESCROW (per job)     [pre-flight, Claude-style]
+Worker swipes   ──► escrow tagged in-flight + quota slot reserved       [lock.lua, unchanged mechanics]
+Worker completes──► escrow → worker balance (via ledger event)          [async, unchanged]
+Lock expires    ──► escrow returns to poster balance                    [janitor, from Phase 2]
+Worker redeems  ──► burn + cash out at the peg
