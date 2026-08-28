@@ -1,0 +1,39 @@
+# economy/simulate.py
+def simulate(days=365, workers0=100, growth=0.015, tasks_per_worker=15,
+             reward=8.0, buy=0.0125, redeem=0.01,
+             tier2_share=0.70, redeem_prob=0.85, scenario="baseline", seed=42):
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    cash, float_redeemable, float_credits = 0.0, 0.0, 0.0
+    pending, hist = [], []
+
+    for day in range(days):
+        workers = workers0 * (1 + growth) ** day
+        if scenario == "bot_attack" and day == 120:
+            workers += 300  # tier-1 Sybils: credits only, never redeemable
+
+        t2 = workers * tier2_share
+        t1 = workers - t2
+        earned_t2, earned_t1 = t2 * tasks_per_worker * reward, t1 * tasks_per_worker * reward
+
+        # Posters buy the t2-backed tokens; platform FUNDS the t1 credits + gold from budget
+        cash += earned_t2 * buy * (1 / 0.95) * 0.95   # poster purchase
+        cash -= earned_t2 * 0.05 * buy                # funding rule: gold mints are pre-funded
+        cash -= earned_t1 * buy                       # funding rule: credits are pre-funded (marketing)
+
+        # schedule redemptions with lag
+        amt = earned_t2 * redeem_prob
+        pending.append((amt, day + int(rng.gamma(6, 1.0))))
+
+        due = sum(a for a, d in pending if d <= day)
+        pending = [(a, d) for a, d in pending if d > day]
+
+        if scenario == "run" and 150 <= day < 157:
+            due += float_redeemable * 0.25            # bank run: 25% of float/day for a week
+
+        cash -= due * redeem
+        float_redeemable += earned_t2 - due
+        float_credits += earned_t1                     # never a cash liability
+        hist.append((day, cash, float_redeemable, float_credits,
+                     cash / max(float_redeemable * redeem, 1e-9)))
+    return hist
