@@ -1,0 +1,42 @@
+// job.proto
+message JobCompleted {
+  EventMeta meta = 1;
+  string user_id = 2;
+  string job_id  = 3;
+  string batch_id = 4;          // "" if standalone
+  int64  reward_tokens = 5;     // consumer contract: MUST be > 0, else DLQ
+  string idempotency_key = 6;   // "complete:{userId}:{jobId}"
+}
+
+message JobLockExpired {
+  EventMeta meta = 1;
+  string job_id = 2;
+  string user_id = 3;           // who held the lock
+  int64  reward_tokens = 4;     // returned to poster escrow
+}
+
+// reputation.proto
+message ReputationUpdated {
+  EventMeta meta = 1;
+  string user_id = 2;
+  int32  tier = 3;
+  double accuracy_lcb = 4;      // the decision basis — publish WHY, not just WHAT
+  double accuracy_mean = 5;
+  int64  gold_exposures = 6;
+  string reason = 7;            // "promotion" | "demotion" | "decay"
+}
+
+
+// fraud.proto
+message FraudVerdict {
+  EventMeta meta = 1;
+  string user_id = 2;
+  double score = 3;
+  repeated string signals = 4;  // ["cadence_cv_low","asn_hosting"]
+  Action action = 5;
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    NONE = 1; RAISE_GOLD_DOSE = 2; THROTTLE = 3;
+    REVIEW = 4; FREEZE_PAYOUT = 5; BAN = 6;
+  }
+}
