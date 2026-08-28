@@ -1,0 +1,15 @@
+swipe.created ─┐
+gold.result   ─┤              ┌────────────────┐      ┌──────────────────┐
+job.completed ─┼──► Kafka ──► │ Feature Worker │ ───► │ Redis (online    │
+submissions   ─┘   (raw)      │ (Python)       │      │ features/user)   │
+                                └───────┬────────┘      └────────┬─────────┘
+                                        │ ClickHouse             │
+                                        ▼ (offline analytics)    ▼
+                                 ┌──────────────┐        ┌──────────────┐
+                                 │ Scorer (Py)  │ ◄─────►│ Model store  │
+                                 └──────┬───────┘        └──────────────┘
+                                        │ fraud.verdict (Kafka)
+                     ┌──────────────────┼──────────────────┐
+                     ▼                  ▼                  ▼
+               rate-limit svc      payout gate        reputation
+               (throttle tiers)    (freeze cash)      (dose adjust)
