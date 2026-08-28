@@ -1,0 +1,11 @@
+CREATE TABLE outbox_events (
+  id           UUID PRIMARY KEY,          -- = event_id (UUIDv7)
+  topic        TEXT NOT NULL,
+  key          TEXT NOT NULL,
+  payload      BYTEA NOT NULL,
+  headers      JSONB NOT NULL,
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  published_at TIMESTAMPTZ,
+  attempts     INT DEFAULT 0
+);
+CREATE INDEX ON outbox_events (created_at) WHERE published_at IS NULL;
