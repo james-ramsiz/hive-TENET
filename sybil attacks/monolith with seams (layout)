@@ -1,0 +1,19 @@
+services/monolith/
+├── cmd/
+│   ├── api/main.go          # HTTP server + all module wiring
+│   └── worker/main.go       # Kafka consumers (ledger, reputation, fraud relay)
+├── internal/
+│   ├── kernel/              # ids.go tokens.go event.go clock.go errors.go
+│   ├── outbox/              # writer.go relay.go postgres.go
+│   ├── swipe/               # port.go service.go http.go postgres.go events.go
+│   ├── jobs/
+│   ├── batch/
+│   ├── ledger/
+│   ├── reputation/
+│   └── fraud/
+├── migrations/
+│   ├── swipe/001_init.sql
+│   ├── ledger/001_init.sql
+│   └── ...
+├── .golangci.yml            # depguard: boundary enforcement
+└── go.mod
