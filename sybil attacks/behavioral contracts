@@ -1,0 +1,14 @@
+func TestJobCompletedContract(t *testing.T) {
+    cases := []struct {
+        name    string
+        mutate  func(*events.JobCompleted)
+        wantErr bool
+    }{
+        {"reward must be positive", func(e *events.JobCompleted) { e.RewardTokens = 0 }, true},
+        {"idempotency key required", func(e *events.JobCompleted) { e.IdempotencyKey = "" }, true},
+        {"missing batch_id allowed for standalone", func(e *events.JobCompleted) { e.BatchId = "" }, false},
+    }
+    for _, c := range cases {
+        t.Run(c.name, func(t *testing.T) { /* feed through consumer's validate() */ })
+    }
+}
