@@ -1,0 +1,11 @@
+        gold.result ──────────► Bayesian scorer ──► reputation.updated
+                                                       │
+        fraud.signals ──► scorer ──► fraud.verdict ───┤
+                            │                          ▼
+                            └──► payout gate    tier + limits + redemption eligibility
+                                                        │
+                                                        ▼
+                                              ECONOMY (who can mint liability against you)
+Every arrow = a versioned event contract (Part 3)
+traveling through a module seam (Part 4)
+inside one deployable binary (Part 4)
