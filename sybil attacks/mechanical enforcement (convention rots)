@@ -1,0 +1,23 @@
+# .golangci.yml — depguard: illegal cross-module imports fail the build
+linters-settings:
+  depguard:
+    rules:
+      swipe-boundary:
+        files: ["**/internal/swipe/**"]
+        deny:
+          - pkg: microgig/internal/ledger
+            desc: "swipe must not import ledger — use ports in port.go"
+          - pkg: microgig/internal/reputation
+            desc: "same"
+      ledger-boundary:
+        files: ["**/internal/ledger/**"]
+        deny:
+          - pkg: microgig/internal/swipe
+            desc: "ledger consumes events; it does not call swipe"
+      kernel-purity:
+        files: ["**/internal/kernel/**"]
+        deny:
+          - pkg: github.com/jackc/pgx/v5
+            desc: "kernel has zero dependencies"
+          - pkg: github.com/redis/go-redis/v9
+            desc: "kernel has zero dependencies"
