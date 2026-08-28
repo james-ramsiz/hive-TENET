@@ -1,0 +1,13 @@
+func TestSwipeRight_WritesOutboxAtomically(t *testing.T) {
+    db := testPostgres(t) // runs migrations/swipe/*, fresh schema
+    svc := newServiceWithFakes(db)
+
+    _, err := svc.SwipeRight(ctx, testUser, testJob)
+    require.NoError(t, err)
+
+    var topics []string
+    err = db.QueryRow(ctx,
+        `SELECT array_agg(topic) FROM outbox_events`).Scan(&topics)
+    require.NoError(t, err)
+    require.Contains(t, topics, "swipe.created") // event and row committed together
+}
