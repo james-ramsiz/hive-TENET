@@ -1,0 +1,24 @@
+package swipe
+
+import "microgig/internal/kernel"
+
+type JobView struct {
+    ID     kernel.JobID
+    Reward kernel.Tokens
+    Batch  kernel.BatchID
+}
+
+type JobReader interface {
+    Job(ctx context.Context, id kernel.JobID) (JobView, error)
+}
+
+// Reserves the job slot + poster escrow atomically (the Redis Lua from Part 2).
+type SlotLocker interface {
+    Reserve(ctx context.Context, u kernel.UserID, j kernel.JobID, amt kernel.Tokens) error
+    Release(ctx context.Context, u kernel.UserID, j kernel.JobID, amt kernel.Tokens) error
+}
+
+// Rate limits + fraud verdicts live behind one seam.
+type Gatekeeper interface {
+    Allow(ctx context.Context, u kernel.UserID, action kernel.Action) (kernel.Decision, error)
+}
