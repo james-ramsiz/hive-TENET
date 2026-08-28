@@ -1,0 +1,10 @@
+message DeadLetter {
+  EventMeta meta = 1;
+  string original_topic = 2;
+  bytes  original_payload = 3;   // preserved verbatim — replayable
+  string error_class = 4;
+  string error_message = 5;
+  int32  attempts = 6;
+  string consumer_group = 7;
+  google.protobuf.Timestamp first_failed_at = 8;
+}
