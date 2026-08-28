@@ -1,0 +1,15 @@
+// envelope.proto
+syntax = "proto3";
+package microgig.events.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message EventMeta {
+  string event_id    = 1;  // UUIDv7 (time-ordered) — THE idempotency anchor for consumers
+  string event_type  = 2;  // "job.completed"
+  string schema_version = 3;  // semver; MAJOR bumps = new topic (*.v2), MINOR = additive field
+  google.protobuf.Timestamp occurred_at = 4;
+  string producer    = 5;  // "monolith" | "swipe-service" | ...
+  string correlation_id = 6;  // one business transaction (one gig's full lifecycle)
+  string causation_id   = 7;  // event_id of the DIRECT cause; "" if user-initiated
+}
