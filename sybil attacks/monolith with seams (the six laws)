@@ -1,0 +1,6 @@
+Modules live in internal/<module>; only exported types cross module lines.
+Cross-module calls go through interfaces defined in the consuming module (Go's consumer-defined interfaces) — wired by constructors, never a service locator.
+Cross-module data changes go through events via transactional outbox. No module ever reads another's tables.
+internal/kernel holds only IDs, money, clock, event meta, error types. If it changes more than once a sprint, it's leaking.
+Each module owns its schema (table prefix) and its migrations folder. CI enforces.
+One binary, multiple entrypoints (cmd/api, cmd/worker) sharing the same module implementations.
