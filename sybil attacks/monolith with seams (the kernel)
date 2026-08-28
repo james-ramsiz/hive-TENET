@@ -1,0 +1,21 @@
+package kernel
+
+type UserID string
+type JobID string
+type BatchID string
+
+type Tokens int64
+
+func (t Tokens) Add(o Tokens) (Tokens, error) {
+    s := t + o
+    if (s > t) != (o > 0) {
+        return 0, ErrTokenOverflow
+    }
+    return s, nil
+}
+
+var (
+    ErrTokenOverflow = errors.New("token overflow")
+    ErrNotFound      = errors.New("not found")
+    ErrConflict      = errors.New("conflict")
+)
