@@ -1,0 +1,4 @@
+def surge_step(B, m):
+    if   B > 3.0: m = min(2.0, m + 0.1)
+    elif B < 1.0: m = max(1.0, m - 0.1)
+    return m          # evaluate every 10 min; slow steps = no oscillation
