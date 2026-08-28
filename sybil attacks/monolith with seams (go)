@@ -1,0 +1,14 @@
+// internal/outbox/writer.go
+type Writer interface {
+    AppendTx(ctx context.Context, tx pgx.Tx, e OutboxEvent) error
+}
+
+type postgresWriter struct{}
+
+func (postgresWriter) AppendTx(ctx context.Context, tx pgx.Tx, e OutboxEvent) error {
+    _, err := tx.Exec(ctx,
+        `INSERT INTO outbox_events (id, topic, key, payload, headers)
+         VALUES ($1,$2,$3,$4,$5)`,
+        e.ID, e.Topic, e.Key, e.Payload, e.Headers)
+    return err
+}
