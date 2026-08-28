@@ -1,0 +1,62 @@
+// internal/outbox/relay.go
+type Relay struct {
+    db     *pgxpool.Pool
+    writer *kafka.Writer
+    batch  int
+}
+
+func (r *Relay) Run(ctx context.Context) error {
+    tick := time.NewTicker(100 * time.Millisecond)
+    defer tick.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-tick.C:
+            if err := r.drain(ctx); err != nil {
+                slog.Error("outbox drain", "err", err) // metric + keep looping
+            }
+        }
+    }
+}
+
+func (r *Relay) drain(ctx context.Context) error {
+    tx, err := r.db.Begin(ctx)
+    if err != nil { return err }
+    defer tx.Rollback(ctx)
+
+    // SKIP LOCKED: run N relay replicas safely — they divide work instead of fighting
+    rows, err := tx.Query(ctx, `
+        SELECT id, topic, key, payload, headers
+          FROM outbox_events
+         WHERE published_at IS NULL
+         ORDER BY created_at
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED`, r.batch)
+    if err != nil { return err }
+
+    type ev struct{ id string; msg kafka.Message }
+    var batch []ev
+    for rows.Next() {
+        var e ev
+        var headers []byte
+        if err := rows.Scan(&e.id, &e.msg.Topic, &e.msg.Key, &e.msg.Value, &headers); err != nil {
+            rows.Close(); return err
+        }
+        e.msg.Headers = kafkaHeaders(headers)
+        batch = append(batch, e)
+    }
+    rows.Close()
+    if len(batch) == 0 { return nil }
+
+    // Publish first, mark second → crash between = republish = at-least-once.
+    // Consumers are idempotent on event_id BY CONTRACT (Part 3). That's the deal.
+    if err := r.writer.WriteMessages(ctx, msgsOf(batch)); err != nil { return err }
+
+    ids := idsOf(batch)
+    _, err = tx.Exec(ctx,
+        `UPDATE outbox_events SET published_at = now(), attempts = attempts + 1
+          WHERE id = ANY($1)`, ids)
+    if err != nil { return err }
+    return tx.Commit(ctx)
+}
