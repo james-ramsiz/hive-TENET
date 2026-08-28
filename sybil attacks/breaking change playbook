@@ -1,0 +1,10 @@
+type DualProducer struct{ v1, v2 *kafka.Writer; flags *Flags }
+
+func (p *DualProducer) PublishJobCompleted(ctx context.Context, e JobCompleted) error {
+    if p.flags.DualWriteJobCompletedV2() {
+        if err := p.v2.WriteMessages(ctx, e.MessageV2()); err != nil {
+            return err  // fail the request path — silent dual-write divergence is worse
+        }
+    }
+    return p.v1.WriteMessages(ctx, e.MessageV1())
+}
