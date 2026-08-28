@@ -1,0 +1,19 @@
+// cmd/api/main.go
+func main() {
+    db := mustPool(os.Getenv("DATABASE_URL"))
+    rdb := mustRedis(os.Getenv("REDIS_URL"))
+    ob := outbox.PostgresWriter{}
+
+    gate := fraud.NewGatekeeper(rdb, db)              // implements swipe.Gatekeeper
+    locker := ledger.NewEscrowLocker(rdb)             // implements swipe.SlotLocker
+    jobs := jobs.NewReader(db)                        // implements swipe.JobReader
+
+    swipeSvc := swipe.New(jobs, locker, gate, db, ob) // constructor injection, no framework
+
+    relay := outbox.NewRelay(db, mustKafkaWriter())
+    go relay.Run(context.Background())
+
+    r := chi.NewRouter()
+    r.Post("/swipe", swipe.HTTPHandler(swipeSvc))
+    http.ListenAndServe(":8080", r)
+}
