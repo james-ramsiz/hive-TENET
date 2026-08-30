@@ -1,0 +1,203 @@
+// reviewer-performance-tracker.ts
+
+interface ReviewRecord {
+  taskId: string;
+  reviewerId: string;
+  jobTypeId: string;
+  decision: 'accepted' | 'rejected';
+  rejectionReasons?: string[];
+  reviewedAt: Date;
+  willBeAppealable: boolean;
+  
+  // Populated later if appealed
+  appealOutcome?: 'upheld' | 'overturned' | 'not_contested';
+  appellateReviewerId?: string;
+  appealResolvedAt?: Date;
+}
+
+class ReviewerPerformanceTracker {
+  private records: Map<string, ReviewRecord> = new Map();
+  
+  async recordReview(input: {
+    reviewerId: string;
+    jobTypeId: string;
+    decision: 'accepted' | 'rejected';
+    rejectionReasons?: string[];
+    willBeAppealable: boolean;
+  }): Promise<string> {
+    const id = uuidv4();
+    const record: ReviewRecord = {
+      taskId: input.taskId || id, // In practice, taskId is always provided
+      reviewerId: input.reviewerId,
+      jobTypeId: input.jobTypeId,
+      decision: input.decision,
+      rejectionReasons: input.rejectionReasons,
+      reviewedAt: new Date(),
+      willBeAppealable: input.willBeAppealable,
+    };
+    
+    this.records.set(id, record);
+    return id;
+  }
+  
+  async markUpheld(taskId: string, context: { appellateReviewerId: string }): Promise<void> {
+    const record = this.findByTaskId(taskId);
+    if (!record) throw new Error(`No review record for task ${taskId}`);
+    
+    record.appealOutcome = 'upheld';
+    record.appellateReviewerId = context.appellateReviewerId;
+    record.appealResolvedAt = new Date();
+    
+    // Original reviewer was correct — positive signal
+    await this.emitReviewerSignal(record, 'upheld');
+  }
+  
+  async markOverturned(taskId: string, context: {
+    appellateReviewerId: string;
+    reason?: string;
+  }): Promise<void> {
+    const record = this.findByTaskId(taskId);
+    if (!record) throw new Error(`No review record for task ${taskId}`);
+    
+    record.appealOutcome = 'overturned';
+    record.appellateReviewerId = context.appellateReviewerId;
+    record.appealResolvedAt = new Date();
+    
+    // Original reviewer was WRONG — negative signal
+    // This feeds directly into the deck ranking model's reviewer bias adjustment
+    await this.emitReviewerSignal(record, 'overturned');
+  }
+  
+  async markNotContested(taskId: string): Promise<void> {
+    const record = this.findByTaskId(taskId);
+    if (!record) throw new Error(`No review record for task ${taskId}`);
+    
+    record.appealOutcome = 'not_contested';
+    record.appealResolvedAt = new Date();
+    
+    // Weak positive signal — not overturned, but also not affirmed
+    await this.emitReviewerSignal(record, 'not_contested');
+  }
+  
+  /**
+   * Compute the reviewer's "over-rejection score" — the key input to the 
+   * deck ranking model's reviewer bias adjustment.
+   * 
+   * This is NOT simply overturn_rate. It's a Bayesian estimate that accounts for:
+   * - How many of the reviewer's rejections were appealed (selection bias)
+   * - How many of those appeals were overturned
+   * - The base rate of overturns in the system (regression to the mean)
+   */
+  async computeOverRejectionScore(reviewerId: string, jobTypeId?: string): Promise<{
+    pointEstimate: number;
+    confidenceInterval: [number, number];
+    sampleSize: number;
+  }> {
+    const records = this.getReviewerRecords(reviewerId, jobTypeId);
+    const rejectedRecords = records.filter(r => r.decision === 'rejected');
+    const appealedRecords = rejectedRecords.filter(r => r.appealOutcome !== undefined);
+    const overturnedRecords = appealedRecords.filter(r => r.appealOutcome === 'overturned');
+    
+    const n = appealedRecords.length;
+    
+    if (n < 5) {
+      // Not enough data — return system prior (assumes reviewer is average)
+      const systemOverturnRate = await this.getSystemOverturnRate(jobTypeId);
+      return {
+        pointEstimate: systemOverturnRate,
+        confidenceInterval: [0, systemOverturnRate * 3],
+        sampleSize: n,
+      };
+    }
+    
+    // Bayesian estimate with Beta prior
+    // Prior: system average overturn rate, weighted as if we've seen 10 prior samples
+    const systemRate = await this.getSystemOverturnRate(jobTypeId);
+    const priorAlpha = systemRate * 10;
+    const priorBeta = (1 - systemRate) * 10;
+    
+    const posteriorAlpha = priorAlpha + overturnedRecords.length;
+    const posteriorBeta = priorBeta + (appealedRecords.length - overturnedRecords.length);
+    
+    const pointEstimate = posteriorAlpha / (posteriorAlpha + posteriorBeta);
+    
+    // 95% credible interval using Beta distribution quantiles
+    // (In production we'd use a proper Beta distribution library)
+    const variance = (posteriorAlpha * posteriorBeta) / 
+      ((posteriorAlpha + posteriorBeta) ** 2 * (posteriorAlpha + posteriorBeta + 1));
+    const stdDev = Math.sqrt(variance);
+    const confidenceInterval: [number, number] = [
+      Math.max(0, pointEstimate - 1.96 * stdDev),
+      Math.min(1, pointEstimate + 1.96 * stdDev),
+    ];
+    
+    return {
+      pointEstimate,
+      confidenceInterval,
+      sampleSize: n,
+    };
+  }
+  
+  /**
+   * Emit a signal that the deck ranking model consumes.
+   * This is the interface between the two systems.
+   */
+  private async emitReviewerSignal(
+    record: ReviewRecord,
+    outcome: 'upheld' | 'overturned' | 'not_contested'
+  ): Promise<void> {
+    // In production: publish to a message queue that the deck ranking 
+    // model's feature store consumes
+    const signal = {
+      type: 'reviewer_outcome',
+      reviewerId: record.reviewerId,
+      jobTypeId: record.jobTypeId,
+      taskId: record.taskId,
+      outcome,
+      originalDecision: record.decision,
+      timestamp: new Date(),
+    };
+    
+    await MessageQueue.publish('reviewer-performance-signals', signal);
+    metrics.increment('reviewer.signal_emitted', {
+      reviewerId: record.reviewerId,
+      outcome,
+      jobTypeId: record.jobTypeId,
+    });
+  }
+  
+  private findByTaskId(taskId: string): ReviewRecord | undefined {
+    for (const record of this.records.values()) {
+      if (record.taskId === taskId) return record;
+    }
+    return undefined;
+  }
+  
+  private getReviewerRecords(reviewerId: string, jobTypeId?: string): ReviewRecord[] {
+    let records = Array.from(this.records.values())
+      .filter(r => r.reviewerId === reviewerId);
+    
+    if (jobTypeId) {
+      records = records.filter(r => r.jobTypeId === jobTypeId);
+    }
+    
+    return records;
+  }
+  
+  private async getSystemOverturnRate(jobTypeId?: string): Promise<number> {
+    // In production: query aggregate stats
+    // This is the base rate — if the system overturns 15% of appeals overall,
+    // a new reviewer with no data should be assumed to have a 15% overturn rate
+    return jobTypeId 
+      ? (config.systemOverturnRates[jobTypeId] ?? 0.15)
+      : 0.15;
+  }
+}
+
+const config = {
+  systemOverturnRates: {
+    'realtime_content_moderation': 0.08,  // Low — safety decisions are usually correct
+    'storefront_photo_compliance': 0.18,  // Higher — more subjective
+    'logo_detection': 0.25,               // Highest — most ambiguous
+  },
+};
