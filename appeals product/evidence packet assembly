@@ -1,0 +1,54 @@
+// evidence-packet.ts
+
+interface EvidencePacket {
+  // ── THE TASK ITSELF ──
+  task: {
+    taskId: string;
+    jobTypeId: string;
+    jobTypeLabel: string;           // "Storefront Photo Compliance"
+    guidelines: GuidelineSection[];  // The rules for this job type
+    taskPayload: TaskPayload;        // The actual content to review (image, text, etc.)
+    workerResponse: WorkerResponse;  // What the worker submitted
+  };
+  
+  // ── CONTEXT (carefully curated — see bias discussion below) ──
+  context: {
+    submittedAt: Date;
+    timeToCompleteMs: number;        // How long the worker took
+    // NOTE: workerId is INTENTIONALLY ABSENT — see below
+    // NOTE: worker history is INTENTIONALLY ABSENT — see below
+    // NOTE: other reviewers' opinions are INTENTIONALLY ABSENT — see below
+  };
+  
+  // ── REFERENCE MATERIALS ──
+  reference: {
+    similarAcceptedExamples: ExampleTask[];  // Past tasks on this job type that were accepted
+    similarRejectedExamples: ExampleTask[];  // Past tasks on this job type that were rejected
+    guidelineChangeLog: GuidelineChange[];   // Recent changes to guidelines (if any)
+  };
+  
+  // ── METADATA (for the system, not shown to reviewer) ──
+  _internal: {
+    assembledAt: Date;
+    assembledByVersion: string;          // Evidence packet schema version
+    similarExampleSelectionMethod: string; // How examples were picked
+    biasMitigationsApplied: string[];     // Which bias mitigations were active
+  };
+}
+
+interface GuidelineSection {
+  id: string;
+  title: string;
+  content: string;
+  isHighlighted: boolean;  // Flagged as commonly missed
+  lastUpdated: Date;
+}
+
+interface ExampleTask {
+  // Deliberately stripped of identifying information
+  taskPayload: TaskPayload;
+  workerResponse: WorkerResponse;
+  outcome: 'accepted' | 'rejected';
+  rejectionReasons?: string[];  // Only for rejected examples
+  // NOTE: NO worker ID, NO reviewer ID, NO timestamps
+}
