@@ -1,0 +1,24 @@
+┌─────────────────────────────────────────────────────────────────────┐
+│                        TASK LIFECYCLE                               │
+│                                                                     │
+│  submitted ──► queued_for_review ──► in_review ──► accepted         │
+│                     │                  │                             │
+│                     │                  ▼                             │
+│                     │              rejected ──► appealable           │
+│                     │                               │               │
+│                     │                               ▼               │
+│                     │                         appealed              │
+│                     │                               │               │
+│                     │                               ▼               │
+│                     │                     queued_for_appeal          │
+│                     │                               │               │
+│                     │                               ▼               │
+│                     │                     in_appeal_review           │
+│                     │                      │           │             │
+│                     │                      ▼           ▼             │
+│                     │                upheld       overturned         │
+│                     │                  │             │               │
+│                     │                  ▼             ▼               │
+│                     │              final_reject   accepted            │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
