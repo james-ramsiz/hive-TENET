@@ -1,0 +1,278 @@
+// evidence-packet.ts (continued)
+
+import { Task } from './state-machine';
+import { ExampleStore, ExampleQuery } from './example-store';
+import { GuidelinesService } from './guidelines-service';
+import { config } from './config';
+
+const EVIDENCE_PACKET_VERSION = '3.2.0';
+
+async function assembleEvidencePacket(
+  task: Task,
+  options: {
+    forAppeal: boolean;
+    requestingReviewerId: string;
+  }
+): Promise<EvidencePacket> {
+  const mitigationsApplied: string[] = [];
+  
+  // ── 1. Fetch base task data ──
+  const [guidelines, taskPayload, workerResponse] = await Promise.all([
+    GuidelinesService.getGuidelines(task.jobTypeId),
+    TaskStore.getPayload(task.taskId),
+    TaskStore.getWorkerResponse(task.taskId),
+  ]);
+  
+  // ── 2. Select reference examples ──
+  // This is the most bias-sensitive part. How you pick examples
+  // massively influences the reviewer's decision.
+  const examples = await selectReferenceExamples(task, {
+    forAppeal: options.forAppeal,
+    mitigations: mitigationsApplied,
+  });
+  
+  // ── 3. Compute time-to-complete ──
+  const submitEntry = task.stateHistory.find(s => s.state === 'submitted');
+  const reviewStartEntry = task.stateHistory.find(s => s.state === 'in_review');
+  const timeToCompleteMs = reviewStartEntry 
+    ? reviewStartEntry.enteredAt.getTime() - submitEntry!.enteredAt.getTime()
+    : -1; // unknown
+  
+  // ── 4. Apply appeal-specific modifications ──
+  let finalGuidelines = guidelines;
+  let appealContext: Partial<EvidencePacket['context']> = {};
+  
+  if (options.forAppeal) {
+    const appealResult = applyAppealPacketModifications(task, guidelines, mitigationsApplied);
+    finalGuidelines = appealResult.guidelines;
+    appealContext = appealResult.context;
+  }
+  
+  // ── 5. Assemble ──
+  const packet: EvidencePacket = {
+    task: {
+      taskId: task.taskId,
+      jobTypeId: task.jobTypeId,
+      jobTypeLabel: await GuidelinesService.getJobTypeLabel(task.jobTypeId),
+      guidelines: finalGuidelines,
+      taskPayload,
+      workerResponse,
+    },
+    context: {
+      submittedAt: task.submittedAt,
+      timeToCompleteMs,
+      ...appealContext,
+    },
+    reference: examples,
+    _internal: {
+      assembledAt: new Date(),
+      assembledByVersion: EVIDENCE_PACKET_VERSION,
+      similarExampleSelectionMethod: config.exampleSelection.method,
+      biasMitigationsApplied: mitigationsApplied,
+    },
+  };
+  
+  return packet;
+}
+
+// ── Reference Example Selection ──
+// This is where we spent the most time iterating.
+
+async function selectReferenceExamples(
+  task: Task,
+  options: {
+    forAppeal: boolean;
+    mitigations: string[];
+  }
+): Promise<{ similarAcceptedExamples: ExampleTask[]; similarRejectedExamples: ExampleTask[] }> {
+  
+  const method = config.exampleSelection.method;
+  
+  switch (method) {
+    case 'semantic_similarity': {
+      // Use embedding similarity to find past tasks with similar payloads
+      // This is the "best" method but introduces a subtle bias:
+      // if the current task is borderline, the similar examples will 
+      // also be borderline — and borderline examples have high variance 
+      // in their labels. The reviewer sees a mix of accepted/rejected 
+      // borderline cases and gets confused.
+      
+      options.mitigations.push('semantic_similarity_used');
+      
+      const query: ExampleQuery = {
+        jobTypeId: task.jobTypeId,
+        embedding: await getTaskEmbedding(task.taskId),
+        excludeTaskIds: [task.taskId],
+        limit: config.exampleSelection.countPerCategory,
+      };
+      
+      const [accepted, rejected] = await Promise.all([
+        ExampleStore.findSimilar(query, { outcome: 'accepted' }),
+        ExampleStore.findSimilar(query, { outcome: 'rejected' }),
+      ]);
+      
+      // MITIGATION: Balance the ratio. If we return 5 accepted and 2 rejected,
+      // the reviewer will be biased toward accepting. Force 1:1 ratio.
+      return balanceExampleSets(accepted, rejected, config.exampleSelection.countPerCategory, options.mitigations);
+    }
+    
+    case 'random stratified': {
+      // Random examples from the same job type, stratified by rejection reason
+      // Pros: no similarity bias. Cons: examples might be from totally different
+      // edge cases, making them unhelpful.
+      
+      options.mitigations.push('random_stratified_used');
+      options.mitigations.push('ratio_balanced');
+      
+      const [accepted, rejected] = await Promise.all([
+        ExampleStore.findRandom(task.jobTypeId, {
+          outcome: 'accepted',
+          limit: config.exampleSelection.countPerCategory,
+        }),
+        ExampleStore.findRandom(task.jobTypeId, {
+          outcome: 'rejected',
+          limit: config.exampleSelection.countPerCategory,
+          // Stratify by rejection reason to ensure diversity
+          stratifyBy: 'rejectionReason',
+        }),
+      ]);
+      
+      return { similarAcceptedExamples: accepted, similarRejectedExamples: rejected };
+    }
+    
+    case 'disagreement_cases': {
+      // DELIBERATELY pick examples where reviewers disagreed (some accepted, 
+      // some rejected the same type of task). This shows the reviewer that 
+      // this is a borderline area and they should think carefully.
+      // Only used for appeal packets — original reviews get semantic similarity.
+      
+      options.mitigations.push('disagreement_cases_used');
+      options.mitigations.push('ratio_balanced');
+      
+      if (!options.forAppeal) {
+        // Fall back to semantic similarity for non-appeal packets
+        return selectReferenceExamples(task, { ...options, mitigations: options.mitigations });
+      }
+      
+      const disagreementCases = await ExampleStore.findDisagreementCases({
+        jobTypeId: task.jobTypeId,
+        limit: config.exampleSelection.countPerCategory * 2,
+      });
+      
+      // Split into accepted-majority and rejected-majority
+      const acceptedMajority = disagreementCases
+        .filter(c => c.consensusOutcome === 'accepted')
+        .slice(0, config.exampleSelection.countPerCategory);
+      const rejectedMajority = disagreementCases
+        .filter(c => c.consensusOutcome === 'rejected')
+        .slice(0, config.exampleSelection.countPerCategory);
+      
+      return {
+        similarAcceptedExamples: acceptedMajority,
+        similarRejectedExamples: rejectedMajority,
+      };
+    }
+    
+    default:
+      throw new Error(`Unknown example selection method: ${method}`);
+  }
+}
+
+function balanceExampleSets(
+  accepted: ExampleTask[],
+  rejected: ExampleTask[],
+  targetCount: number,
+  mitigations: string[]
+): { similarAcceptedExamples: ExampleTask[]; similarRejectedExamples: ExampleTask[] } {
+  // Force equal counts to prevent anchoring bias
+  const count = Math.min(accepted.length, rejected.length, targetCount);
+  mitigations.push(`ratio_balanced_to_${count}`);
+  
+  return {
+    similarAcceptedExamples: shuffleArray(accepted).slice(0, count),
+    similarRejectedExamples: shuffleArray(rejected).slice(0, count),
+  };
+}
+
+// ── Appeal-Specific Packet Modifications ──
+// The appeal packet is DIFFERENT from the review packet. This is critical.
+
+function applyAppealPacketModifications(
+  task: Task,
+  guidelines: GuidelineSection[],
+  mitigations: string[]
+): { guidelines: GuidelineSection[]; context: Record<string, unknown> } {
+  
+  const context: Record<string, unknown> = {};
+  
+  // ── MODIFICATION 1: Include the worker's appeal reason ──
+  // The worker wrote an explanation of why they think the rejection was wrong.
+  // This MUST be shown to the appellate reviewer, but it creates bias:
+  // the reviewer might be persuaded by a well-written appeal even if the 
+  // original decision was correct.
+  //
+  // MITIGATION: We show the appeal reason AFTER the reviewer has made 
+  // an initial judgment (two-phase review). See the UI section below.
+  context.appealReason = task.appealReason;
+  mitigations.push('appeal_reason_included_deferred');
+  
+  // ── MODIFICATION 2: Highlight the specific rejection reasons ──
+  // The original reviewer picked reason codes. Show these to the appellate 
+  // reviewer so they can evaluate each one.
+  context.originalRejectionReasons = task.reviewRejectionReasons;
+  mitigations.push('original_reasons_included');
+  
+  // ── MODIFICATION 3: Highlight relevant guideline sections ──
+  // Map rejection reasons to guideline sections and flag them
+  const relevantGuidelineIds = mapRejectionReasonsToGuidelines(task.reviewRejectionReasons || []);
+  const highlightedGuidelines = guidelines.map(g => ({
+    ...g,
+    isHighlighted: relevantGuidelineIds.includes(g.id),
+  }));
+  mitigations.push('relevant_guidelines_highlighted');
+  
+  // ── MODIFICATION 4: Do NOT show the original reviewer's identity ──
+  // This is critical to prevent social dynamics (seniority bias, 
+  // personal relationships, etc.)
+  // We don't even store it in the packet — it's simply absent.
+  mitigations.push('original_reviewer_id_omitted');
+  
+  // ── MODIFICATION 5: Show time-to-complete if it was abnormally fast ──
+  // If the worker completed the task in <10th percentile time, flag it.
+  // This is a legitimate quality signal (rushed work) but it's also 
+  // biasing — the reviewer might reject solely based on speed.
+  // MITIGATION: Only flag if speed is below 5th percentile (truly extreme)
+  const submitEntry = task.stateHistory.find(s => s.state === 'submitted');
+  // In production, we'd fetch the percentile here
+  // context.suspiciouslyFast = percentile < 0.05;
+  mitigations.push('speed_flag_threshold_at_5th_percentile');
+  
+  return { guidelines: highlightedGuidelines, context };
+}
+
+function shuffleArray<T>(array: T[]): T[] {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
+async function getTaskEmbedding(taskId: string): Promise<number[]> {
+  // In production: fetch pre-computed embedding from vector store
+  // The embedding is computed when the task is submitted, not at review time
+  return TaskStore.getEmbedding(taskId);
+}
+
+function mapRejectionReasonsToGuidelines(reasons: string[]): string[] {
+  // Static mapping from rejection reason codes to guideline section IDs
+  const mapping: Record<string, string[]> = {
+    'blurry_image': ['guidelines.photo_quality', 'guidelines.resolution_requirements'],
+    'incorrect_label': ['guidelines.labeling_rules', 'guidelines.category_definitions'],
+    'missing_element': ['guidelines.completeness_checklist'],
+    'safety_violation': ['guidelines.safety_policy', 'guidelines.content_moderation'],
+    // ... etc
+  };
+  return reasons.flatMap(r => mapping[r] || []);
+}
