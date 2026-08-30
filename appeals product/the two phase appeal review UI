@@ -1,0 +1,182 @@
+// appeal-review-controller.ts
+// This describes the server-side logic for the two-phase appeal review flow
+
+import { Task } from './state-machine';
+import { EvidencePacket } from './evidence-packet';
+
+/**
+ * Phase 1: BLIND REVIEW
+ * The appellate reviewer sees:
+ *   - The task payload
+ *   - The worker's response
+ *   - The guidelines
+ *   - Reference examples
+ * 
+ * They do NOT see:
+ *   - The original rejection reasons
+ *   - The worker's appeal reason
+ *   - The original reviewer's identity
+ *   - Any indication that this is an appeal (it looks like a fresh review)
+ * 
+ * They make a preliminary decision: accept or reject.
+ * If they accept → the appeal is granted (overturned).
+ * If they reject → they proceed to Phase 2.
+ */
+async function handlePhase1Decision(
+  taskId: string,
+  reviewerId: string,
+  preliminaryDecision: 'accepted' | 'rejected',
+  rejectionReasons?: string[]
+): Promise<Phase1Result> {
+  const task = await TaskStore.getTask(taskId);
+  
+  metrics.increment('appeal.phase1_decision', {
+    decision: preliminaryDecision,
+    jobType: task.jobTypeId,
+  });
+  
+  if (preliminaryDecision === 'accepted') {
+    // The appellate reviewer independently decided this task should be accepted.
+    // The appeal is GRANTED without ever seeing the original rejection or appeal reason.
+    // This is the strongest form of overturn — pure independent judgment.
+    
+    await stateMachine.transition(taskId, 'overturned', {
+      actor: reviewerId,
+      metadata: {
+        overturnReason: 'phase1_independent_accept',
+        phase: 1,
+      },
+    });
+    
+    metrics.increment('appeal.overturned_at_phase1', { jobType: task.jobTypeId });
+    
+    return {
+      phase: 1,
+      result: 'overturned',
+      message: 'Appeal granted. Your task has been accepted.',
+    };
+  }
+  
+  if (preliminaryDecision === 'rejected') {
+    // The appellate reviewer independently agreed this should be rejected.
+    // But before we uphold, we show them Phase 2 context.
+    // They might change their mind after seeing the worker's appeal reason.
+    
+    // Store the phase 1 decision for audit
+    await AppealReviewStore.recordPhase1Decision({
+      taskId,
+      reviewerId,
+      decision: 'rejected',
+      rejectionReasons: rejectionReasons || [],
+    });
+    
+    metrics.increment('appeal.advanced_to_phase2', { jobType: task.jobTypeId });
+    
+    return {
+      phase: 1,
+      result: 'advance_to_phase2',
+      message: 'Please review the additional context before finalizing your decision.',
+    };
+  }
+}
+
+/**
+ * Phase 2: CONTEXTUAL REVIEW
+ * Now the appellate reviewer sees:
+ *   - Everything from Phase 1
+ *   - PLUS the original rejection reasons
+ *   - PLUS the worker's appeal reason
+ *   - PLUS whether their Phase 1 rejection reasons matched the original reviewer's
+ * 
+ * They can:
+ *   - Confirm rejection (upheld) — the appeal is denied
+ *   - Change to accept (overturned) — the appeal is granted
+ *   - Modify rejection reasons (still upheld, but with different reasoning)
+ */
+async function handlePhase2Decision(
+  taskId: string,
+  reviewerId: string,
+  finalDecision: 'upheld' | 'overturned',
+  rejectionReasons?: string[],
+  overturnReason?: string
+): Promise<Phase2Result> {
+  const task = await TaskStore.getTask(taskId);
+  const phase1 = await AppealReviewStore.getPhase1Decision(taskId);
+  
+  metrics.increment('appeal.phase2_decision', {
+    decision: finalDecision,
+    jobType: task.jobTypeId,
+    phase1ReasonsMatch: arraysOverlap(
+      phase1.rejectionReasons, 
+      task.reviewRejectionReasons || []
+    ),
+  });
+  
+  if (finalDecision === 'upheld') {
+    await stateMachine.transition(taskId, 'upheld', {
+      actor: reviewerId,
+      metadata: {
+        phase: 2,
+        phase1RejectionReasons: phase1.rejectionReasons,
+        phase2RejectionReasons: rejectionReasons,
+        reasonsChanged: !arraysEqual(phase1.rejectionReasons, rejectionReasons || []),
+      },
+    });
+    
+    metrics.increment('appeal.upheld_at_phase2', { jobType: task.jobTypeId });
+    
+    return {
+      phase: 2,
+      result: 'upheld',
+      message: 'Appeal denied. The original rejection has been upheld.',
+    };
+  }
+  
+  if (finalDecision === 'overturned') {
+    await stateMachine.transition(taskId, 'overturned', {
+      actor: reviewerId,
+      metadata: {
+        overturnReason: overturnReason || 'phase2_contextual_overturn',
+        phase: 2,
+        phase1Decision: phase1.decision,
+        // This is interesting: the reviewer changed their mind after seeing context.
+        // This could mean the appeal reason was genuinely persuasive, OR it could 
+        // mean the appeal reason introduced bias. We track this separately.
+        mindChanged: true,
+      },
+    });
+    
+    metrics.increment('appeal.overturned_at_phase2_mind_changed', { jobType: task.jobTypeId });
+    
+    return {
+      phase: 2,
+      result: 'overturned',
+      message: 'Appeal granted. Your task has been accepted.',
+    };
+  }
+}
+
+// ── Helpers ──
+
+function arraysOverlap(a: string[], b: string[]): boolean {
+  return a.some(item => b.includes(item));
+}
+
+function arraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((val, idx) => val === sortedB[idx]);
+}
+
+interface Phase1Result {
+  phase: 1;
+  result: 'overturned' | 'advance_to_phase2';
+  message: string;
+}
+
+interface Phase2Result {
+  phase: 2;
+  result: 'upheld' | 'overturned';
+  message: string;
+}
