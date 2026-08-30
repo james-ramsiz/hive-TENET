@@ -1,0 +1,173 @@
+// pipeline.ts — This is the entry point that wires everything together
+
+import { TaskStateMachine } from './state-machine';
+import { EvidencePacket, assembleEvidencePacket } from './evidence-packet';
+import { SLAEnforcer } from './sla-enforcer';
+import { ReviewerPool } from './reviewer-pool';
+import { ReviewerPerformanceTracker } from './reviewer-performance-tracker';
+import { WorkerPerformanceSignal } from './worker-performance-signal';
+import { MetricsClient } from './metrics';
+import { MessageQueue } from './message-queue';
+
+// ── Initialize all components ──
+const metrics = new MetricsClient();
+const slaEnforcer = new SLAEnforcer();
+const reviewerPool = new ReviewerPool();
+const workerPerformanceSignal = new WorkerPerformanceSignal();
+const reviewerPerformanceTracker = new ReviewerPerformanceTracker();
+
+const stateMachine = new TaskStateMachine(
+  slaEnforcer,
+  reviewerPool,
+  workerPerformanceSignal,
+  reviewerPerformanceTracker,
+  metrics,
+);
+
+// ── Subscribe to state machine events ──
+
+// When a task is accepted or final-rejected, notify the worker
+stateMachine.on('transition', async (event) => {
+  const { from, to, task, context } = event;
+  
+  // Notify worker of outcome
+  if (to === 'accepted' || to === 'final_reject') {
+    await WorkerNotificationService.sendOutcome(task.workerId, {
+      taskId: task.taskId,
+      outcome: to === 'accepted' ? 'accepted' : 'rejected',
+      rejectionReasons: task.reviewRejectionReasons,
+      appealable: to === 'final_reject' ? false : true, // 'rejected' → appealable, 'final_reject' → not
+    });
+  }
+  
+  // If appealable, start the appeal window
+  if (to === 'appealable') {
+    await WorkerNotificationService.sendAppealOption(task.workerId, {
+      taskId: task.taskId,
+      rejectionReasons: task.reviewRejectionReasons!,
+      appealDeadline: task.currentSLADeadline!,
+      appealRate: await workerPerformanceSignal.getAppealRate(task.workerId),
+      maxAppealRate: slaEnforcer.getMaxAppealRateForJobType(task.jobTypeId),
+    });
+  }
+  
+  // If overturned, FIX the worker's performance signal
+  // This is critical — the deck ranking model was trained on the original 
+  // rejection signal. We need to retract that signal and replace it.
+  if (to === 'overturned') {
+    await workerPerformanceSignal.retractRejection({
+      taskId: task.taskId,
+      workerId: task.workerId,
+      jobTypeId: task.jobTypeId,
+      reason: `Appeal overturned by ${task.appellateReviewerId}`,
+    });
+    
+    metrics.increment('worker.signal_retracted', {
+      workerId: task.workerId,
+      jobTypeId: task.jobTypeId,
+      originalReviewer: task.reviewerId!,
+    });
+  }
+});
+
+// ── Handle incoming review decisions from the reviewer UI ──
+
+MessageQueue.subscribe('review.decision', async (msg: {
+  taskId: string;
+  reviewerId: string;
+  decision: 'accepted' | 'rejected';
+  rejectionReasons?: string[];
+}) => {
+  await stateMachine.transition(msg.taskId, msg.decision, {
+    actor: msg.reviewerId,
+    metadata: { rejectionReasons: msg.rejectionReasons },
+  });
+});
+
+// ── Handle incoming appeal filings from the worker UI ──
+
+MessageQueue.subscribe('appeal.file', async (msg: {
+  taskId: string;
+  workerId: string;
+  appealReason: string;
+}) => {
+  try {
+    await stateMachine.transition(msg.taskId, 'appealed', {
+      actor: msg.workerId,
+      metadata: { appealReason: msg.appealReason },
+    });
+  } catch (err) {
+    if (err instanceof AppealRateExceededError) {
+      await WorkerNotificationService.sendAppealDenied(msg.workerId, {
+        taskId: msg.taskId,
+        reason: err.message,
+      });
+    }
+    throw err;
+  }
+});
+
+// ── Handle appeal review decisions (two-phase) ──
+
+MessageQueue.subscribe('appeal.phase1_decision', async (msg: {
+  taskId: string;
+  reviewerId: string;
+  decision: 'accepted' | 'rejected';
+  rejectionReasons?: string[];
+}) => {
+  await handlePhase1Decision(msg.taskId, msg.reviewerId, msg.decision, msg.rejectionReasons);
+});
+
+MessageQueue.subscribe('appeal.phase2_decision', async (msg: {
+  taskId: string;
+  reviewerId: string;
+  decision: 'upheld' | 'overturned';
+  rejectionReasons?: string[];
+  overturnReason?: string;
+}) => {
+  await handlePhase2Decision(
+    msg.taskId, 
+    msg.reviewerId, 
+    msg.decision, 
+    msg.rejectionReasons, 
+    msg.overturnReason
+  );
+});
+
+// ── Handle SLA escalations (monitoring / pagerduty) ──
+
+stateMachine.on('escalation', async (event) => {
+  const { task, sla } = event;
+  
+  await AlertingService.sendEscalation({
+    task: task.taskId,
+    state: task.state,
+    jobType: task.jobTypeId,
+    slaAction: sla.escalationAction,
+    escalationCount: task.slaEscalationCount,
+    message: `Task ${task.taskId} in state ${task.state} exceeded SLA (${sla.durationMs}ms). ` +
+             `Action: ${sla.escalationAction}. Escalation count: ${task.slaEscalationCount}.`,
+  });
+});
+
+// ── Periodic: flush reviewer performance signals to deck ranking model ──
+
+setInterval(async () => {
+  const allReviewers = await reviewerPool.getAllReviewerIds();
+  
+  for (const reviewerId of allReviewers) {
+    const score = await reviewerPerformanceTracker.computeOverRejectionScore(reviewerId);
+    
+    // Push to deck ranking model's feature store
+    await FeatureStore.set(
+      `reviewer:${reviewerId}:over_rejection_score`,
+      {
+        ...score,
+        updatedAt: new Date(),
+      },
+      { ttl: 24 * 60 * 60 } // 24h TTL — recalculate daily
+    );
+  }
+  
+  metrics.increment('reviewer.score_flush_completed');
+}, 5 * 60 * 1000); // Every 5 minutes
