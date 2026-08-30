@@ -1,0 +1,109 @@
+// sla-enforcer.ts
+
+import { config } from './config';
+
+interface SLAConfig {
+  review: {
+    queueWaitMs: number;       // Time to find a reviewer
+    completionMs: number;      // Time for reviewer to decide
+  };
+  appealWindow: {
+    durationMs: number;        // Time for worker to file appeal
+  };
+  appeal_review: {
+    queueWaitMs: number;       // Time to find appellate reviewer
+    completionMs: number;      // Time for appellate reviewer to decide
+  };
+}
+
+class SLAEnforcer {
+  private jobTypeOverrides: Map<string, Partial<SLAConfig>> = new Map();
+  private maxAppealRates: Map<string, number> = new Map();
+  
+  constructor() {
+    // Load job-type-specific SLA overrides from config
+    // Some job types need faster review (real-time content moderation)
+    // Some have longer appeal windows (complex judgment tasks)
+    for (const [jobType, overrides] of Object.entries(config.sla.jobTypeOverrides)) {
+      this.jobTypeOverrides.set(jobType, overrides);
+    }
+    for (const [jobType, rate] of Object.entries(config.sla.maxAppealRates)) {
+      this.maxAppealRates.set(jobType, rate);
+    }
+  }
+  
+  getSLAForJobType(jobTypeId: string, stage: 'review' | 'appeal_review'): { durationMs: number } {
+    const base = config.sla.defaults[stage];
+    const override = this.jobTypeOverrides.get(jobTypeId)?.[stage];
+    
+    return {
+      durationMs: override?.durationMs || base.durationMs,
+    };
+  }
+  
+  getAppealWindowForJobType(jobTypeId: string): { durationMs: number } {
+    const base = config.sla.defaults.appealWindow;
+    const override = this.jobTypeOverrides.get(jobTypeId)?.appealWindow;
+    
+    return {
+      durationMs: override?.durationMs || base.durationMs,
+    };
+  }
+  
+  getMaxAppealRateForJobType(jobTypeId: string): number {
+    return this.maxAppealRates.get(jobTypeId) || config.sla.defaults.maxAppealRate;
+  }
+}
+
+// ── Config ──
+// This is the actual shape of the SLA config we ran in production
+
+const config = {
+  sla: {
+    defaults: {
+      review: {
+        queueWaitMs: 5 * 60 * 1000,       // 5 min
+        completionMs: 15 * 60 * 1000,      // 15 min
+      },
+      appealWindow: {
+        durationMs: 24 * 60 * 60 * 1000,   // 24 hours
+      },
+      appeal_review: {
+        queueWaitMs: 3 * 60 * 1000,        // 3 min (higher priority)
+        completionMs: 10 * 60 * 1000,      // 10 min (tighter — reviewer already has context)
+      },
+      maxAppealRate: 0.25,                  // 25% of rejections can be appealed
+    },
+    jobTypeOverrides: {
+      'realtime_content_moderation': {
+        review: {
+          queueWaitMs: 30 * 1000,           // 30 seconds — this is safety-critical
+          completionMs: 2 * 60 * 1000,      // 2 minutes
+        },
+        appealWindow: {
+          durationMs: 4 * 60 * 60 * 1000,   // 4 hours — can't sit on safety decisions
+        },
+        appeal_review: {
+          queueWaitMs: 15 * 1000,
+          completionMs: 3 * 60 * 1000,
+        },
+      },
+      'storefront_photo_compliance': {
+        // Uses defaults — no override needed
+      },
+      'logo_detection': {
+        appealWindow: {
+          durationMs: 48 * 60 * 60 * 1000, // 48 hours — lots of edge cases, give workers time
+        },
+        appeal_review: {
+          completionMs: 20 * 60 * 1000,     // 20 min — these are genuinely hard
+        },
+      },
+    },
+  },
+  exampleSelection: {
+    method: 'semantic_similarity',  // Default for original reviews
+    countPerCategory: 3,
+    appealMethodOverride: 'disagreement_cases',  // Appeals get disagreement cases
+  },
+};
