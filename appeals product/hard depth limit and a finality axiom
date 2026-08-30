@@ -1,0 +1,50 @@
+// appeal-depth-guard.ts
+
+const MAX_APPEAL_DEPTH = 1;  // One appeal per task. Non-negotiable.
+
+interface AppealEligibilityCheck {
+  eligible: boolean;
+  reason?: string;
+}
+
+function checkAppealEligibility(task: Task): AppealEligibilityCheck {
+  // Rule 1: Hard depth limit
+  const appealCount = task.stateHistory.filter(s => s.state === 'appealed').length;
+  if (appealCount >= MAX_APPEAL_DEPTH) {
+    return {
+      eligible: false,
+      reason: `Task has already been appealed ${appealCount} time(s). Maximum is ${MAX_APPEAL_DEPTH}.`,
+    };
+  }
+  
+  // Rule 2: Only rejections can be appealed (not accepts)
+  if (task.reviewDecision !== 'rejected') {
+    return {
+      eligible: false,
+      reason: 'Only rejected tasks can be appealed.',
+    };
+  }
+  
+  // Rule 3: Must be in appealable state
+  if (task.state !== 'appealable') {
+    return {
+      eligible: false,
+      reason: `Task is in state '${task.state}', not 'appealable'.`,
+    };
+  }
+  
+  // Rule 4: Appeal window hasn't expired
+  if (task.currentSLADeadline && new Date() > task.currentSLADeadline) {
+    return {
+      eligible: false,
+      reason: 'Appeal window has expired.',
+    };
+  }
+  
+  // Rule 5: Worker's appeal rate isn't excessive
+  // (This is checked in the state machine guard, but we also check here 
+  // for fast-fail in the API layer)
+  // Actual check is async — see the guard in the state machine
+  
+  return { eligible: true };
+}
