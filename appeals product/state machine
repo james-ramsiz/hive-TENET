@@ -1,0 +1,636 @@
+// state-machine.ts
+import { EventEmitter } from 'events';
+import { v4 as uuidv4 } from 'uuid';
+import { EvidencePacket, assembleEvidencePacket } from './evidence-packet';
+import { SLAEnforcer } from './sla-enforcer';
+import { ReviewerPool, ReviewerAssignment } from './reviewer-pool';
+import { MetricsClient } from './metrics';
+
+// ─── Types ───────────────────────────────────────────────────────────
+
+type TaskState =
+  | 'submitted'
+  | 'queued_for_review'
+  | 'in_review'
+  | 'accepted'
+  | 'rejected'
+  | 'appealable'
+  | 'appealed'
+  | 'queued_for_appeal'
+  | 'in_appeal_review'
+  | 'upheld'
+  | 'overturned'
+  | 'final_reject'
+  | 'expired';
+
+interface TaskTransition {
+  from: TaskState;
+  to: TaskState;
+  guard?: (task: Task, context: TransitionContext) => Promise<boolean>;
+  sideEffects: (task: Task, context: TransitionContext) => Promise<void>;
+  sla?: SLAConfig;
+}
+
+interface TransitionContext {
+  actor: string;           // reviewer ID, system, or worker ID
+  reason?: string;
+  evidenceOverrides?: Partial<EvidencePacket>;
+  metadata?: Record<string, unknown>;
+}
+
+interface SLAConfig {
+  durationMs: number;
+  escalationAction: 'reassign' | 'auto_accept' | 'auto_reject' | 'escalate';
+  escalationTarget?: string;
+}
+
+interface Task {
+  taskId: string;
+  jobTypeId: string;
+  workerId: string;
+  state: TaskState;
+  submittedAt: Date;
+  stateHistory: Array<{
+    state: TaskState;
+    enteredAt: Date;
+    exitedAt: Date | null;
+    actor: string;
+  }>;
+  
+  // Review data
+  reviewerId?: string;
+  reviewedAt?: Date;
+  reviewDecision?: 'accepted' | 'rejected';
+  reviewRejectionReasons?: string[];
+  
+  // Appeal data
+  appealReason?: string;
+  appealedAt?: Date;
+  appellateReviewerId?: string;
+  appellateReviewedAt?: Date;
+  appellateDecision?: 'upheld' | 'overturned';
+  
+  // SLA tracking
+  currentSLADeadline?: Date;
+  slaEscalationCount: number;
+  
+  // Evidence packet (assembled at transition time, stored for audit)
+  evidencePacketAtReview?: EvidencePacket;
+  evidencePacketAtAppeal?: EvidencePacket;
+}
+
+// ─── Transition Table ────────────────────────────────────────────────
+
+const TRANSITIONS: TaskTransition[] = [
+  {
+    from: 'submitted',
+    to: 'queued_for_review',
+    guard: async (task) => {
+      // Guard: worker isn't under review freeze
+      return !await reviewerPool.isWorkerFrozen(task.workerId);
+    },
+    sideEffects: async (task, ctx) => {
+      // Find a reviewer and set SLA timer
+      const assignment = await reviewerPool.findReviewer(task);
+      if (!assignment) {
+        // No reviewers available—stay in submitted, retry via scheduler
+        throw new NoReviewerAvailableError(task.jobTypeId);
+      }
+      task.reviewerId = assignment.reviewerId;
+      task.currentSLADeadline = new Date(
+        Date.now() + slaEnforcer.getSLAForJobType(task.jobTypeId, 'review').durationMs
+      );
+      metrics.increment('task.queued_for_review', { jobType: task.jobTypeId });
+    },
+    sla: {
+      durationMs: 5 * 60 * 1000, // 5 min to find a reviewer
+      escalationAction: 'escalate',
+      escalationTarget: 'review-queue-monitor',
+    },
+  },
+  
+  {
+    from: 'queued_for_review',
+    to: 'in_review',
+    sideEffects: async (task, ctx) => {
+      // Assemble the evidence packet NOW, at the moment of review start
+      // This is critical: we snapshot the evidence so it can't change 
+      // between when the reviewer starts and when they decide
+      task.evidencePacketAtReview = await assembleEvidencePacket(task, {
+        forAppeal: false,
+        requestingReviewerId: task.reviewerId!,
+      });
+      
+      // Notify reviewer
+      await reviewerPool.notifyReviewerAssignment(
+        task.reviewerId!,
+        task.taskId,
+        task.evidencePacketAtReview
+      );
+      
+      // Set review SLA
+      task.currentSLADeadline = new Date(
+        Date.now() + slaEnforcer.getSLAForJobType(task.jobTypeId, 'review_completion').durationMs
+      );
+      
+      metrics.increment('task.review_started', { jobType: task.jobTypeId });
+      metrics.histogram('task.time_to_review_start', 
+        Date.now() - task.submittedAt.getTime(),
+        { jobType: task.jobTypeId }
+      );
+    },
+    sla: {
+      durationMs: 15 * 60 * 1000, // 15 min to complete review
+      escalationAction: 'reassign',
+    },
+  },
+  
+  {
+    from: 'in_review',
+    to: 'accepted',
+    sideEffects: async (task, ctx) => {
+      task.reviewDecision = 'accepted';
+      task.reviewedAt = new Date();
+      
+      // Update worker performance signal (feeds deck ranking model)
+      await workerPerformanceSignal.recordOutcome({
+        workerId: task.workerId,
+        jobTypeId: task.jobTypeId,
+        taskId: task.taskId,
+        outcome: 'accepted',
+        reviewerId: task.reviewerId!,
+        reviewedAt: task.reviewedAt,
+      });
+      
+      // Update reviewer performance (reviewer accuracy tracking)
+      await reviewerPerformanceTracker.recordReview({
+        reviewerId: task.reviewerId!,
+        jobTypeId: task.jobTypeId,
+        decision: 'accepted',
+        willBeAppealable: false, // acceptances aren't appealable by design
+      });
+      
+      metrics.increment('task.accepted', { jobType: task.jobTypeId });
+      metrics.histogram('task.review_duration',
+        task.reviewedAt.getTime() - (task.stateHistory.find(s => s.state === 'in_review')?.enteredAt.getTime() || 0),
+        { jobType: task.jobTypeId }
+      );
+    },
+  },
+  
+  {
+    from: 'in_review',
+    to: 'rejected',
+    guard: async (task, ctx) => {
+      // Guard: rejection MUST have at least one reason code
+      return !!(ctx.metadata?.rejectionReasons as string[]?.length);
+    },
+    sideEffects: async (task, ctx) => {
+      task.reviewDecision = 'rejected';
+      task.reviewedAt = new Date();
+      task.reviewRejectionReasons = ctx.metadata!.rejectionReasons as string[];
+      
+      // Update worker performance signal
+      await workerPerformanceSignal.recordOutcome({
+        workerId: task.workerId,
+        jobTypeId: task.jobTypeId,
+        taskId: task.taskId,
+        outcome: 'rejected',
+        reviewerId: task.reviewerId!,
+        reviewedAt: task.reviewedAt,
+        rejectionReasons: task.reviewRejectionReasons,
+      });
+      
+      // Track reviewer decision (will be updated if appealed and overturned)
+      await reviewerPerformanceTracker.recordReview({
+        reviewerId: task.reviewerId!,
+        jobTypeId: task.jobTypeId,
+        decision: 'rejected',
+        rejectionReasons: task.reviewRejectionReasons,
+        willBeAppealable: true,
+      });
+      
+      metrics.increment('task.rejected', { 
+        jobType: task.jobTypeId,
+        reasons: task.reviewRejectionReasons.join(','),
+      });
+    },
+  },
+  
+  {
+    from: 'rejected',
+    to: 'appealable',
+    sideEffects: async (task) => {
+      // Start the appeal window timer
+      task.currentSLADeadline = new Date(
+        Date.now() + slaEnforcer.getAppealWindowForJobType(task.jobTypeId).durationMs
+      );
+      metrics.increment('task.became_appealable', { jobType: task.jobTypeId });
+    },
+    sla: {
+      durationMs: 24 * 60 * 60 * 1000, // 24h appeal window
+      escalationAction: 'auto_accept', // If no appeal filed, rejection stands → final_reject
+    },
+  },
+  
+  {
+    from: 'appealable',
+    to: 'appealed',
+    guard: async (task, ctx) => {
+      // Guard: appeal must have a reason
+      // Guard: worker can't appeal more than X% of their rejections (gaming prevention)
+      const appealRate = await workerPerformanceSignal.getAppealRate(
+        task.workerId, 
+        /* windowMs */ 7 * 24 * 60 * 60 * 1000
+      );
+      const maxAppealRate = slaEnforcer.getMaxAppealRateForJobType(task.jobTypeId);
+      
+      if (appealRate > maxAppealRate && !(ctx.metadata?.forceAllow as boolean)) {
+        throw new AppealRateExceededError(task.workerId, appealRate, maxAppealRate);
+      }
+      
+      return !!(ctx.metadata?.appealReason as string);
+    },
+    sideEffects: async (task, ctx) => {
+      task.appealReason = ctx.metadata!.appealReason as string;
+      task.appealedAt = new Date();
+      
+      metrics.increment('task.appealed', { 
+        jobType: task.jobTypeId,
+        appealReason: task.appealReason,
+      });
+    },
+  },
+  
+  {
+    from: 'appealable',
+    to: 'final_reject',
+    // This transition fires when the SLA expires (no appeal filed)
+    sideEffects: async (task) => {
+      // The rejection is now final. Update reviewer performance to mark
+      // that their decision was not contested (weak signal of correctness)
+      await reviewerPerformanceTracker.markNotContested(task.taskId);
+      metrics.increment('task.rejection_finalized_no_appeal', { jobType: task.jobTypeId });
+    },
+  },
+  
+  {
+    from: 'appealed',
+    to: 'queued_for_appeal',
+    guard: async (task) => {
+      // Guard: CRITICAL — the appellate reviewer MUST be different from 
+      // the original reviewer. This is non-negotiable.
+      // Also: ideally different from reviewers who frequently agree with 
+      // the original reviewer (collusion detection — simplified here)
+      return true;
+    },
+    sideEffects: async (task, ctx) => {
+      const assignment = await reviewerPool.findAppellateReviewer(task, {
+        excludeReviewerIds: [task.reviewerId!],
+        preferSenior: true, // appellate reviewers should be more experienced
+      });
+      
+      if (!assignment) {
+        throw new NoReviewerAvailableError(task.jobTypeId);
+      }
+      
+      task.appellateReviewerId = assignment.reviewerId;
+      task.currentSLADeadline = new Date(
+        Date.now() + slaEnforcer.getSLAForJobType(task.jobTypeId, 'appeal_review').durationMs
+      );
+      
+      metrics.increment('task.queued_for_appeal', { jobType: task.jobTypeId });
+    },
+    sla: {
+      durationMs: 30 * 60 * 1000, // 30 min for appeal review (higher priority)
+      escalationAction: 'escalate',
+      escalationTarget: 'appeal-queue-monitor',
+    },
+  },
+  
+  {
+    from: 'queued_for_appeal',
+    to: 'in_appeal_review',
+    sideEffects: async (task, ctx) => {
+      // Assemble appeal evidence packet — THIS IS THE CRITICAL PART
+      // The appeal packet is different from the review packet. See below.
+      task.evidencePacketAtAppeal = await assembleEvidencePacket(task, {
+        forAppeal: true,
+        requestingReviewerId: task.appellateReviewerId!,
+      });
+      
+      await reviewerPool.notifyReviewerAssignment(
+        task.appellateReviewerId!,
+        task.taskId,
+        task.evidencePacketAtAppeal
+      );
+      
+      task.currentSLADeadline = new Date(
+        Date.now() + slaEnforcer.getSLAForJobType(task.jobTypeId, 'appeal_completion').durationMs
+      );
+      
+      metrics.increment('task.appeal_review_started', { jobType: task.jobTypeId });
+      metrics.histogram('task.time_to_appeal_review',
+        Date.now() - task.appealedAt!.getTime(),
+        { jobType: task.jobTypeId }
+      );
+    },
+    sla: {
+      durationMs: 10 * 60 * 1000, // 10 min to decide appeal (tighter than original review)
+      escalationAction: 'reassign',
+    },
+  },
+  
+  {
+    from: 'in_appeal_review',
+    to: 'upheld',
+    sideEffects: async (task, ctx) => {
+      task.appellateDecision = 'upheld';
+      task.appellateReviewedAt = new Date();
+      
+      // Original rejection stands. Update reviewer performance — 
+      // their decision was upheld (strong signal of correctness)
+      await reviewerPerformanceTracker.markUpheld(task.taskId, {
+        appellateReviewerId: task.appellateReviewerId!,
+      });
+      
+      // Worker's appeal was denied — this is a negative signal for the worker
+      // (frivolous appeals should be penalized to prevent gaming)
+      await workerPerformanceSignal.recordAppealOutcome({
+        taskId: task.taskId,
+        workerId: task.workerId,
+        outcome: 'upheld', // appeal denied, rejection stands
+      });
+      
+      metrics.increment('task.appeal_upheld', { jobType: task.jobTypeId });
+    },
+  },
+  
+  {
+    from: 'in_appeal_review',
+    to: 'overturned',
+    sideEffects: async (task, ctx) => {
+      task.appellateDecision = 'overturned';
+      task.appellateReviewedAt = new Date();
+      
+      // The original reviewer was WRONG. This is the most important 
+      // signal in the system — it's the only ground truth we have.
+      
+      // 1. Fix the worker's record — this rejection should not count
+      await workerPerformanceSignal.recordAppealOutcome({
+        taskId: task.taskId,
+        workerId: task.workerId,
+        outcome: 'overturned', // appeal granted, rejection removed
+      });
+      
+      // 2. Penalize the original reviewer — this is reviewer accuracy signal
+      await reviewerPerformanceTracker.markOverturned(task.taskId, {
+        appellateReviewerId: task.appellateReviewerId!,
+        reason: ctx.metadata?.overturnReason as string,
+      });
+      
+      // 3. If this reviewer has a pattern of overturned decisions, 
+      //    flag for human audit (done asynchronously by reviewer pool)
+      await reviewerPool.checkForAccuracyDegradation(task.reviewerId!);
+      
+      metrics.increment('task.appeal_overturned', { 
+        jobType: task.jobTypeId,
+        originalReviewer: task.reviewerId!,
+      });
+      
+      // This is the metric we watch most closely — if overturn rate 
+      // is >15%, something is systematically broken
+      metrics.histogram('reviewer.overturn_rate', 1, {
+        reviewerId: task.reviewerId!,
+        jobType: task.jobTypeId,
+      });
+    },
+  },
+  
+  {
+    from: 'upheld',
+    to: 'final_reject',
+    sideEffects: async (task) => {
+      metrics.increment('task.final_reject_after_appeal', { jobType: task.jobTypeId });
+    },
+  },
+];
+
+// ─── State Machine Engine ────────────────────────────────────────────
+
+class TaskStateMachine extends EventEmitter {
+  private tasks: Map<string, Task> = new Map();
+  private slaTimers: Map<string, NodeJS.Timeout> = new Map();
+  
+  constructor(
+    private slaEnforcer: SLAEnforcer,
+    private reviewerPool: ReviewerPool,
+    private workerPerformanceSignal: WorkerPerformanceSignal,
+    private reviewerPerformanceTracker: ReviewerPerformanceTracker,
+    private metrics: MetricsClient,
+  ) {
+    super();
+  }
+  
+  async transition(taskId: string, targetState: TaskState, context: TransitionContext): Promise<Task> {
+    const task = this.getTask(taskId);
+    const transition = TRANSITIONS.find(t => t.from === task.state && t.to === targetState);
+    
+    if (!transition) {
+      throw new InvalidTransitionError(taskId, task.state, targetState);
+    }
+    
+    // Run guard
+    if (transition.guard) {
+      const guardResult = await transition.guard(task, context);
+      if (!guardResult) {
+        throw new TransitionGuardFailedError(taskId, task.state, targetState);
+      }
+    }
+    
+    // Exit current state
+    const currentStateEntry = task.stateHistory.find(s => s.state === task.state)!;
+    currentStateEntry.exitedAt = new Date();
+    
+    // Clear existing SLA timer
+    this.clearSLATimer(taskId);
+    
+    // Enter new state
+    const previousState = task.state;
+    task.state = targetState;
+    task.stateHistory.push({
+      state: targetState,
+      enteredAt: new Date(),
+      exitedAt: null,
+      actor: context.actor,
+    });
+    
+    // Run side effects
+    await transition.sideEffects(task, context);
+    
+    // Set new SLA timer if configured
+    if (transition.sla) {
+      this.setSLATimer(taskId, task, transition.sla);
+    }
+    
+    // Persist
+    await this.persist(task);
+    
+    // Emit for event-driven downstream consumers (deck ranking model, etc.)
+    this.emit('transition', {
+      taskId,
+      from: previousState,
+      to: targetState,
+      task,
+      context,
+    });
+    
+    return task;
+  }
+  
+  private setSLATimer(taskId: string, task: Task, sla: SLAConfig): void {
+    const timer = setTimeout(async () => {
+      try {
+        await this.handleSLAExpiry(taskId, sla);
+      } catch (err) {
+        this.metrics.increment('sla.expiry_handling_error', { 
+          taskId, 
+          escalationAction: sla.escalationAction 
+        });
+      }
+    }, sla.durationMs);
+    
+    // Don't let the timer prevent process exit
+    if (timer.unref) timer.unref();
+    
+    this.slaTimers.set(taskId, timer);
+  }
+  
+  private clearSLATimer(taskId: string): void {
+    const existing = this.slaTimers.get(taskId);
+    if (existing) {
+      clearTimeout(existing);
+      this.slaTimers.delete(taskId);
+    }
+  }
+  
+  private async handleSLAExpiry(taskId: string, sla: SLAConfig): Promise<void> {
+    const task = this.getTask(taskId);
+    
+    this.metrics.increment('sla.expired', {
+      state: task.state,
+      escalationAction: sla.escalationAction,
+      jobType: task.jobTypeId,
+    });
+    
+    task.slaEscalationCount++;
+    
+    switch (sla.escalationAction) {
+      case 'reassign': {
+        // Find a new reviewer and reset the timer
+        const isAppeal = task.state === 'in_appeal_review';
+        const assignment = isAppeal
+          ? await this.reviewerPool.findAppellateReviewer(task, {
+              excludeReviewerIds: [task.reviewerId!, task.appellateReviewerId!].filter(Boolean),
+              preferSenior: true,
+            })
+          : await this.reviewerPool.findReviewer(task);
+        
+        if (assignment) {
+          if (isAppeal) {
+            task.appellateReviewerId = assignment.reviewerId;
+          } else {
+            task.reviewerId = assignment.reviewerId;
+          }
+          
+          // Reset to queued state to re-assemble evidence packet for new reviewer
+          const queuedState = isAppeal ? 'queued_for_appeal' : 'queued_for_review';
+          await this.transition(taskId, queuedState, {
+            actor: 'system:sla-reassign',
+            metadata: { reason: `SLA expired after ${sla.durationMs}ms, reassigned` },
+          });
+        } else {
+          // No reviewer available — escalate to human monitor
+          this.metrics.increment('sla.expiry_no_reviewer', { state: task.state });
+          await this.escalateToMonitor(taskId, sla);
+        }
+        break;
+      }
+      
+      case 'auto_accept': {
+        // Appeal window expired without appeal — rejection is final
+        await this.transition(taskId, 'final_reject', {
+          actor: 'system:sla-auto-finalize',
+          metadata: { reason: 'Appeal window expired' },
+        });
+        break;
+      }
+      
+      case 'escalate': {
+        await this.escalateToMonitor(taskId, sla);
+        break;
+      }
+      
+      default:
+        this.metrics.increment('sla.expiry_unhandled', { 
+          action: sla.escalationAction, 
+          state: task.state 
+        });
+    }
+  }
+  
+  private async escalateToMonitor(taskId: string, sla: SLAConfig): Promise<void> {
+    const task = this.getTask(taskId);
+    // In production this posts to a Slack channel / pagerduty / dashboard
+    this.metrics.increment('sla.escalated_to_monitor', {
+      state: task.state,
+      jobType: task.jobTypeId,
+      escalationTarget: sla.escalationTarget || 'unknown',
+    });
+    this.emit('escalation', { taskId, task, sla });
+  }
+  
+  private getTask(taskId: string): Task {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new TaskNotFoundError(taskId);
+    return task;
+  }
+  
+  private async persist(task: Task): Promise<void> {
+    // In production: write to event-sourced log + materialized read model
+    // The state history is the audit trail — it's immutable
+    this.tasks.set(task.taskId, task);
+  }
+}
+
+// ─── Error Types ─────────────────────────────────────────────────────
+
+class InvalidTransitionError extends Error {
+  constructor(taskId: string, from: TaskState, to: TaskState) {
+    super(`Invalid transition: ${taskId} cannot go from ${from} to ${to}`);
+  }
+}
+
+class TransitionGuardFailedError extends Error {
+  constructor(taskId: string, from: TaskState, to: TaskState) {
+    super(`Guard failed: ${taskId} transition from ${from} to ${to}`);
+  }
+}
+
+class NoReviewerAvailableError extends Error {
+  constructor(jobTypeId: string) {
+    super(`No reviewer available for job type: ${jobTypeId}`);
+  }
+}
+
+class AppealRateExceededError extends Error {
+  constructor(workerId: string, actual: number, max: number) {
+    super(`Worker ${workerId} appeal rate ${actual} exceeds max ${max}`);
+  }
+}
+
+class TaskNotFoundError extends Error {
+  constructor(taskId: string) {
+    super(`Task not found: ${taskId}`);
+  }
+}
