@@ -1,0 +1,256 @@
+// ci-gate.ts
+// This is the entry point for CI. It:
+// 1. Spins up testcontainers
+// 2. Runs k6 scenarios
+// 3. Advances the controllable clock (for SLA tests)
+// 4. Checks all invariants
+// 5. Outputs results and exits with appropriate code
+
+import { createTestEnvironment, TestEnvironment } from './test-environment';
+import { runAllInvariants, formatInvariantResults, InvariantResult } from './invariants';
+import { execSync, spawn } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+
+interface CIGateResult {
+  k6Success: boolean;
+  invariants: InvariantResult[];
+  mergeAllowed: boolean;
+  durationMs: number;
+  k6Output: string;
+  invariantOutput: string;
+  serviceLogs: Record<string, string>;
+}
+
+async function runCIGate(): Promise<CIGateResult> {
+  const startTime = Date.now();
+  let env: TestEnvironment | null = null;
+  const serviceLogs: Record<string, string> = {};
+  
+  try {
+    // ── Phase 1: Spin up environment ──
+    console.log('═══════════════════════════════════════════');
+    console.log('  CI GATE: Spinning up test environment');
+    console.log('═══════════════════════════════════════════');
+    
+    env = await createTestEnvironment();
+    
+    const stateMachineUrl = `http://${env.stateMachineService.getHost()}:${env.stateMachineService.getMappedPort(3001)}`;
+    
+    // ── Phase 2: Run k6 steady state ──
+    console.log('\n═══════════════════════════════════════════');
+    console.log('  PHASE 1: Steady-state concurrent load');
+    console.log('═══════════════════════════════════════════');
+    
+    const k6Output1 = runK6(stateMachineUrl, {
+      VUS: '20',
+      DURATION: '30s',
+      SCENARIO: 'steady_state',
+    });
+    
+    // Quick invariant check after steady state (should all pass)
+    let midResults = await runAllInvariants(env.dbPool);
+    let criticalMid = midResults.filter(r => !r.passed && r.severity === 'critical');
+    if (criticalMid.length > 0) {
+      console.log('\n🚨 CRITICAL: Invariants failed after steady state!');
+      console.log(formatInvariantResults(midResults));
+      return failEarly(env, startTime, k6Output1, midResults, serviceLogs);
+    }
+    
+    // ── Phase 3: Run SLA storm ──
+    console.log('\n═══════════════════════════════════════════');
+    console.log('  PHASE 2: SLA storm + clock advance');
+    console.log('═══════════════════════════════════════════');
+    
+    const k6Output2 = runK6(stateMachineUrl, {
+      VUS: '10',
+      DURATION: '10s',
+      SCENARIO: 'sla_storm',
+    });
+    
+    // NOW advance the clock by 30 minutes to trigger all SLA timers
+    console.log('  ⏩ Advancing clock by 30 minutes...');
+    await env.advanceTime(30 * 60 * 1000);
+    
+    // Wait for SLA handlers to settle
+    await sleep(2000);
+    
+    // Check invariants after SLA storm
+    midResults = await runAllInvariants(env.dbPool);
+    criticalMid = midResults.filter(r => !r.passed && r.severity === 'critical');
+    if (criticalMid.length > 0) {
+      console.log('\n🚨 CRITICAL: Invariants failed after SLA storm!');
+      console.log(formatInvariantResults(midResults));
+      return failEarly(env, startTime, k6Output1 + '\n' + k6Output2, midResults, serviceLogs);
+    }
+    
+    // ── Phase 4: Run appeal flood ──
+    console.log('\n═══════════════════════════════════════════');
+    console.log('  PHASE 3: Appeal flood');
+    console.log('═══════════════════════════════════════════');
+    
+    const k6Output3 = runK6(stateMachineUrl, {
+      VUS: '8',
+      DURATION: '15s',
+      SCENARIO: 'appeal_flood',
+    });
+    
+    // Advance clock again for appeal SLAs
+    console.log('  ⏩ Advancing clock by 15 minutes (appeal SLAs)...');
+    await env.advanceTime(15 * 60 * 1000);
+    await sleep(2000);
+    
+    // ── Phase 5: Final invariant check ──
+    console.log('\n═══════════════════════════════════════════');
+    console.log('  FINAL: Checking all invariants');
+    console.log('═══════════════════════════════════════════');
+    
+    const finalResults = await runAllInvariants(env.dbPool);
+    const invariantOutput = formatInvariantResults(finalResults);
+    console.log(invariantOutput);
+    
+    const criticalFailures = finalResults.filter(r => !r.passed && r.severity === 'critical');
+    const k6Success = !k6Output1.includes('ERRORED') && 
+                      !k6Output2.includes('ERRORED') && 
+                      !k6Output3.includes('ERRORED');
+    
+    // Collect service logs for debugging if anything failed
+    if (criticalFailures.length > 0 || !k6Success) {
+      for (const service of ['state-machine', 'evidence-packet', 'reviewer-pool', 'worker-signal', 'sla-enforcer']) {
+        serviceLogs[service] = await env.getLogs(service);
+      }
+    }
+    
+    return {
+      k6Success,
+      invariants: finalResults,
+      mergeAllowed: criticalFailures.length === 0,
+      durationMs: Date.now() - startTime,
+      k6Output: k6Output1 + '\n---\n' + k6Output2 + '\n---\n' + k6Output3,
+      invariantOutput,
+      serviceLogs,
+    };
+    
+  } catch (err) {
+    console.error('💥 CI GATE CRASHED:', err);
+    
+    // Try to collect logs even on crash
+    if (env) {
+      try {
+        for (const service of ['state-machine', 'evidence-packet', 'reviewer-pool', 'worker-signal', 'sla-enforcer']) {
+          serviceLogs[service] = await env.getLogs(service);
+        }
+      } catch (_) { /* best effort */ }
+    }
+    
+    return {
+      k6Success: false,
+      invariants: [],
+      mergeAllowed: false,
+      durationMs: Date.now() - startTime,
+      k6Output: 'CI gate crashed before k6 completed',
+      invariantOutput: 'CI gate crashed before invariant checks',
+      serviceLogs,
+    };
+    
+  } finally {
+    if (env) {
+      await env.cleanup();
+    }
+  }
+}
+
+function runK6(baseUrl: string, envVars: Record<string, string>): string {
+  try {
+    const envString = Object.entries({ BASE_URL: baseUrl, ...envVars })
+      .map(([k, v]) => `${k}=${v}`)
+      .join(' ');
+    
+    const output = execSync(
+      `k6 run --no-thresholds --out json=/tmp/k6-output.json tests/k6/invariant-probe.js`,
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, BASE_URL: baseUrl, ...envVars },
+        timeout: 120000, // 2 minute timeout per scenario
+        cwd: path.resolve(__dirname, '..'),
+      }
+    );
+    
+    return output;
+  } catch (err: any) {
+    // k6 exits with non-zero if thresholds are breached, but we handle 
+    // thresholds ourselves. Check if it's a threshold failure or a real error.
+    if (err.stdout) return err.stdout;
+    if (err.stderr) return `STDERR: ${err.stderr}`;
+    return `UNKNOWN ERROR: ${err.message}`;
+  }
+}
+
+function failEarly(
+  env: TestEnvironment,
+  startTime: number,
+  k6Output: string,
+  invariants: InvariantResult[],
+  serviceLogs: Record<string, string>
+): CIGateResult {
+  return {
+    k6Success: false,
+    invariants,
+    mergeAllowed: false,
+    durationMs: Date.now() - startTime,
+    k6Output,
+    invariantOutput: formatInvariantResults(invariants),
+    serviceLogs,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ─── Entry Point ───
+
+async function main() {
+  const result = await runCIGate();
+  
+  // Write results to file for CI artifact upload
+  const resultsDir = path.resolve(__dirname, '../test-results');
+  if (!fs.existsSync(resultsDir)) {
+    fs.mkdirSync(resultsDir, { recursive: true });
+  }
+  
+  fs.writeFileSync(
+    path.join(resultsDir, 'ci-gate-result.json'),
+    JSON.stringify({
+      ...result,
+      // Don't include full logs in JSON — they go to separate files
+      serviceLogs: Object.fromEntries(
+        Object.entries(result.serviceLogs).map(([k, v]) => [k, `${v.length} bytes`])
+      ),
+    }, null, 2)
+  );
+  
+  // Write service logs to separate files (can be large)
+  for (const [service, logs] of Object.entries(result.serviceLogs)) {
+    fs.writeFileSync(
+      path.join(resultsDir, `logs-${service}.txt`),
+      logs
+    );
+  }
+  
+  // Exit code
+  if (!result.mergeAllowed) {
+    console.error('\n🚨🚨🚨 MERGE BLOCKED 🚨🚨🚨');
+    console.error('Critical invariants failed. DO NOT MERGE.');
+    console.error('Check test-results/ for details.');
+    process.exit(1);
+  }
+  
+  console.log('\n✅ MERGE ALLOWED — All invariants pass.');
+  process.exit(0);
+}
+
+main().catch((err) => {
+  console.error('Fatal error in CI gate:', err);
+  process.exit(2);
+});
