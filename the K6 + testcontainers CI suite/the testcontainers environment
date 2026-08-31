@@ -1,0 +1,290 @@
+// test-environment.ts
+// This file sets up the ENTIRE system in testcontainers.
+// It's the most complex file in the test suite because it has to 
+// replicate production infrastructure faithfully.
+
+import { GenericContainer, Wait, Network, PostgreSqlContainer, RedisContainer } from 'testcontainers';
+import { StartedTestContainer } from 'testcontainers/dist/started-container';
+import { Pool } from 'pg';
+import { execSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+
+interface TestEnvironment {
+  // Infrastructure
+  postgres: PostgreSqlContainer;
+  redis: RedisContainer;
+  rabbitmq: StartedTestContainer;
+  network: Network;
+  
+  // Application services (each in their own container)
+  stateMachineService: StartedTestContainer;
+  evidencePacketService: StartedTestContainer;
+  reviewerPoolService: StartedTestContainer;
+  workerSignalService: StartedTestContainer;
+  slaService: StartedTestContainer;
+  
+  // Connection info
+  postgresUrl: string;
+  redisUrl: string;
+  rabbitmqUrl: string;
+  
+  // Direct DB access for invariant checks
+  dbPool: Pool;
+  
+  // Lifecycle
+  cleanup: () => Promise<void>;
+  getLogs: (service: string) => Promise<string>;
+  advanceTime: (ms: number) => Promise<void>;
+}
+
+const SERVICES = [
+  'state-machine',
+  'evidence-packet',
+  'reviewer-pool',
+  'worker-signal',
+  'sla-enforcer',
+] as const;
+
+// ─── Configuration ───
+// These mirror production as closely as possible.
+// The ONLY difference is resource limits (lower CPU/memory for CI).
+
+const SERVICE_CONFIG = {
+  'state-machine': {
+    image: 'ecr.aws/our-repo/state-machine-service:latest',
+    port: 3001,
+    env: {
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'debug', // Verbose logs for CI debugging
+      DB_POOL_SIZE: '5',  // Smaller pool for CI
+      // ... other env vars mirror production
+    },
+    resources: {
+      memoryMB: 256,
+      cpuPeriod: 100000,
+      cpuQuota: 50000, // 0.5 CPU
+    },
+  },
+  'evidence-packet': {
+    image: 'ecr.aws/our-repo/evidence-packet-service:latest',
+    port: 3002,
+    env: {
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'debug',
+      EXAMPLE_STORE_URL: 'http://example-store:3006',
+      GUIDELINES_CACHE_TTL_MS: '0', // No caching in tests — we want real behavior
+    },
+    resources: { memoryMB: 256, cpuPeriod: 100000, cpuQuota: 50000 },
+  },
+  'reviewer-pool': {
+    image: 'ecr.aws/our-repo/reviewer-pool-service:latest',
+    port: 3003,
+    env: {
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'debug',
+      REVIEWER_CACHE_TTL_MS: '0', // No caching — catch stale cache bugs
+    },
+    resources: { memoryMB: 128, cpuPeriod: 100000, cpuQuota: 25000 },
+  },
+  'worker-signal': {
+    image: 'ecr.aws/our-repo/worker-signal-service:latest',
+    port: 3004,
+    env: {
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'debug',
+      FEATURE_STORE_URL: 'http://feature-store:3007',
+    },
+    resources: { memoryMB: 128, cpuPeriod: 100000, cpuQuota: 25000 },
+  },
+  'sla-enforcer': {
+    image: 'ecr.aws/our-repo/sla-enforcer-service:latest',
+    port: 3005,
+    env: {
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'debug',
+      // In test mode, SLA timers use a controllable clock instead of real time
+      // This is CRITICAL for testing SLA behaviour without waiting minutes
+      CLOCK_TYPE: 'controllable',
+    },
+    resources: { memoryMB: 64, cpuPeriod: 100000, cpuQuota: 25000 },
+  },
+} as const;
+
+export async function createTestEnvironment(): Promise<TestEnvironment> {
+  console.log('🏗️  Spinning up test infrastructure...');
+  const startTime = Date.now();
+  
+  // ── 1. Create isolated network ──
+  const network = await new Network().start();
+  
+  // ── 2. Start infrastructure containers ──
+  const postgres = await new PostgreSqlContainer('postgres:15-alpine')
+    .withNetwork(network)
+    .withNetworkAliases('postgres')
+    .withDatabase('review_system_test')
+    .withUsername('test')
+    .withPassword('test')
+    .withExposedPorts(5432)
+    .start();
+  
+  const redis = await new RedisContainer('redis:7-alpine')
+    .withNetwork(network)
+    .withNetworkAliases('redis')
+    .withExposedPorts(6379)
+    .start();
+  
+  const rabbitmq = await new GenericContainer('rabbitmq:3-management-alpine')
+    .withNetwork(network)
+    .withNetworkAliases('rabbitmq')
+    .withExposedPorts(5672, 15672)
+    .withWaitStrategy(Wait.forLogMessage('Server startup complete'))
+    .start();
+  
+  console.log(`  ✅ Infrastructure up (${Date.now() - startTime}ms)`);
+  
+  // ── 3. Run database migrations ──
+  const postgresUrl = postgres.getConnectionUri();
+  console.log('  📦 Running migrations...');
+  execSync(`DATABASE_URL="${postgresUrl}" npx prisma migrate deploy`, {
+    cwd: path.resolve(__dirname, '../'),
+    stdio: 'pipe',
+  });
+  
+  // Also seed test data: reviewers, job types, guidelines
+  execSync(`DATABASE_URL="${postgresUrl}" npx prisma db seed -- --environment test`, {
+    cwd: path.resolve(__dirname, '../'),
+    stdio: 'pipe',
+  });
+  
+  const redisUrl = `redis://${redis.getHost()}:${redis.getMappedPort(6379)}`;
+  const rabbitmqUrl = `amqp://guest:guest@${rabbitmq.getHost()}:${rabbitmq.getMappedPort(5672)}`;
+  
+  // ── 4. Start application services ──
+  const serviceContainers: Record<string, StartedTestContainer> = {};
+  
+  for (const [serviceName, config] of Object.entries(SERVICE_CONFIG)) {
+    console.log(`  🚀 Starting ${serviceName}...`);
+    
+    const container = await new GenericContainer(config.image)
+      .withNetwork(network)
+      .withNetworkAliases(serviceName)
+      .withExposedPorts(config.port)
+      .withEnvironment({
+        ...config.env,
+        DATABASE_URL: postgresUrl,
+        REDIS_URL: redisUrl,
+        RABBITMQ_URL: rabbitmqUrl,
+        RABBITMQ_QUEUE_PREFIX: `test_${process.env.CI_RUN_ID || 'local'}_`,
+      })
+      .withWaitStrategy(Wait.forHttp('/health', config.port)
+        .forResponseMatching(body => JSON.parse(body).status === 'ready'))
+      .withStartupTimeout(30000) // 30s startup timeout
+      .start();
+    
+    serviceContainers[serviceName] = container;
+  }
+  
+  console.log(`  ✅ All services up (${Date.now() - startTime}ms)`);
+  
+  // ── 5. Create direct DB pool for invariant checks ──
+  const dbPool = new Pool({
+    connectionString: postgresUrl,
+    max: 5,
+  });
+  
+  // ── 6. Return environment ──
+  return {
+    postgres,
+    redis,
+    rabbitmq,
+    network,
+    stateMachineService: serviceContainers['state-machine'],
+    evidencePacketService: serviceContainers['evidence-packet'],
+    reviewerPoolService: serviceContainers['reviewer-pool'],
+    workerSignalService: serviceContainers['worker-signal'],
+    slaService: serviceContainers['sla-enforcer'],
+    postgresUrl,
+    redisUrl,
+    rabbitmqUrl,
+    dbPool,
+    
+    cleanup: async () => {
+      console.log('🧹 Tearing down test environment...');
+      await dbPool.end();
+      for (const container of Object.values(serviceContainers)) {
+        await container.stop();
+      }
+      await rabbitmq.stop();
+      await redis.stop();
+      await postgres.stop();
+      await network.stop();
+      console.log('✅ Cleanup complete');
+    },
+    
+    getLogs: async (serviceName: string): Promise<string> => {
+      const container = serviceContainers[serviceName];
+      if (!container) throw new Error(`Unknown service: ${serviceName}`);
+      return container.logs();
+    },
+    
+    // This is the magic method — advance the controllable clock
+    // Used to fast-forward through SLA timers without waiting
+    advanceTime: async (ms: number): Promise<void> => {
+      // The SLA enforcer service exposes a test-only endpoint
+      // that advances its internal clock by the given duration
+      const slaHost = serviceContainers['sla-enforcer'].getHost();
+      const slaPort = serviceContainers['sla-enforcer'].getMappedPort(3005);
+      
+      const response = await fetch(`http://${slaHost}:${slaPort}/__test/advance-clock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ advanceMs: ms }),
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Failed to advance clock: ${response.status} ${await response.text()}`);
+      }
+      
+      // Wait for any SLA handlers to fire and process
+      await new Promise(resolve => setTimeout(resolve, 500));
+    },
+  };
+}
+
+// ─── The Controllable Clock ───
+// This is a test-only modification to the SLA enforcer that replaces 
+// setTimeout with a priority queue driven by an explicit clock.
+// In production, this code path is never reached (CLOCK_TYPE != 'controllable').
+
+// sla-enforcer/test-clock.ts (inside the SLA enforcer service)
+// 
+// import { MinPriorityQueue } from '@datastructures-js/priority-queue';
+// 
+// class ControllableClock {
+//   private currentTimeMs: number = 0;
+//   private timerQueue = new MinPriorityQueue<{ fireAtMs: number; callback: () => void }>(
+//     (item) => item.fireAtMs
+//   );
+//   
+//   now(): Date {
+//     return new Date(this.currentTimeMs);
+//   }
+//   
+//   setTimeout(callback: () => void, delayMs: number): any {
+//     const fireAtMs = this.currentTimeMs + delayMs;
+//     this.timerQueue.enqueue({ fireAtMs, callback });
+//     return { fireAtMs }; // "timer handle" — not used for clearing in tests
+//   }
+//   
+//   async advance(ms: number): Promise<void> {
+//     this.currentTimeMs += ms;
+//     
+//     // Fire all timers that are now due
+//     while (!this.timerQueue.isEmpty() && this.timerQueue.front().element.fireAtMs <= this.currentTimeMs) {
+//       const { callback } = this.timerQueue.dequeue().element;
+//       // Run callbacks sequentially to mimic real setTimeout behavior
+//       await callback();
+//     }
+//   }
+// }
