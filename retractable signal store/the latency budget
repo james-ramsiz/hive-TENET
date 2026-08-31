@@ -1,0 +1,32 @@
+┌─────────────────────────────────────────────────────────────────┐
+│                    LATENCY BUDGET                                │
+│                                                                  │
+│  WRITE PATH (emission or retraction)                             │
+│  ├── Event log append (INSERT with sequence):     2-5ms         │
+│  ├── Materializer pick up (polling interval):     0-500ms       │
+│  ├── Materializer process + DB write:             1-3ms         │
+│  └── Total: end-to-end visibility                 ~500ms-1s     │
+│                                                                  │
+│  READ PATH (feature store query)                                 │
+│  ├── signal_current_state query:               1-5ms           │
+│  └── Total:                                       1-5ms         │
+│                                                                  │
+│  RECONCILIATION                                                   │
+│  ├── Sample check (10% of signals):           5-30s            │
+│  ├── Full rebuild (if needed):                30-120s          │
+│  └── Runs every:                              5 minutes        │
+│                                                                  │
+│  TRAINING SNAPSHOT                                                 │
+│  ├── Full extract (all workers, all types):  10-60s            │
+│  └── Runs:                                 on schedule (daily) │
+│                                                                  │
+│  KEY CONSTRAINT:                                                  │
+│  The materialized view is stale by up to 500ms. Any read that    │
+│  happens in that window sees the pre-retraction state. This is   │
+│  acceptable because:                                              │
+│  1. The deck ranking model refreshes features every 30s anyway   │
+│  2. A single prediction using stale features has negligible      │
+│     impact on the overall ranking                                 │
+│  3. The alternative (synchronous write-through) adds 2-5ms to   │
+│     EVERY read, which is unacceptable at prediction time         │
+└─────────────────────────────────────────────────────────────────┘
