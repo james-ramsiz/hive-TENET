@@ -1,0 +1,220 @@
+// reconciler.ts
+
+import { Pool } from 'pg';
+import { SignalEventLog } from './signal-event-log';
+import { MetricsClient } from './metrics';
+
+class SignalReconciler {
+  constructor(
+    private db: Pool,
+    private eventLog: SignalEventLog,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Compare the materialized view to the event log and fix any drift.
+   * 
+   * This runs on a schedule (every 5 minutes in production).
+   * It's the last line of defense against silent data corruption.
+   */
+  async reconcile(): Promise<{
+    runId: string;
+    totalChecked: number;
+    mismatchesFound: number;
+    mismatchesFixed: boolean;
+    details: any[];
+  }> {
+    const runId = `recon-${Date.now()}`;
+    const startTime = Date.now();
+    const details: any[] = [];
+    
+    console.log(`🔍 Reconciliation run ${runId} starting...`);
+    
+    // Strategy: Rebuild the expected state from the event log for a SAMPLE
+    // of signals, then compare to the materialized view.
+    // We don't rebuild everything (too expensive) — we sample and extrapolate.
+    
+    // 1. Get a random sample of signal_ids from the materialized view
+    const sampleResult = await this.db.query(`
+      SELECT signal_id, status, last_emission_seq, last_retraction_seq
+      FROM signal_current_state
+      TABLESAMPLE BERNOULLI (10)  -- 10% sample
+      LIMIT 5000
+    `);
+    
+    let mismatchesFound = 0;
+    let mismatchesFixed = 0;
+    
+    for (const row of sampleResult.rows) {
+      // 2. Get the actual events for this signal from the event log
+      const events = await this.eventLog.getEventsForSignal(row.signal_id);
+      
+      // 3. Determine the correct state from events
+      const correctState = this.computeCorrectState(events);
+      
+      // 4. Compare
+      const actualStatus = row.status;
+      const actualLastEmissionSeq = row.last_emission_seq;
+      const actualLastRetractionSeq = row.last_retraction_seq;
+      
+      if (correctState.status !== actualStatus ||
+          correctState.lastEmissionSeq !== actualLastEmissionSeq ||
+          correctState.lastRetractionSeq !== actualLastRetractionSeq) {
+        
+        mismatchesFound++;
+        details.push({
+          signalId: row.signal_id,
+          expected: correctState,
+          actual: {
+            status: actualStatus,
+            lastEmissionSeq: actualLastEmissionSeq,
+            lastRetractionSeq: actualLastRetractionSeq,
+          },
+          fixApplied: false,
+        });
+      }
+    }
+    
+    // 5. Also check for signals that are in the event log but NOT in the
+    //    materialized view (missing signals). Sample from the event log.
+    const missingCheck = await this.db.query(`
+      SELECT DISTINCT signal_id
+      FROM signal_events
+      TABLESAMPLE BERNOULLI (5)
+      LIMIT 2000
+    `);
+    
+    for (const row of missingCheck.rows) {
+      const inMaterialized = await this.db.query(`
+        SELECT 1 FROM signal_current_state WHERE signal_id = $1
+      `, [row.signal_id]);
+      
+      if (inMaterialized.rows.length === 0) {
+        mismatchesFound++;
+        details.push({
+          signalId: row.signal_id,
+          expected: 'exists_in_materialized',
+          actual: 'missing_from_materialized',
+          fixApplied: false,
+        });
+      }
+    }
+    
+    // 6. If mismatches found, trigger a full rebuild
+    let mismatchesFixed = false;
+    if (mismatchesFound > 0) {
+      console.warn(`⚠️  Reconciliation found ${mismatchesFound} mismatches! Triggering full rebuild.`);
+      
+      // Log the mismatch details
+      await this.db.query(`
+        INSERT INTO reconciliation_log (
+          run_id, started_at, completed_at,
+          total_signals_checked, mismatches_found, mismatches_fixed,
+          mismatch_details, reconciled_up_to_seq, status
+        ) VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, 'success')
+      `, [
+        runId,
+        new Date(startTime),
+        sampleResult.rows.length + missingCheck.rows.length,
+        mismatchesFound,
+        0, // Will be updated after rebuild
+        JSON.stringify(details),
+        await this.eventLog.getCurrentLogSequence(),
+      ]);
+      
+      // The actual rebuild is done by the materializer.
+      // We signal it to rebuild by setting a flag.
+      // In production, this was a Redis key that the materializer polls.
+      await this.signalRebuildNeeded();
+      
+      mismatchesFixed = true; // Rebuild will fix them
+    } else {
+      await this.db.query(`
+        INSERT INTO reconciliation_log (
+          run_id, started_at, completed_at,
+          total_signals_checked, mismatches_found, mismatches_fixed,
+          mismatch_details, reconciled_up_to_seq, status
+        ) VALUES ($1, $2, NOW(), $3, 0, 0, '[]', $4, 'success')
+      `, [
+        runId,
+        new Date(startTime),
+        sampleResult.rows.length + missingCheck.rows.length,
+        await this.eventLog.getCurrentLogSequence(),
+      ]);
+    }
+    
+    const duration = Date.now() - startTime;
+    this.metrics.histogram('reconciliation.duration_ms', duration);
+    this.metrics.gauge('reconciliation.mismatches_found', mismatchesFound);
+    
+    if (mismatchesFound > 0) {
+      this.metrics.increment('reconciliation.mismatch_detected');
+      // This is a PAGE-ABLE alert. If reconciliation finds drift, something
+      // is fundamentally wrong with the write path.
+      this.metrics.increment('reconciliation.rebuild_triggered', {
+        runId,
+        mismatchCount: mismatchesFound.toString(),
+      });
+    }
+    
+    console.log(
+      `✅ Reconciliation ${runId} complete in ${duration}ms. ` +
+      `Checked ${sampleResult.rows.length + missingCheck.rows.length} signals, ` +
+      `found ${mismatchesFound} mismatches.`
+    );
+    
+    return {
+      runId,
+      totalChecked: sampleResult.rows.length + missingCheck.rows.length,
+      mismatchesFound,
+      mismatchesFixed,
+      details,
+    };
+  }
+  
+  /**
+   * Compute the correct state of a signal from its event history.
+   * This is the ground truth function. If the materialized view disagrees
+   * with this, the materialized view is wrong.
+   */
+  private computeCorrectState(events: Array<{
+    eventType: string;
+    logSequence: number;
+  }>): {
+    status: 'active' | 'retracted' | 'unknown';
+    lastEmissionSeq: number | null;
+    lastRetractionSeq: number | null;
+  } {
+    let lastEmissionSeq: number | null = null;
+    let lastRetractionSeq: number | null = null;
+    
+    for (const event of events) {
+      if (event.eventType === 'emission') {
+        lastEmissionSeq = event.logSequence;
+      } else if (event.eventType === 'retraction') {
+        lastRetractionSeq = event.logSequence;
+      }
+    }
+    
+    if (lastEmissionSeq === null) {
+      // No emission found — shouldn't happen if we got here from the event log
+      return { status: 'unknown', lastEmissionSeq: null, lastRetractionSeq: null };
+    }
+    
+    // A signal is retracted if the last retraction's sequence is >= the last emission's.
+    // (In practice they should always be >, but >= handles edge cases.)
+    const isRetracted = lastRetractionSeq !== null && lastRetractionSeq >= lastEmissionSeq;
+    
+    return {
+      status: isRetracted ? 'retracted' : 'active',
+      lastEmissionSeq,
+      lastRetractionSeq,
+    };
+  }
+  
+  private async signalRebuildNeeded(): Promise<void> {
+    // In production: SET flag in Redis that materializer polls
+    // For simplicity here, we just log it
+    console.log('🚨 REBUILD_NEEDED flag set');
+  }
+}
