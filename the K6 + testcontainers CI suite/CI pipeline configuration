@@ -1,0 +1,125 @@
+# .github/workflows/ci-gate.yml
+name: CI Gate — Invariant Verification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - 'shared/**'
+      - 'migrations/**'
+      - 'tests/k6/**'
+      - 'tests/invariants/**'
+
+# Cancel in-progress runs for the same PR
+concurrency:
+  group: ci-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  invariant-gate:
+    name: "Invariant Gate (k6 + testcontainers)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    
+    # Required for Docker-in-Docker (testcontainers)
+    permissions:
+      contents: read
+      packages: read
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install k6
+      
+      - name: Build service Docker images
+        run: |
+          # Build all service images from the PR branch
+          # These are the images that testcontainers will use
+          docker build -t ecr.aws/our-repo/state-machine-service:latest ./services/state-machine
+          docker build -t ecr.aws/our-repo/evidence-packet-service:latest ./services/evidence-packet
+          docker build -t ecr.aws/our-repo/reviewer-pool-service:latest ./services/reviewer-pool
+          docker build -t ecr.aws/our-repo/worker-signal-service:latest ./services/worker-signal
+          docker build -t ecr.aws/our-repo/sla-enforcer-service:latest ./services/sla-enforcer
+      
+      - name: Run CI Gate
+        run: npx ts-node tests/ci-gate.ts
+        env:
+          CI: 'true'
+          CI_RUN_ID: ${{ github.run_id }}
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: invariant-gate-results
+          path: test-results/
+          retention-days: 14
+      
+      - name: Upload service logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-logs
+          path: test-results/logs-*.txt
+          retention-days: 30
+      
+      # ── POST-FAILURE: Auto-comment on PR with diagnostic info ──
+      - name: Comment on PR with results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('test-results/ci-gate-result.json', 'utf-8'));
+            
+            const criticalFailures = result.invariants.filter(r => !r.passed && r.severity === 'critical');
+            const warnings = result.invariants.filter(r => !r.passed && r.severity === 'warning');
+            const passed = result.invariants.filter(r => r.passed);
+            
+            let body = '## 🔍 CI Gate Results\n\n';
+            body += `**Duration:** ${(result.durationMs / 1000).toFixed(1)}s\n\n`;
+            body += `| Status | Count |\n|--------|-------|\n`;
+            body += `| ✅ Passed | ${passed.length} |\n`;
+            body += `| ❌ Critical | ${criticalFailures.length} |\n`;
+            body += `| ⚠️ Warnings | ${warnings.length} |\n\n`;
+            
+            if (criticalFailures.length > 0) {
+              body += '### ❌ Critical Failures\n\n';
+              for (const f of criticalFailures) {
+                body += `**${f.name}**\n${f.detail}\n\n`;
+              }
+              body += '\n> 🚨 **MERGE BLOCKED** — Fix critical failures before merging.\n';
+              body += '> Download the `service-logs` artifact for detailed diagnostics.\n';
+            } else if (warnings.length > 0) {
+              body += '### ⚠️ Warnings\n\n';
+              for (const w of warnings) {
+                body += `**${w.name}**\n${w.detail}\n\n`;
+              }
+              body += '\n> ⚠️ Warnings present. Review but merge is allowed.\n';
+            } else {
+              body += '### ✅ All Invariants Pass\n\n';
+              body += '> Merge is allowed. No invariant violations detected.\n';
+            }
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });
