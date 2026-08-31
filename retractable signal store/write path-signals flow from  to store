@@ -1,0 +1,147 @@
+// signal-write-coordinator.ts
+// This sits in the review/appeals system and coordinates signal writes.
+// It's the only component that calls SignalEventLog.appendEmission/appendRetraction.
+
+import { SignalEventLog } from './signal-event-log';
+import { MessageQueue } from './message-queue';
+import { MetricsClient } from './metrics';
+
+class SignalWriteCoordinator {
+  constructor(
+    private eventLog: SignalEventLog,
+    private messageQueue: MessageQueue,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Called when a task is rejected (from the state machine side effect).
+   * Emits a rejection signal to the event log.
+   */
+  async emitRejectionSignal(input: {
+    taskId: string;
+    workerId: string;
+    jobTypeId: string;
+    reviewerId: string;
+    rejectionReasons: string[];
+    reviewedAt: Date;
+  }): Promise<void> {
+    const signalId = `rejection:${input.taskId}`;
+    
+    const result = await this.eventLog.appendEmission({
+      signalId,
+      workerId: input.workerId,
+      jobTypeId: input.jobTypeId,
+      payload: {
+        taskId: input.taskId,
+        outcome: 'rejected',
+        reviewerId: input.reviewerId,
+        rejectionReasons: input.rejectionReasons,
+        reviewedAt: input.reviewedAt.toISOString(),
+      },
+      producerId: 'review-state-machine',
+      originalRequestId: input.taskId,
+    });
+    
+    if (!result.wasDuplicate) {
+      this.metrics.increment('signal.emitted', { 
+        type: 'rejection',
+        jobType: input.jobTypeId,
+      });
+    }
+  }
+  
+  /**
+   * Called when a rejection is overturned (from the state machine side effect).
+   * Emits a retraction signal to the event log.
+   * 
+   * CRITICAL: This is called in the SAME transaction boundary as the 
+   * state transition to 'overturned'. If the state transition succeeds
+   * but the retraction fails, we have a problem.
+   * 
+   * We handle this by:
+   * 1. Making the retraction idempotent (same signalId)
+   * 2. Having the reconciliation job catch any missed retractions
+   * 3. Emitting a "best effort" retraction via the message queue as backup
+   */
+  async emitRetractionSignal(input: {
+    taskId: string;
+    workerId: string;
+    jobTypeId: string;
+    reason: string;
+    appellateReviewerId?: string;
+    overturnedAt: Date;
+  }): Promise<void> {
+    const signalId = `rejection:${input.taskId}`; // MUST match the emission's signalId
+    
+    let logResult: Awaited<ReturnType<typeof this.eventLog.appendRetraction>>;
+    let logSuccess = false;
+    
+    try {
+      logResult = await this.eventLog.appendRetraction({
+        signalId,
+        workerId: input.workerId,
+        jobTypeId: input.jobTypeId,
+        payload: {
+          taskId: input.taskId,
+          reason: input.reason,
+          appellateReviewerId: input.appellateReviewerId,
+          overturnedAt: input.overturnedAt.toISOString(),
+        },
+        producerId: 'appeal-state-machine',
+        originalRequestId: input.taskId,
+      });
+      logSuccess = true;
+      
+      if (!logResult.wasDuplicate) {
+        this.metrics.increment('signal.retracted', { 
+          jobType: input.jobTypeId,
+          reason: input.reason,
+        });
+      }
+    } catch (err) {
+      // The event log write failed. This is BAD.
+      // We fall through to the backup path.
+      this.metrics.increment('signal.retraction_log_failed', {
+        taskId: input.taskId,
+        error: err instanceof Error ? err.message : 'unknown',
+      });
+    }
+    
+    // Backup: publish a retraction message to the message queue.
+    // The event log service also consumes from this queue, so even if
+    // the direct write failed, the message queue delivery might succeed.
+    // This is belt-and-suspenders. The reconciliation job is the actual safety net.
+    if (!logSuccess || !logResult.wasDuplicate) {
+      try {
+        await this.messageQueue.publish('signal-retractions', {
+          signalId,
+          workerId: input.workerId,
+          jobTypeId: input.jobTypeId,
+          payload: {
+            taskId: input.taskId,
+            reason: input.reason,
+            appellateReviewerId: input.appellateReviewerId,
+            overturnedAt: input.overturnedAt.toISOString(),
+          },
+          producerId: 'appeal-state-machine-backup',
+          originalRequestId: input.taskId,
+        });
+        
+        this.metrics.increment('signal.retraction_backup_published');
+      } catch (err) {
+        // Both paths failed. The retraction is LOST unless reconciliation catches it.
+        this.metrics.increment('signal.retraction_backup_failed', {
+          taskId: input.taskId,
+        });
+        
+        // This is a PAGE-ABLE alert. A lost retraction means a worker's
+        // record is permanently damaged until reconciliation runs (max 5 min).
+        this.metrics.increment('signal.retraction_lost_PAGEABLE', {
+          taskId: input.taskId,
+          workerId: input.workerId,
+          jobTypeId: input.jobTypeId,
+        });
+      }
+    }
+  }
+}
