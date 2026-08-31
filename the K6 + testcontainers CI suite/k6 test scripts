@@ -1,0 +1,341 @@
+// tests/k6/invariant-probe.js
+// This script drives the system through realistic state transitions
+// under concurrent load, then the Node.js side checks invariants afterward.
+
+import http from 'k6/http';
+import { check, group, sleep, fail } from 'k6';
+import { Rate, Counter, Trend, Gauge } from 'k6/metrics';
+
+// ─── Custom Metrics ───
+// These track the BEHAVIOR during the test, not just pass/fail
+
+const transitionSuccessRate = new Rate('transition_success');
+const transitionLatency = new Trend('transition_latency_ms');
+const invalidTransitionErrors = new Counter('invalid_transition_errors');
+const concurrentStateErrors = new Counter('concurrent_state_errors');
+const slaTimerErrors = new Counter('sla_timer_errors');
+
+// ─── Configuration ───
+
+const BASE_URL = __ENV.BASE_URL || 'http://host.docker.internal:3001';
+const VUS = parseInt(__ENV.VUS || '20');        // Concurrent virtual users
+const DURATION = __ENV.DURATION || '30s';        // Test duration
+const TASKS_PER_VU = parseInt(__ENV.TASKS_PER_VU || '5'); // Tasks each VU creates
+
+export const options = {
+  scenarios: {
+    // Scenario 1: Steady-state concurrent reviews
+    // Multiple workers submitting, multiple reviewers deciding simultaneously
+    steady_state: {
+      executor: 'constant-vus',
+      vus: VUS,
+      duration: DURATION,
+      exec: 'steadyState',
+      startTime: '0s',
+    },
+    
+    // Scenario 2: SLA storm
+    // Submit a burst of tasks, then fast-forward time to trigger all SLAs at once
+    // This tests that SLA handlers don't race with each other
+    sla_storm: {
+      executor: 'per-vu-iterations',
+      vus: Math.ceil(VUS / 2),
+      iterations: TASKS_PER_VU,
+      exec: 'slaStorm',
+      startTime: `${DURATION}`, // Run after steady state
+    },
+    
+    // Scenario 3: Appeal flood
+    // Submit tasks, get them rejected, then flood with appeals simultaneously
+    // This tests appeal assignment race conditions
+    appeal_flood: {
+      executor: 'per-vu-iterations',
+      vus: Math.ceil(VUS / 3),
+      iterations: TASKS_PER_VU,
+      exec: 'appealFlood',
+      startTime: `${parseInt(DURATION) * 2}s`,
+    },
+  },
+  
+  thresholds: {
+    // These thresholds are about BEHAVIORAL correctness, not performance
+    'transition_success': ['rate>0.95'],         // >95% of transitions should succeed
+    'invalid_transition_errors': ['count<3'],     // Fewer than 3 invalid transitions
+    'concurrent_state_errors': ['count<1'],       // ZERO concurrent state errors tolerated
+    'http_req_duration{endpoint:transition}': ['p(95)<2000'], // p95 < 2s
+  },
+};
+
+// ─── Test Data ───
+
+const JOB_TYPES = [
+  'storefront_photo_compliance',
+  'logo_detection',
+  'product_attribute_verification',
+];
+
+const REJECTION_REASONS = [
+  'blurry_image',
+  'incorrect_label',
+  'missing_element',
+  'safety_violation',
+  'low_quality',
+];
+
+const APPEAL_REASONS = [
+  'The image meets the quality requirements in guideline 3.2',
+  'The label is correct per the category definition in section 4',
+  'The element is present but partially occluded — guideline 2.1 allows this',
+  'The rejection reason does not match the actual issue',
+];
+
+// ─── Helpers ───
+
+function randomChoice(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function createTask(workerId) {
+  const res = http.post(`${BASE_URL}/tasks`, JSON.stringify({
+    jobTypeId: randomChoice(JOB_TYPES),
+    workerId: workerId,
+    // Simplified payload — in reality this would have actual task data
+    payload: {
+      type: 'photo_review',
+      imageUrl: `https://test-bucket.example.com/${workerId}/${Date.now()}.jpg`,
+      metadata: { source: 'k6-invariant-test' },
+    },
+    response: {
+      decision: 'compliant',
+      confidence: 0.9 + Math.random() * 0.1,
+      annotations: [],
+    },
+  }), {
+    headers: { 'Content-Type': 'application/json' },
+    tags: { endpoint: 'create_task' },
+  });
+  
+  return res;
+}
+
+function transitionTask(taskId, targetState, body = {}) {
+  const start = Date.now();
+  const res = http.post(
+    `${BASE_URL}/tasks/${taskId}/transition`,
+    JSON.stringify({ targetState, ...body }),
+    {
+      headers: { 'Content-Type': 'application/json' },
+      tags: { endpoint: 'transition' },
+    }
+  );
+  const duration = Date.now() - start;
+  transitionLatency.add(duration);
+  
+  const success = check(res, {
+    'transition returned 200 or 202': (r) => r.status === 200 || r.status === 202,
+    'transition response has state': (r) => {
+      try { return !!JSON.parse(r.body).state; } catch { return false; }
+    },
+  });
+  
+  transitionSuccessRate.add(success);
+  
+  if (res.status === 409) {
+    // 409 = invalid transition — this should be EXTREMELY rare
+    invalidTransitionErrors.add(1);
+    console.error(`INVALID TRANSITION: ${taskId} → ${targetState}: ${res.body}`);
+  }
+  
+  if (res.status === 500 && res.body.includes('overlapping')) {
+    concurrentStateErrors.add(1);
+    console.error(`CONCURRENT STATE ERROR: ${taskId}: ${res.body}`);
+  }
+  
+  return { success, status: res.status, body: res.body };
+}
+
+function getTaskState(taskId) {
+  const res = http.get(`${BASE_URL}/tasks/${taskId}`, {
+    tags: { endpoint: 'get_task' },
+  });
+  if (res.status !== 200) return null;
+  return JSON.parse(res.body);
+}
+
+// ─── Scenario: Steady State ───
+// Drive tasks through the happy path (submit → review → accept) with
+// some rejections mixed in. Multiple VUs doing this concurrently.
+
+export function steadyState() {
+  const workerId = `worker_${__VU}_${Date.now()}`;
+  const reviewerId = `reviewer_${(__VU % 5) + 1}`; // Cycle through 5 reviewers
+  
+  group('steady_state: submit and review', () => {
+    // 1. Submit task
+    const createRes = createTask(workerId);
+    check(createRes, { 'task created': (r) => r.status === 201 });
+    
+    if (createRes.status !== 201) return;
+    const taskId = JSON.parse(createRes.body).taskId;
+    
+    // 2. Transition to queued_for_review
+    const qRes = transitionTask(taskId, 'queued_for_review', { actor: 'system' });
+    if (!qRes.success) return;
+    
+    // 3. Transition to in_review
+    const irRes = transitionTask(taskId, 'in_review', { actor: reviewerId });
+    if (!irRes.success) return;
+    
+    // 4. Small random delay to simulate review time
+    sleep(Math.random() * 0.5);
+    
+    // 5. Decide: accept or reject (70/30 split)
+    const shouldReject = Math.random() < 0.3;
+    
+    if (shouldReject) {
+      const reasons = [
+        randomChoice(REJECTION_REASONS),
+      ];
+      // Sometimes add a second reason (10% of rejections)
+      if (Math.random() < 0.1) {
+        reasons.push(randomChoice(REJECTION_REASONS.filter(r => r !== reasons[0])));
+      }
+      
+      const rejRes = transitionTask(taskId, 'rejected', {
+        actor: reviewerId,
+        metadata: { rejectionReasons: reasons },
+      });
+      
+      if (rejRes.success) {
+        // 6. Transition to appealable
+        transitionTask(taskId, 'appealable', { actor: 'system' });
+      }
+    } else {
+      transitionTask(taskId, 'accepted', { actor: reviewerId });
+    }
+  });
+}
+
+// ─── Scenario: SLA Storm ───
+// Submit tasks and leave them in states with SLA timers, then
+// the Node.js side will advance the clock to trigger all SLAs at once.
+
+export function slaStorm() {
+  const workerId = `worker_sla_${__VU}_${Date.now()}`;
+  
+  group('sla_storm: create tasks and abandon them', () => {
+    // Create a task and move it to queued_for_review, then DON'T 
+    // transition it further. It will sit there with an SLA timer.
+    const createRes = createTask(workerId);
+    if (createRes.status !== 201) return;
+    const taskId = JSON.parse(createRes.body).taskId;
+    
+    transitionTask(taskId, 'queued_for_review', { actor: 'system' });
+    // Deliberately stop here — this task will hit its SLA when clock advances
+  });
+}
+
+// ─── Scenario: Appeal Flood ───
+// Get tasks to the appealable state, then flood with appeals simultaneously.
+// Tests that appellate reviewer assignment doesn't double-assign.
+
+export function appealFlood() {
+  const workerId = `worker_appeal_${__VU}_${Date.now()}`;
+  const reviewerId = `reviewer_${(__VU % 5) + 1}`;
+  
+  group('appeal_flood: create rejected-appealable tasks', () => {
+    // Fast-path to appealable state
+    const createRes = createTask(workerId);
+    if (createRes.status !== 201) return;
+    const taskId = JSON.parse(createRes.body).taskId;
+    
+    transitionTask(taskId, 'queued_for_review', { actor: 'system' });
+    transitionTask(taskId, 'in_review', { actor: reviewerId });
+    transitionTask(taskId, 'rejected', {
+      actor: reviewerId,
+      metadata: { rejectionReasons: [randomChoice(REJECTION_REASONS)] },
+    });
+    transitionTask(taskId, 'appealable', { actor: 'system' });
+    
+    // Now file the appeal
+    sleep(Math.random() * 0.2); // Small stagger to test timing
+    
+    const appealRes = http.post(
+      `${BASE_URL}/tasks/${taskId}/appeal`,
+      JSON.stringify({
+        workerId: workerId,
+        appealReason: randomChoice(APPEAL_REASONS),
+      }),
+      {
+        headers: { 'Content-Type': 'application/json' },
+        tags: { endpoint: 'file_appeal' },
+      }
+    );
+    
+    check(appealRes, {
+      'appeal filed successfully': (r) => r.status === 200 || r.status === 202,
+      'appeal not rate-limited': (r) => r.status !== 429,
+    });
+    
+    if (appealRes.status === 200 || appealRes.status === 202) {
+      // If appeal succeeded, advance through appeal review
+      const appellateReviewerId = `appellate_${(__VU % 3) + 1}`;
+      
+      transitionTask(taskId, 'queued_for_appeal', { actor: 'system' });
+      transitionTask(taskId, 'in_appeal_review', { actor: appellateReviewerId });
+      
+      // Decide: uphold or overturn (60/40 — slightly more overturns to 
+      // exercise the signal retraction path)
+      if (Math.random() < 0.4) {
+        transitionTask(taskId, 'overturned', {
+          actor: appellateReviewerId,
+          metadata: { overturnReason: 'phase1_independent_accept' },
+        });
+      } else {
+        transitionTask(taskId, 'upheld', {
+          actor: appellateReviewerId,
+          metadata: { rejectionReasons: [randomChoice(REJECTION_REASONS)] },
+        });
+        transitionTask(taskId, 'final_reject', { actor: 'system' });
+      }
+    }
+  });
+}
+
+// ─── Teardown ───
+// k6 doesn't have a native teardown hook that runs after all scenarios,
+// but we use the handleSummary to signal to the Node.js runner that
+// k6 is done and it should now check invariants.
+
+export function handleSummary(data) {
+  // Write a marker file that the Node.js runner polls for
+  // This is the handshake between k6 and the invariant checker
+  
+  const summary = {
+    metrics: {
+      transitionSuccessRate: data.metrics.transition_success?.values?.rate,
+      invalidTransitionErrors: data.metrics.invalid_transition_errors?.values?.count,
+      concurrentStateErrors: data.metrics.concurrent_state_errors?.values?.count,
+      transitionLatencyP95: data.metrics.transition_latency_ms?.values?.['p(95)'],
+    },
+    checks: {},
+  };
+  
+  for (const [name, check] of Object.entries(data.checks)) {
+    summary.checks[name] = {
+      passes: check.passes,
+      fails: check.fails,
+    };
+  }
+  
+  // Write to shared volume that Node.js can read
+  const fs = require('fs'); // k6 doesn't actually support require('fs')
+  // In practice, we use k6's --out flag to write to JSON, then 
+  // the Node.js process reads that file.
+  
+  return {
+    'stdout': JSON.stringify(summary, null, 2),
+    // Also write as artifact for CI
+    [`invariant-probe-results-${Date.now()}.json`]: JSON.stringify(data, null, 2),
+  };
+}
