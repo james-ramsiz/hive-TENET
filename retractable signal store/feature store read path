@@ -1,0 +1,82 @@
+// feature-store-reader.ts
+// Called by the deck ranking model at prediction time.
+
+import { Pool } from 'pg';
+
+interface WorkerJobTypeFeatures {
+  workerId: string;
+  jobTypeId: string;
+  totalRejections: number;
+  totalRetractions: number;
+  netRejections: number;
+  retractionRate: number;
+  recentRejections: number;    // Last 7 days (simplified)
+  recentNetRejections: number;  // Last 7 days (simplified)
+  lastRejectionAt: Date | null;
+  lastRetractionAt: Date | null;
+}
+
+class FeatureStoreReader {
+  constructor(private db: Pool) {}
+  
+  async getFeatures(workerId: string, jobTypeId: string): Promise<WorkerJobTypeFeatures> {
+    const result = await this.db.query(`
+      SELECT 
+        worker_id,
+        job_type_id,
+        COUNT(*) FILTER (WHERE status = 'active') as total_rejections,
+        COUNT(*) FILTER (WHERE status = 'retracted') as total_retractions,
+        COUNT(*) FILTER (WHERE status = 'active') - 
+          COUNT(*) FILTER (WHERE status = 'retracted') as net_rejections,
+        CASE 
+          WHEN COUNT(*) > 0 
+          THEN COUNT(*) FILTER (WHERE status = 'retracted')::float / COUNT(*)
+          ELSE 0 
+        END as retraction_rate,
+        -- Recent signals (last 7 days) — this requires joining with event log
+        -- for timing. Simplified here; in production this is a separate query
+        -- or a pre-computed materialized column.
+        0 as recent_rejections,
+        0 as recent_net_rejections,
+        NULL::timestamptz as last_rejection_at,
+        NULL::timestamptz as last_retraction_at
+      FROM signal_current_state
+      WHERE worker_id = $1 AND job_type_id = $2
+      GROUP BY worker_id, job_type_id
+    `, [workerId, jobTypeId]);
+    
+    if (result.rows.length === 0) {
+      // No signals for this worker/job_type combination — cold start
+      return this.coldStartFeatures(workerId, jobTypeId);
+    }
+    
+    const row = result.rows[0];
+    return {
+      workerId: row.worker_id,
+      jobTypeId: row.job_type_id,
+      totalRejections: parseInt(row.total_rejections),
+      totalRetractions: parseInt(row.total_retractions),
+      netRejections: parseInt(row.net_rejections),
+      retractionRate: parseFloat(row.retraction_rate),
+      recentRejections: parseInt(row.recent_rejections),
+      recentNetRejections: parseInt(row.recent_net_rejections),
+      lastRejectionAt: row.last_rejection_at,
+      lastRetractionAt: row.last_retraction_at,
+    };
+  }
+  
+  private coldStartFeatures(workerId: string, jobTypeId: string): WorkerJobTypeFeatures {
+    return {
+      workerId,
+      jobTypeId,
+      totalRejections: 0,
+      totalRetractions: 0,
+      netRejections: 0,
+      retractionRate: 0,
+      recentRejections: 0,
+      recentNetRejections: 0,
+      lastRejectionAt: null,
+      lastRetractionAt: null,
+    };
+  }
+}
