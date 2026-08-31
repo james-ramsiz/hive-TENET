@@ -1,0 +1,175 @@
+// training-snapshot-extractor.ts
+
+import { Pool } from 'pg';
+import { SignalEventLog } from './signal-event-log';
+import { MetricsClient } from './metrics';
+
+class TrainingSnapshotExtractor {
+  constructor(
+    private db: Pool,
+    private eventLog: SignalEventLog,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Create a point-in-time snapshot of all signal states.
+   * 
+   * The "point in time" is defined by a log sequence number, NOT a wall clock.
+   * This is critical: we want to know the state of signals as of the moment
+   * the last event was processed, not as of "now" (which might include events
+   * that arrived after the training window conceptually closed).
+   * 
+   * A signal is "active at seq N" if:
+   *   - It has an emission event with log_seq <= N
+   *   - AND it has NO retraction event with log_seq <= N
+   */
+  async createSnapshot(options?: {
+    upToSeq?: number;           // If not provided, use current max
+    label?: string;             // e.g., 'weekly_training_2024-01-15'
+    workerIds?: string[];       // If provided, only snapshot these workers
+    jobTypeIds?: string[];      // If provided, only snapshot these job types
+  }): Promise<{
+    snapshotId: string;
+    snapshotAtSeq: number;
+    workersSnapshotted: number;
+    totalActiveSignals: number;
+    totalRetractedSignals: number;
+  }> {
+    const startTime = Date.now();
+    
+    const upToSeq = options?.upToSeq ?? await this.eventLog.getCurrentLogSequence();
+    const snapshotId = options?.label 
+      ? `snapshot-${options.label}` 
+      : `snapshot-${upToSeq}-${Date.now()}`;
+    
+    // This query is the heart of the system. It determines the state of every
+    // signal as of a specific log sequence, using ONLY the event log.
+    // No reads from signal_current_state — that would be circular.
+    
+    const workerFilter = options?.workerIds?.length 
+      ? `AND e.worker_id = ANY($3)` 
+      : '';
+    const jobTypeFilter = options?.jobTypeIds?.length
+      ? `AND e.job_type_id = ANY($4)`
+      : '';
+    
+    // Step 1: Find all signals that have at least one emission up to upToSeq
+    // Step 2: For each signal, check if it has a retraction up to upToSeq
+    // Step 3: Aggregate by worker_id + job_type_id
+    
+    const queryParams: any[] = [upToSeq, upToSeq];
+    if (options?.workerIds?.length) queryParams.push(options.workerIds);
+    if (options?.jobTypeIds?.length) queryParams.push(options.jobTypeIds);
+    
+    const result = await this.db.query(`
+      WITH signals_with_emissions AS (
+        SELECT DISTINCT signal_id, worker_id, job_type_id
+        FROM signal_events
+        WHERE event_type = 'emission'
+          AND log_sequence <= $1
+          ${workerFilter}
+          ${jobTypeFilter}
+      ),
+      signals_with_retractions AS (
+        SELECT DISTINCT signal_id
+        FROM signal_events
+        WHERE event_type = 'retraction'
+          AND log_sequence <= $2
+      ),
+      signal_state AS (
+        SELECT 
+          e.worker_id,
+          e.job_type_id,
+          e.signal_id,
+          CASE 
+            WHEN r.signal_id IS NOT NULL THEN 'retracted'
+            ELSE 'active'
+          END as status
+        FROM signals_with_emissions e
+        LEFT JOIN signals_with_retractions r ON e.signal_id = r.signal_id
+      ),
+      aggregated AS (
+        SELECT 
+          worker_id,
+          job_type_id,
+          COUNT(*) FILTER (WHERE status = 'active') as active_count,
+          COUNT(*) FILTER (WHERE status = 'retracted') as retracted_count,
+          COUNT(*) FILTER (WHERE status = 'active') - 
+            COUNT(*) FILTER (WHERE status = 'retracted') as net_count,
+          ARRAY_AGG(signal_id) FILTER (WHERE status = 'active') as active_signal_ids
+        FROM signal_state
+        GROUP BY worker_id, job_type_id
+      )
+      INSERT INTO training_snapshots (
+        snapshot_id, snapshot_at, worker_id, job_type_id,
+        active_count, retracted_count, net_count, active_signal_ids
+      )
+      SELECT 
+        $${queryParams.length + 1}, 
+        (SELECT received_at FROM signal_events WHERE log_sequence = $1 LIMIT 1),
+        worker_id, job_type_id,
+        active_count, retracted_count, net_count, active_signal_ids
+      FROM aggregated
+      RETURNING *
+    `, [...queryParams, snapshotId]);
+    
+    const totalActive = result.rows.reduce((sum: number, r: any) => sum + parseInt(r.active_count), 0);
+    const totalRetracted = result.rows.reduce((sum: number, r: any) => sum + parseInt(r.retracted_count), 0);
+    
+    const duration = Date.now() - startTime;
+    this.metrics.histogram('training_snapshot.extract_duration_ms', duration);
+    this.metrics.increment('training_snapshot.created');
+    this.metrics.gauge('training_snapshot.active_signals', totalActive);
+    this.metrics.gauge('training_snapshot.retracted_signals', totalRetracted);
+    
+    return {
+      snapshotId,
+      snapshotAtSeq: upToSeq,
+      workersSnapshotted: result.rows.length,
+      totalActiveSignals: totalActive,
+      totalRetractedSignals: totalRetracted,
+    };
+  }
+  
+  /**
+   * Read snapshot data in the format the deck ranking model expects.
+   * This is the API that the model training pipeline calls.
+   */
+  async readSnapshotForTraining(snapshotId: string): Promise<Array<{
+    workerId: string;
+    jobTypeId: string;
+    features: {
+      netRejections: number;
+      totalRejections: number;
+      retractionRate: number;     // retractions / total rejections
+      recentNetRejections: number; // last 7 days (from snapshot)
+    };
+  }>> {
+    const result = await this.db.query(`
+      SELECT 
+        worker_id as "workerId",
+        job_type_id as "jobTypeId",
+        net_count as "netRejections",
+        active_count + retracted_count as "totalRejections",
+        CASE 
+          WHEN (active_count + retracted_count) > 0 
+          THEN retracted_count::float / (active_count + retracted_count)
+          ELSE 0 
+        END as "retractionRate",
+        net_count as "recentNetRejections" -- simplified; real version joins with time-bounded events
+      FROM training_snapshots
+      WHERE snapshot_id = $1
+    `, [snapshotId]);
+    
+    return result.rows.map((r: any) => ({
+      workerId: r.workerId,
+      jobTypeId: r.jobTypeId,
+      features: {
+        netRejections: parseInt(r.netRejections),
+        totalRejections: parseInt(r.totalRejections),
+        retractionRate: parseFloat(r.retractionRate),
+        recentNetRejections: parseInt(r.recentNetRejections),
+      },
+    }));
+  }
+}
