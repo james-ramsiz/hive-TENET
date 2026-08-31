@@ -1,0 +1,18 @@
+Approach 1: Direct Mutation (Failed)
+Emission: INSERT into signals table
+Retraction: UPDATE signals table SET retracted = true WHERE id = X
+  Approach 2: Soft Delete with Tombstones (Failed)
+Emission: INSERT into signals table (status = 'active')
+Retraction: INSERT into signals table (status = 'retraction', references original)
+Feature store: SELECT ... WHERE status = 'active'
+  Approach 3: Event Log + Materialized View (What We Actually Built)
+Event log: APPEND-ONLY. Every emission and every retraction is an event.
+           Events have a logical timestamp (not wall clock — sequence number).
+           No mutations, no deletes, no updates. Ever.
+
+Materialized view: Rebuilt from the event log. Contains the CURRENT state
+                   of every signal (active or retracted). This is what the
+                   feature store reads from.
+
+Reconciliation: Periodic job that compares the materialized view to the
+                event log. If they disagree, the event log wins.
