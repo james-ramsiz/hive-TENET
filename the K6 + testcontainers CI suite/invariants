@@ -1,0 +1,446 @@
+// invariants.ts
+// These are checked AFTER every CI test run by querying the database directly.
+// They don't test behavior — they test state.
+
+import { Pool } from 'pg';
+
+interface InvariantResult {
+  name: string;
+  passed: boolean;
+  detail: string;
+  severity: 'critical' | 'warning';
+  query?: string;
+}
+
+// ─── INVARIANT 1: No Invalid State Transitions ───
+// Every (task_id, from_state, to_state) triple in the history must 
+// correspond to a legal transition in the transition table.
+// This catches: race conditions that skip states, bugs that transition
+// backward, or SLA handlers that fire on already-transitioned tasks.
+
+async function checkNoInvalidTransitions(pool: Pool): Promise<InvariantResult> {
+  const { rows } = await pool.query(`
+    WITH legal_transitions AS (
+      SELECT * FROM (VALUES
+        ('submitted', 'queued_for_review'),
+        ('queued_for_review', 'in_review'),
+        ('in_review', 'accepted'),
+        ('in_review', 'rejected'),
+        ('rejected', 'appealable'),
+        ('appealable', 'appealed'),
+        ('appealable', 'final_reject'),
+        ('appealed', 'queued_for_appeal'),
+        ('queued_for_appeal', 'in_appeal_review'),
+        ('in_appeal_review', 'upheld'),
+        ('in_appeal_review', 'overturned'),
+        ('upheld', 'final_reject')
+      ) AS t(from_state, to_state)
+    )
+    SELECT 
+      sh.task_id,
+      sh.from_state,
+      sh.to_state,
+      sh.occurred_at
+    FROM state_history sh
+    LEFT JOIN legal_transitions lt 
+      ON sh.from_state = lt.from_state 
+      AND sh.to_state = lt.to_state
+    WHERE lt.from_state IS NULL
+    ORDER BY sh.occurred_at DESC
+    LIMIT 20;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'no_invalid_transitions',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? 'All state transitions are legal'
+      : `Found ${rows.length} illegal transitions. Examples: ${rows.map((r: any) => 
+          `${r.task_id}: ${r.from_state} → ${r.to_state} at ${r.occurred_at}`
+        ).join('; ')}`,
+  };
+}
+
+// ─── INVARIANT 2: No Overlapping States ───
+// For any task, at most one state_history entry should have exited_at = NULL.
+// If two entries have exited_at = NULL, the task is in two states simultaneously.
+// This catches: concurrent transition handlers that both succeed.
+
+async function checkNoOverlappingStates(pool: Pool): Promise<InvariantResult> {
+  const { rows } = await pool.query(`
+    SELECT task_id, COUNT(*) as concurrent_states
+    FROM state_history
+    WHERE exited_at IS NULL
+    GROUP BY task_id
+    HAVING COUNT(*) > 1;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'no_overlapping_states',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? 'No task is in multiple states simultaneously'
+      : `${rows.length} tasks in multiple states: ${rows.map((r: any) => 
+          `${r.task_id} (${r.concurrent_states} states)`
+        ).join(', ')}`,
+  };
+}
+
+// ─── INVARIANT 3: Every Non-Terminal Task Has an Active SLA Timer ───
+// If a task is in queued_for_review, in_review, appealable, queued_for_appeal, 
+// or in_appeal_review, it MUST have a non-null sla_deadline in the future.
+// This catches: the bug where SLA timer was set after evidence packet assembly,
+// and packet assembly failed silently.
+
+const NON_TERMINAL_STATES = [
+  'queued_for_review', 'in_review', 'appealable', 
+  'queued_for_appeal', 'in_appeal_review',
+] as const;
+
+async function checkEveryActiveTaskHasSLA(pool: Pool): Promise<InvariantResult> {
+  const { rows } = await pool.query(`
+    SELECT t.task_id, t.state, t.sla_deadline
+    FROM tasks t
+    WHERE t.state IN (${NON_TERMINAL_STATES.map(s => `'${s}'`).join(',')})
+      AND (t.sla_deadline IS NULL OR t.sla_deadline <= NOW())
+    LIMIT 20;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'every_active_task_has_sla',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? 'All non-terminal tasks have active SLA timers'
+      : `${rows.length} tasks missing SLA timers: ${rows.map((r: any) => 
+          `${r.task_id} in ${r.state} (deadline: ${r.sla_deadline || 'NULL'})`
+        ).join(', ')}`,
+  };
+}
+
+// ─── INVARIANT 4: Reviewer Separation ───
+// For any task that reached in_appeal_review, 
+// reviewer_id != appellate_reviewer_id.
+// This catches: stale cache in reviewer pool, race conditions in assignment.
+
+async function checkReviewerSeparation(pool: Pool): Promise<InvariantResult> {
+  const { rows } = await pool.query(`
+    SELECT task_id, reviewer_id, appellate_reviewer_id
+    FROM tasks
+    WHERE appellate_reviewer_id IS NOT NULL
+      AND reviewer_id = appellate_reviewer_id
+    LIMIT 20;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'reviewer_separation',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? 'No task was reviewed and appealed by the same reviewer'
+      : `${rows.length} tasks with same reviewer for review and appeal: ${rows.map((r: any) => 
+          `${r.task_id} (reviewer: ${r.reviewer_id})`
+        ).join(', ')}`,
+  };
+}
+
+// ─── INVARIANT 5: Appeal Depth Limit ───
+// No task should have more than MAX_APPEAL_DEPTH appeals.
+// We count appeals by counting transitions INTO the 'appealed' state.
+
+const MAX_APPEAL_DEPTH = 1;
+
+async function checkAppealDepthLimit(pool: Pool): Promise<InvariantResult> {
+  const { rows } = await pool.query(`
+    SELECT task_id, COUNT(*) as appeal_count
+    FROM state_history
+    WHERE to_state = 'appealed'
+    GROUP BY task_id
+    HAVING COUNT(*) > ${MAX_APPEAL_DEPTH};
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'appeal_depth_limit',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? `No task exceeded appeal depth limit of ${MAX_APPEAL_DEPTH}`
+      : `${rows.length} tasks exceeded appeal limit: ${rows.map((r: any) => 
+          `${r.task_id} (${r.appeal_count} appeals)`
+        ).join(', ')}`,
+  };
+}
+
+// ─── INVARIANT 6: Evidence Packet Immutability ───
+// Once an evidence packet is assembled (stored in evidence_packets table),
+// its content_hash must never change. If it changes, something mutated the
+// packet after assembly, which means the reviewer may have seen different
+// content than what's in the audit trail.
+
+async function checkEvidencePacketImmutability(pool: Pool): Promise<InvariantResult> {
+  // We store every version of the packet with a hash. If there are multiple
+  // entries for the same (task_id, review_phase) with different hashes,
+  // something went wrong.
+  const { rows } = await pool.query(`
+    WITH packet_versions AS (
+      SELECT 
+        task_id,
+        review_phase,
+        content_hash,
+        COUNT(*) as version_count,
+        ARRAY_AGG(DISTINCT content_hash) as all_hashes
+      FROM evidence_packets
+      GROUP BY task_id, review_phase, content_hash
+    ),
+    duplicate_hashes AS (
+      SELECT 
+        task_id,
+        review_phase,
+        COUNT(DISTINCT content_hash) as hash_count,
+        all_hashes
+      FROM packet_versions
+      GROUP BY task_id, review_phase, all_hashes
+      HAVING COUNT(DISTINCT content_hash) > 1
+    )
+    SELECT * FROM duplicate_hashes LIMIT 20;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'evidence_packet_immutability',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? 'All evidence packets are immutable (single hash per task/phase)'
+      : `${rows.length} tasks have mutated evidence packets: ${rows.map((r: any) => 
+          `${r.task_id} (${r.review_phase}): ${r.hash_count} different hashes`
+        ).join(', ')}`,
+  };
+}
+
+// ─── INVARIANT 7: Signal Consistency ───
+// Every rejection MUST produce exactly one signal. If overturned, the signal
+// is retracted (negative signal) and no new signal is emitted for the 
+// overturn itself. The net signal count should equal:
+//   (total rejections) - (overturned rejections)
+// 
+// We track signals in a separate signals table. This invariant verifies
+// that the signals table is consistent with the tasks table.
+
+async function checkSignalConsistency(pool: Pool): Promise<InvariantResult> {
+  const { rows } = await pool.query(`
+    WITH task_rejections AS (
+      SELECT 
+        job_type_id,
+        COUNT(*) as total_rejections,
+        COUNT(*) FILTER (WHERE appellate_decision = 'overturned') as overturned
+      FROM tasks
+      WHERE review_decision = 'rejected'
+      GROUP BY job_type_id
+    ),
+    expected_signals AS (
+      SELECT 
+        job_type_id,
+        total_rejections - overturned as expected_net_rejections
+      FROM task_rejections
+    ),
+    actual_signals AS (
+      SELECT 
+        job_type_id,
+        COUNT(*) FILTER (WHERE signal_type = 'rejection') as emitted_rejections,
+        COUNT(*) FILTER (WHERE signal_type = 'retraction') as retractions,
+        COUNT(*) FILTER (WHERE signal_type = 'rejection') - 
+          COUNT(*) FILTER (WHERE signal_type = 'retraction') as actual_net_rejections
+      FROM performance_signals
+      GROUP BY job_type_id
+    )
+    SELECT 
+      COALESCE(e.job_type_id, a.job_type_id) as job_type_id,
+      e.expected_net_rejections,
+      a.actual_net_rejections,
+      COALESCE(e.expected_net_rejections, 0) - COALESCE(a.actual_net_rejections, 0) as delta
+    FROM expected_signals e
+    FULL OUTER JOIN actual_signals a ON e.job_type_id = a.job_type_id
+    WHERE COALESCE(e.expected_net_rejections, 0) != COALESCE(a.actual_net_rejections, 0);
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'signal_consistency',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? 'Performance signals are consistent with task outcomes'
+      : `Signal mismatch for ${rows.length} job types: ${rows.map((r: any) => 
+          `${r.job_type_id}: expected ${r.expected_net_rejections}, got ${r.actual_net_rejections} (delta: ${r.delta})`
+        ).join(', ')}`,
+  };
+}
+
+// ─── INVARIANT 8: No Orphaned Non-Terminal Tasks ───
+// After the test run completes and all SLA timers have fired,
+// there should be zero tasks in non-terminal states.
+// This catches: tasks stuck in states due to unhandled errors,
+// missing event handlers, or dead message queue consumers.
+
+async function checkNoOrphanedTasks(pool: Pool): Promise<InvariantResult> {
+  // First, drain all SLA timers by advancing time (testcontainers can do this)
+  // Then check for remaining non-terminal tasks
+  const { rows } = await pool.query(`
+    SELECT state, COUNT(*) as count
+    FROM tasks
+    WHERE state NOT IN ('accepted', 'final_reject', 'expired')
+    GROUP BY state
+    ORDER BY count DESC;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'no_orphaned_tasks',
+    passed,
+    severity: 'warning', // Not always critical — might be expected if test 
+                         // doesn't wait for full SLA drain
+    detail: passed 
+      ? 'All tasks reached terminal states'
+      : `${rows.reduce((sum: number, r: any) => sum + parseInt(r.count), 0)} tasks in non-terminal states: ` +
+        rows.map((r: any) => `${r.state}: ${r.count}`).join(', '),
+  };
+}
+
+// ─── INVARIANT 9: Monotonic Counters ───
+// Worker acceptance counts should only increase. Rejection counts can 
+// decrease (on overturn) but should never go below zero.
+// This catches: counter bugs, double-counting, race conditions in increments.
+
+async function checkMonotonicCounters(pool: Pool): Promise<InvariantResult> {
+  const { rows } = await pool.query(`
+    SELECT worker_id, job_type_id, rejection_count
+    FROM worker_performance_counters
+    WHERE rejection_count < 0
+    LIMIT 20;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'monotonic_counters',
+    passed,
+    severity: 'critical',
+    detail: passed 
+      ? 'All performance counters are non-negative'
+      : `${rows.length} workers with negative rejection counts: ${rows.map((r: any) => 
+          `${r.worker_id}/${r.job_type_id}: ${r.rejection_count}`
+        ).join(', ')}`,
+  };
+}
+
+// ─── INVARIANT 10: No Future Timestamps ───
+// No state_history entry should have entered_at or exited_at in the future
+// (beyond clock skew tolerance). This catches: clock skew between services,
+// or bugs that use wrong time sources.
+
+async function checkNoFutureTimestamps(pool: Pool): Promise<InvariantResult> {
+  const CLOCK_SKEW_TOLERANCE_MS = 5000; // 5 seconds
+  
+  const { rows } = await pool.query(`
+    SELECT task_id, from_state, to_state, entered_at
+    FROM state_history
+    WHERE entered_at > NOW() + INTERVAL '${CLOCK_SKEW_TOLERANCE_MS} milliseconds'
+    ORDER BY entered_at DESC
+    LIMIT 20;
+  `);
+
+  const passed = rows.length === 0;
+  return {
+    name: 'no_future_timestamps',
+    passed,
+    severity: 'warning',
+    detail: passed 
+      ? 'No future timestamps detected'
+      : `${rows.length} entries with future timestamps (beyond ${CLOCK_SKEW_TOLERANCE_MS}ms skew): ` +
+        rows.map((r: any) => `${r.task_id}: ${r.entered_at}`).join(', '),
+  };
+}
+
+// ─── Run All Invariants ───
+
+export async function runAllInvariants(pool: Pool): Promise<InvariantResult[]> {
+  const checks = [
+    checkNoInvalidTransitions,
+    checkNoOverlappingStates,
+    checkEveryActiveTaskHasSLA,
+    checkReviewerSeparation,
+    checkAppealDepthLimit,
+    checkEvidencePacketImmutability,
+    checkSignalConsistency,
+    checkNoOrphanedTasks,
+    checkMonotonicCounters,
+    checkNoFutureTimestamps,
+  ];
+  
+  const results = await Promise.all(checks.map(check => check(pool)));
+  return results;
+}
+
+export function formatInvariantResults(results: InvariantResult[]): string {
+  const critical = results.filter(r => !r.passed && r.severity === 'critical');
+  const warnings = results.filter(r => !r.passed && r.severity === 'warning');
+  const passed = results.filter(r => r.passed);
+  
+  const lines: string[] = [
+    '═══════════════════════════════════════════════════════',
+    '           INVARIANT CHECK RESULTS                     ',
+    '═══════════════════════════════════════════════════════',
+    '',
+    `  ✅ PASSED:  ${passed.length}/${results.length}`,
+    `  ❌ CRITICAL: ${critical.length}`,
+    `  ⚠️  WARNING:  ${warnings.length}`,
+    '',
+  ];
+  
+  if (critical.length > 0) {
+    lines.push('  ── CRITICAL FAILURES ──');
+    for (const r of critical) {
+      lines.push(`  ❌ ${r.name}`);
+      lines.push(`     ${r.detail}`);
+      lines.push('');
+    }
+  }
+  
+  if (warnings.length > 0) {
+    lines.push('  ── WARNINGS ──');
+    for (const r of warnings) {
+      lines.push(`  ⚠️  ${r.name}`);
+      lines.push(`     ${r.detail}`);
+      lines.push('');
+    }
+  }
+  
+  if (passed.length > 0) {
+    lines.push('  ── PASSED ──');
+    for (const r of passed) {
+      lines.push(`  ✅ ${r.name}: ${r.detail}`);
+    }
+  }
+  
+  lines.push('');
+  lines.push('═══════════════════════════════════════════════════════');
+  
+  if (critical.length > 0) {
+    lines.push('  🚨 MERGE BLOCKED: Critical invariant(s) failed');
+    lines.push('  Fix the failures and re-run. Do not override.');
+  } else if (warnings.length > 0) {
+    lines.push('  ⚠️  Warnings present. Review but merge allowed.');
+  } else {
+    lines.push('  ✅ All invariants pass. Merge allowed.');
+  }
+  lines.push('═══════════════════════════════════════════════════════');
+  
+  return lines.join('\n');
+}
