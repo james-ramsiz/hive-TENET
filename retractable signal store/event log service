@@ -1,0 +1,218 @@
+// signal-event-log.ts
+
+import { Pool } from 'pg';
+import { v4 as uuidv4 } from 'uuid';
+import { MetricsClient } from './metrics';
+
+interface SignalEmission {
+  signalId: string;           // Caller-provided, must be idempotent
+  workerId: string;
+  jobTypeId: string;
+  payload: {
+    taskId: string;
+    outcome: 'rejected';
+    reviewerId: string;
+    rejectionReasons: string[];
+    reviewedAt: string;       // ISO timestamp
+  };
+  producerId: string;         // Which service produced this
+  originalRequestId?: string; // For distributed tracing
+}
+
+interface SignalRetraction {
+  signalId: string;           // Must match an existing emission's signalId
+  workerId: string;
+  jobTypeId: string;
+  payload: {
+    taskId: string;
+    reason: string;           // e.g., 'appeal_overturned'
+    appellateReviewerId?: string;
+    overturnedAt: string;     // ISO timestamp
+  };
+  producerId: string;
+  originalRequestId?: string;
+}
+
+interface AppendResult {
+  eventId: string;
+  logSequence: number;
+  receivedAt: Date;
+  // If this is a duplicate (same event_id already exists), we return
+  // the existing record instead of creating a new one
+  wasDuplicate: boolean;
+}
+
+class SignalEventLog {
+  constructor(
+    private db: Pool,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Append an emission event to the log.
+   * Idempotent: if the same event_id already exists, return the existing record.
+   */
+  async appendEmission(emission: SignalEmission): Promise<AppendResult> {
+    return this.appendEvent({
+      eventId: `emission-${emission.signalId}`,
+      signalId: emission.signalId,
+      eventType: 'emission',
+      workerId: emission.workerId,
+      jobTypeId: emission.jobTypeId,
+      payload: emission.payload,
+      producerId: emission.producerId,
+      originalRequestId: emission.originalRequestId,
+    });
+  }
+  
+  /**
+   * Append a retraction event to the log.
+   * Idempotent: if the same event_id already exists, return the existing record.
+   * 
+   * CRITICAL: This does NOT check whether the emission exists yet.
+   * The retraction is appended unconditionally. The materialization
+   * process will determine the correct state by looking at both events.
+   * This is how we solve the ordering problem.
+   */
+  async appendRetraction(retraction: SignalRetraction): Promise<AppendResult> {
+    return this.appendEvent({
+      eventId: `retraction-${retraction.signalId}`,
+      signalId: retraction.signalId,
+      eventType: 'retraction',
+      workerId: retraction.workerId,
+      jobTypeId: retraction.jobTypeId,
+      payload: retraction.payload,
+      producerId: retraction.producerId,
+      originalRequestId: retraction.originalRequestId,
+    });
+  }
+  
+  private async appendEvent(input: {
+    eventId: string;
+    signalId: string;
+    eventType: 'emission' | 'retraction';
+    workerId: string;
+    jobTypeId: string;
+    payload: object;
+    producerId: string;
+    originalRequestId?: string;
+  }): Promise<AppendResult> {
+    const startTime = Date.now();
+    
+    // Use INSERT ... ON CONFLICT to achieve idempotency at the database level.
+    // If the same event_id exists, we return the existing row (DO NOTHING).
+    // This handles at-least-once delivery from the message queue.
+    const result = await this.db.query(`
+      INSERT INTO signal_events (
+        event_id, signal_id, event_type, worker_id, job_type_id,
+        event_payload, log_sequence, producer_id, original_request_id
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, nextval('signal_event_log_seq'), $7, $8
+      )
+      ON CONFLICT (event_id) DO NOTHING
+      RETURNING event_id, log_sequence, received_at
+    `, [
+      input.eventId,
+      input.signalId,
+      input.eventType,
+      input.workerId,
+      input.jobTypeId,
+      JSON.stringify(input.payload),
+      input.producerId,
+      input.originalRequestId || null,
+    ]);
+    
+    const duration = Date.now() - startTime;
+    this.metrics.histogram('signal_event.append_duration_ms', duration, {
+      eventType: input.eventType,
+      producer: input.producerId,
+    });
+    
+    if (result.rows.length > 0) {
+      // New event was inserted
+      this.metrics.increment('signal_event.appended', {
+        eventType: input.eventType,
+        producer: input.producerId,
+      });
+      
+      return {
+        eventId: result.rows[0].event_id,
+        logSequence: result.rows[0].log_sequence,
+        receivedAt: result.rows[0].received_at,
+        wasDuplicate: false,
+      };
+    }
+    
+    // Event already existed — fetch and return it
+    this.metrics.increment('signal_event.deduplicated', {
+      eventType: input.eventType,
+      producer: input.producerId,
+    });
+    
+    const existing = await this.db.query(`
+      SELECT event_id, log_sequence, received_at
+      FROM signal_events
+      WHERE event_id = $1
+    `, [input.eventId]);
+    
+    return {
+      eventId: existing.rows[0].event_id,
+      logSequence: existing.rows[0].log_sequence,
+      receivedAt: existing.rows[0].received_at,
+      wasDuplicate: true,
+    };
+  }
+  
+  /**
+   * Get all events for a specific signal, in log sequence order.
+   * Used by the materialization process.
+   */
+  async getEventsForSignal(signalId: string): Promise<Array<{
+    eventId: string;
+    signalId: string;
+    eventType: 'emission' | 'retraction';
+    payload: any;
+    logSequence: number;
+    receivedAt: Date;
+  }>> {
+    const result = await this.db.query(`
+      SELECT event_id, signal_id, event_type, event_payload as payload, 
+             log_sequence, received_at
+      FROM signal_events
+      WHERE signal_id = $1
+      ORDER BY log_sequence ASC
+    `, [signalId]);
+    
+    return result.rows.map(row => ({
+      ...row,
+      payload: typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
+    }));
+  }
+  
+  /**
+   * Get the current max log sequence. Used by materialization to know
+   * where it's up to.
+   */
+  async getCurrentLogSequence(): Promise<number> {
+    const result = await this.db.query(`
+      SELECT COALESCE(MAX(log_sequence), 0) as max_seq
+      FROM signal_events
+    `);
+    return result.rows[0].max_seq;
+  }
+  
+  /**
+   * Get all events after a given log sequence.
+   * Used by incremental materialization.
+   */
+  async getEventsAfterSeq(fromSeq: number, limit: number = 10000): Promise<any[]> {
+    const result = await this.db.query(`
+      SELECT *
+      FROM signal_events
+      WHERE log_sequence > $1
+      ORDER BY log_sequence ASC
+      LIMIT $2
+    `, [fromSeq, limit]);
+    return result.rows;
+  }
+}
