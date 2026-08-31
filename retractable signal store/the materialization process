@@ -1,0 +1,349 @@
+// materializer.ts
+
+import { Pool } from 'pg';
+import { SignalEventLog } from './signal-event-log';
+import { MetricsClient } from './metrics';
+
+interface MaterializationState {
+  lastProcessedSeq: number;
+  lastProcessedAt: Date;
+  totalSignalsActive: number;
+  totalSignalsRetracted: number;
+}
+
+class SignalMaterializer {
+  private running: boolean = false;
+  private state: MaterializationState = {
+    lastProcessedSeq: 0,
+    lastProcessedAt: new Date(0),
+    totalSignalsActive: 0,
+    totalSignalsRetracted: 0,
+  };
+  
+  // In-memory index for fast lookups during incremental processing.
+  // Key: signal_id, Value: current known state
+  private signalIndex: Map<string, {
+    status: 'active' | 'retracted';
+    workerId: string;
+    jobTypeId: string;
+    emissionPayload: any;
+    retractionPayload: any | null;
+    lastEmissionSeq: number;
+    lastRetractionSeq: number | null;
+  }> = new Map();
+  
+  constructor(
+    private db: Pool,
+    private eventLog: SignalEventLog,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Full rebuild: drop the materialized view and rebuild from scratch.
+   * Used by reconciliation when drift is detected.
+   * This is safe because the event log is the source of truth.
+   */
+  async fullRebuild(): Promise<void> {
+    const startTime = Date.now();
+    this.metrics.increment('materializer.full_rebuild_started');
+    
+    console.log('🔄 Full rebuild of signal_current_state starting...');
+    
+    // 1. Clear the materialized view
+    await this.db.query('TRUNCATE signal_current_state');
+    this.signalIndex.clear();
+    
+    // 2. Fetch ALL events in order
+    const maxSeq = await this.eventLog.getCurrentLogSequence();
+    const events: any[] = [];
+    let fromSeq = 0;
+    
+    while (fromSeq <= maxSeq) {
+      const batch = await this.eventLog.getEventsAfterSeq(fromSeq, 50000);
+      if (batch.length === 0) break;
+      events.push(...batch);
+      fromSeq = batch[batch.length - 1].log_sequence + 1;
+    }
+    
+    console.log(`  📦 Processing ${events.length} events...`);
+    
+    // 3. Process each event in order to build the in-memory index
+    for (const event of events) {
+      this.processEvent(event, /* skipDbWrite */ true);
+    }
+    
+    // 4. Write the final state to the database in a single batch
+    await this.flushToDb();
+    
+    // 5. Update state
+    this.state.lastProcessedSeq = maxSeq;
+    this.state.lastProcessedAt = new Date();
+    this.state.totalSignalsActive = this.countByStatus('active');
+    this.state.totalSignalsRetracted = this.countByStatus('retracted');
+    
+    const duration = Date.now() - startTime;
+    this.metrics.histogram('materializer.full_rebuild_duration_ms', duration);
+    this.metrics.increment('materializer.full_rebuild_completed');
+    this.metrics.gauge('materializer.signals_active', this.state.totalSignalsActive);
+    this.metrics.gauge('materializer.signals_retracted', this.state.totalSignalsRetracted);
+    
+    console.log(`  ✅ Full rebuild complete in ${duration}ms`);
+    console.log(`     Active: ${this.state.totalSignalsActive}, Retracted: ${this.state.totalSignalsRetracted}`);
+  }
+  
+  /**
+   * Incremental: process only new events since last processed sequence.
+   * This is the normal running mode.
+   */
+  async incrementalProcess(): Promise<void> {
+    const currentMaxSeq = await this.eventLog.getCurrentLogSequence();
+    
+    if (currentMaxSeq <= this.state.lastProcessedSeq) {
+      return; // Nothing new
+    }
+    
+    const newEvents = await this.eventLog.getEventsAfterSeq(
+      this.state.lastProcessedSeq,
+      1000 // Small batch for low latency
+    );
+    
+    if (newEvents.length === 0) return;
+    
+    for (const event of newEvents) {
+      this.processEvent(event, /* skipDbWrite */ false);
+    }
+    
+    this.state.lastProcessedSeq = newEvents[newEvents.length - 1].log_sequence;
+    this.state.lastProcessedAt = new Date();
+    
+    this.metrics.increment('materializer.events_processed', { 
+      count: newEvents.length 
+    });
+  }
+  
+  /**
+   * Process a single event and update the in-memory index + database.
+   */
+  private async processEvent(event: any, skipDbWrite: boolean): Promise<void> {
+    const payload = typeof event.event_payload === 'string' 
+      ? JSON.parse(event.event_payload) 
+      : event.event_payload;
+    
+    const existing = this.signalIndex.get(event.signal_id);
+    
+    if (event.event_type === 'emission') {
+      if (existing) {
+        // Duplicate emission for the same signal_id.
+        // This shouldn't happen in practice (signal_id should be unique per signal),
+        // but if it does, we keep the first one (it has a lower log_sequence
+        // since we process in order).
+        this.metrics.increment('materializer.duplicate_emission_ignored');
+        return;
+      }
+      
+      // New signal
+      const entry = {
+        status: 'active' as const,
+        workerId: event.worker_id,
+        jobTypeId: event.job_type_id,
+        emissionPayload: payload,
+        retractionPayload: null,
+        lastEmissionSeq: event.log_sequence,
+        lastRetractionSeq: null as number | null,
+      };
+      
+      this.signalIndex.set(event.signal_id, entry);
+      
+      if (!skipDbWrite) {
+        await this.upsertSignalState(event.signal_id, entry);
+      }
+      
+    } else if (event.event_type === 'retraction') {
+      if (!existing) {
+        // Retraction arrived before emission. This is the KEY case.
+        // We create a "pre-retracted" entry in the index.
+        // When the emission arrives later, it will see this entry
+        // and immediately mark itself as retracted.
+        const entry = {
+          status: 'retracted' as const,
+          workerId: event.worker_id,
+          jobTypeId: event.job_type_id,
+          emissionPayload: null, // Will be filled in when emission arrives
+          retractionPayload: payload,
+          lastEmissionSeq: null as number | null,
+          lastRetractionSeq: event.log_sequence,
+        };
+        
+        this.signalIndex.set(event.signal_id, entry);
+        
+        if (!skipDbWrite) {
+          // Don't write to signal_current_state yet — we don't have
+          // the emission payload. We'll write it when the emission arrives.
+          // But we DO need to track this retraction so reconciliation can find it.
+          this.metrics.increment('materializer.early_retraction_staged');
+        }
+        
+        return;
+      }
+      
+      if (existing.status === 'retracted') {
+        // Already retracted — duplicate retraction event
+        this.metrics.increment('materializer.duplicate_retraction_ignored');
+        return;
+      }
+      
+      // Normal case: retract an active signal
+      existing.status = 'retracted';
+      existing.retractionPayload = payload;
+      existing.lastRetractionSeq = event.log_sequence;
+      
+      if (!skipDbWrite) {
+        await this.updateSignalRetracted(event.signal_id, existing);
+      }
+    }
+  }
+  
+  /**
+   * Handle the case where an emission arrives AFTER its retraction
+   * has already been staged in the index.
+   */
+  private async handleLateEmission(event: any, skipDbWrite: boolean): Promise<void> {
+    const existing = this.signalIndex.get(event.signal_id);
+    
+    if (!existing || existing.lastRetractionSeq === null) {
+      // Normal case — no early retraction. Let processEvent handle it.
+      return false;
+    }
+    
+    // The retraction arrived first. Fill in the emission payload
+    // and mark as retracted.
+    existing.emissionPayload = typeof event.event_payload === 'string'
+      ? JSON.parse(event.event_payload)
+      : event.event_payload;
+    existing.lastEmissionSeq = event.log_sequence;
+    // Status is already 'retracted' from the early retraction
+    
+    if (!skipDbWrite) {
+      // Now we have both the emission and retraction. Write the final state.
+      await this.upsertSignalState(event.signal_id, existing);
+    }
+    
+    this.metrics.increment('materializer.late_emission_resolved');
+    return true;
+  }
+  
+  private async upsertSignalState(signalId: string, entry: any): Promise<void> {
+    await this.db.query(`
+      INSERT INTO signal_current_state (
+        signal_id, status, worker_id, job_type_id,
+        emission_payload, retraction_payload,
+        last_emission_seq, last_retraction_seq,
+        materialized_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      ON CONFLICT (signal_id) DO UPDATE SET
+        status = EXCLUDED.status,
+        emission_payload = EXCLUDED.emission_payload,
+        retraction_payload = EXCLUDED.retraction_payload,
+        last_emission_seq = EXCLUDED.last_emission_seq,
+        last_retraction_seq = EXCLUDED.last_retraction_seq,
+        materialized_at = NOW()
+    `, [
+      signalId,
+      entry.status,
+      entry.workerId,
+      entry.jobTypeId,
+      JSON.stringify(entry.emissionPayload),
+      entry.retractionPayload ? JSON.stringify(entry.retractionPayload) : null,
+      entry.lastEmissionSeq,
+      entry.lastRetractionSeq,
+    ]);
+  }
+  
+  private async updateSignalRetracted(signalId: string, entry: any): Promise<void> {
+    await this.db.query(`
+      UPDATE signal_current_state SET
+        status = 'retracted',
+        retraction_payload = $2,
+        last_retraction_seq = $3,
+        materialized_at = NOW()
+      WHERE signal_id = $1
+    `, [
+      signalId,
+      JSON.stringify(entry.retractionPayload),
+      entry.lastRetractionSeq,
+    ]);
+  }
+  
+  private async flushToDb(): Promise<void> {
+    // Batch insert for full rebuild — much faster than individual upserts
+    const entries = Array.from(this.signalIndex.entries());
+    const values: any[] = [];
+    const params: any[] = [];
+    
+    for (let i = 0; i < entries.length; i++) {
+      const [signalId, entry] = entries[i];
+      const offset = i * 8;
+      params.push(
+        signalId,
+        entry.status,
+        entry.workerId,
+        entry.jobTypeId,
+        JSON.stringify(entry.emissionPayload),
+        entry.retractionPayload ? JSON.stringify(entry.retractionPayload) : null,
+        entry.lastEmissionSeq,
+        entry.lastRetractionSeq,
+      );
+      values.push(`($${offset+1}, $${offset+2}, $${offset+3}, $${offset+4}, $${offset+5}, $${offset+6}, $${offset+7}, $${offset+8}, NOW())`);
+    }
+    
+    // Insert in batches of 1000 to avoid query size limits
+    const BATCH_SIZE = 1000;
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      const batchValues = values.slice(i, i + BATCH_SIZE);
+      const batchParams = params.slice(i * 8, (i + BATCH_SIZE) * 8);
+      
+      await this.db.query(`
+        INSERT INTO signal_current_state (
+          signal_id, status, worker_id, job_type_id,
+          emission_payload, retraction_payload,
+          last_emission_seq, last_retraction_seq,
+          materialized_at
+        ) VALUES ${batchValues.join(',')}
+      `, batchParams);
+    }
+  }
+  
+  private countByStatus(status: 'active' | 'retracted'): number {
+    let count = 0;
+    for (const entry of this.signalIndex.values()) {
+      if (entry.status === status) count++;
+    }
+    return count;
+  }
+  
+  getState(): MaterializationState {
+    return { ...this.state };
+  }
+  
+  startPolling(intervalMs: number = 500): void {
+    if (this.running) return;
+    this.running = true;
+    
+    const poll = async () => {
+      if (!this.running) return;
+      try {
+        await this.incrementalProcess();
+      } catch (err) {
+        this.metrics.increment('materializer.poll_error');
+        console.error('Materializer poll error:', err);
+      }
+      setTimeout(poll, intervalMs);
+    };
+    
+    poll();
+  }
+  
+  stop(): void {
+    this.running = false;
+  }
+}
