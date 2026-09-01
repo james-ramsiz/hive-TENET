@@ -1,0 +1,214 @@
+// content-service/rejection-explanations.ts
+
+/**
+ * Rejection explanations are VERSIONED content, not code.
+ * They live in a database table, not in source code, because:
+ * 1. Non-engineers (content team, QA trainers) need to edit them
+ * 2. They're A/B tested frequently
+ * 3. They change when guidelines change
+ * 4. They need to be deployed independently of code
+ */
+
+interface RejectionExplanation {
+  reasonCode: string;
+  version: number;
+  // The SHORT version: shown in the notification and list views
+  shortTitle: string;
+  shortBody: string;           // Max 80 chars
+  // The FULL version: shown when the worker taps "learn more"
+  fullTitle: string;
+  fullBody: string;            // Markdown, rendered client-side
+  fullDo: string[];            // "Do this" — actionable guidance
+  fullDont: string[];          // "Don't do this" — common mistakes
+  // Visual example: shown inline (NOT the evidence packet examples — 
+  // those are for reviewers. These are simplified for workers.)
+  exampleImageAcceptedUrl?: string;
+  exampleImageRejectedUrl?: string;
+  // Metadata
+  jobTypeIds: string[];        // Which job types this explanation applies to
+  activeFrom: Date;
+  activeUntil: Date | null;    // null = active indefinitely
+  abVariant?: string;          // If this is an experiment variant
+}
+
+class RejectionExplanationService {
+  // Cache explanations in memory, refreshed every 60s
+  private cache: Map<string, RejectionExplanation[]> = new Map();
+  private lastRefresh: Date = new Date(0);
+  
+  constructor(private db: Pool) {}
+  
+  /**
+   * Get the explanation for a specific rejection reason, for a specific worker.
+   * Handles versioning, A/B testing, and job type specificity.
+   */
+  async getExplanation(
+    reasonCode: string,
+    jobTypeId: string,
+    workerId: string,
+    experiments: ExperimentFramework,
+  ): Promise<{
+    short: { title: string; body: string };
+    full: { title: string; body: string; do: string[]; dont: string[]; exampleAccepted?: string; exampleRejected?: string };
+  }> {
+    await this.ensureCacheFresh();
+    
+    const candidates = this.cache.get(reasonCode) || [];
+    
+    // Filter to explanations that are:
+    // 1. Active now
+    // 2. Applicable to this job type (or all job types)
+    const now = new Date();
+    const active = candidates.filter(e => 
+      e.activeFrom <= now && 
+      (e.activeUntil === null || e.activeUntil > now) &&
+      (e.jobTypeIds.length === 0 || e.jobTypeIds.includes(jobTypeId))
+    );
+    
+    if (active.length === 0) {
+      // Fallback: generic explanation
+      return this.genericExplanation(reasonCode);
+    }
+    
+    // If there are multiple active explanations (A/B test), pick one
+    if (active.length === 1) {
+      return this.formatExplanation(active[0]);
+    }
+    
+    // A/B test: use the experiment framework to pick a variant
+    const abVariants = active.filter(e => e.abVariant);
+    if (abVariants.length > 1) {
+      const assignedVariant = await experiments.getAssignment(
+        workerId,
+        `rejection_explanation_${reasonCode}`,
+        { fallback: abVariants[0].abVariant! }
+      );
+      const selected = abVariants.find(e => e.abVariant === assignedVariant) 
+        || abVariants[0];
+      return this.formatExplanation(selected);
+    }
+    
+    // No A/B test — pick the latest version
+    const latest = active.sort((a, b) => b.version - a.version)[0];
+    return this.formatExplanation(latest);
+  }
+  
+  private formatExplanation(e: RejectionExplanation) {
+    return {
+      short: { title: e.shortTitle, body: e.shortBody },
+      full: {
+        title: e.fullTitle,
+        body: e.fullBody,
+        do: e.fullDo,
+        dont: e.fullDont,
+        exampleAccepted: e.exampleImageAcceptedUrl,
+        exampleRejected: e.exampleImageRejectedUrl,
+      },
+    };
+  }
+  
+  private genericExplanation(reasonCode: string) {
+    return {
+      short: {
+        title: 'Task not accepted',
+        body: 'Your submission did not meet the requirements.',
+      },
+      full: {
+        title: 'Task not accepted',
+        body: `Your task was flagged with reason code \`${reasonCode}\`. ` +
+              'Review the guidelines for this task type and try again. ' +
+              'If you believe this is an error, you can file an appeal below.',
+        do: ['Review the guidelines carefully', 'Compare your work to the examples'],
+        dont: ['Submit similar work without understanding the issue'],
+      },
+    };
+  }
+  
+  private async ensureCacheFresh(): Promise<void> {
+    if (Date.now() - this.lastRefresh.getTime() < 60_000) return;
+    
+    const result = await this.db.query(`
+      SELECT * FROM rejection_explanations
+      WHERE active_from <= NOW() AND (active_until IS NULL OR active_until > NOW())
+      ORDER BY reason_code, version DESC
+    `);
+    
+    this.cache.clear();
+    for (const row of result.rows) {
+      const existing = this.cache.get(row.reason_code) || [];
+      existing.push({
+        reasonCode: row.reason_code,
+        version: row.version,
+        shortTitle: row.short_title,
+        shortBody: row.short_body,
+        fullTitle: row.full_title,
+        fullBody: row.full_body,
+        fullDo: row.full_do,
+        fullDont: row.full_dont,
+        exampleImageAcceptedUrl: row.example_image_accepted_url,
+        exampleImageRejectedUrl: row.example_image_rejected_url,
+        jobTypeIds: row.job_type_ids || [],
+        activeFrom: new Date(row.active_from),
+        activeUntil: row.active_until ? new Date(row.active_until) : null,
+        abVariant: row.ab_variant,
+      });
+      this.cache.set(row.reason_code, existing);
+    }
+    
+    this.lastRefresh = new Date();
+  }
+}
+
+// ─── Example explanations (stored in DB, not in code) ───
+// These are SEED DATA, not hardcoded logic.
+
+const SEED_EXPLANATIONS = [
+  {
+    reason_code: 'blurry_image',
+    version: 2,
+    short_title: 'Image quality issue',
+    short_body: 'The image was not clear enough to evaluate.',
+    full_title: 'Image Quality: Clarity Requirements',
+    full_body: 'Images must be clear enough that all elements can be identified without ambiguity. ' +
+      'This means no motion blur, no out-of-focus regions covering key elements, ' +
+      'and sufficient resolution that text (if present) is legible.',
+    full_do: [
+      'Ensure your camera is focused before capturing',
+      'Hold the device steady for at least 2 seconds',
+      'Check that the key elements are sharp in the preview before submitting',
+    ],
+    full_dont: [
+      'Submit images where any key element is blurry, even if the rest is clear',
+      'Assume that "close enough" is acceptable — if you can\'t clearly identify an element, the image fails',
+    ],
+    job_type_ids: ['storefront_photo_compliance', 'product_attribute_verification'],
+    active_from: '2024-01-15',
+    active_until: null,
+    ab_variant: null,
+  },
+  {
+    reason_code: 'blurry_image',
+    version: 3,
+    // A/B variant: same info, different framing — tests whether "what to check" 
+    // performs better than "what you did wrong"
+    short_title: 'Check image clarity',
+    short_body: 'Some elements in the image were not clearly visible.',
+    full_title: 'How to Check Image Clarity',
+    full_body: 'Before submitting, zoom into the key elements of the image. ' +
+      'Can you clearly identify what each element is? If any element is ambiguous ' +
+      'due to blur, the image does not meet the standard.',
+    full_do: [
+      'Zoom in on each key element before submitting',
+      'If anything looks even slightly unclear, retake the photo',
+      'Use good lighting — low light causes the camera to use slow shutter speeds, which cause blur',
+    ],
+    full_dont: [
+      'Rely on the thumbnail view — always zoom in to check',
+      'Submit if you\'re unsure about clarity — when in doubt, retake',
+    ],
+    job_type_ids: ['storefront_photo_compliance'],
+    active_from: '2024-03-01',
+    active_until: null,
+    ab_variant: 'action_framing', // This is variant B of the A/B test
+  },
+];
