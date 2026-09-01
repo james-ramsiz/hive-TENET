@@ -1,0 +1,38 @@
+┌─────────────────────────────────────────────────────────────────────┐
+│                    WORKER APPEAL FUNNEL                             │
+│                     (before optimizations)                          │
+│                                                                     │
+│  rejection_seen ────────────────────────────── 100% (baseline)     │
+│       │                                                             │
+│       │  12% drop (never opened notification)                       │
+│       ▼                                                             │
+│  rejection_reason_read ──────────────────────── 88%                 │
+│       │                                                             │
+│       │  45% drop (didn't click "learn more")                      │
+│       ▼                                                             │
+│  learn_more_clicked ────────────────────────── 48%                 │
+│       │                                                             │
+│       │  23% drop (read explanation, decided not to appeal)        │
+│       ▼                                                             │
+│  appeal_started ───────────────────────────── 37%                 │
+│       │                                                             │
+│       │  8% drop (started form, didn't select category)           │
+│       ▼                                                             │
+│  appeal_category_selected ─────────────────── 34%                 │
+│       │                                                             │
+│       │  4% drop (selected category, didn't write text)           │
+│       ▼                                                             │
+│  appeal_text_entered ──────────────────────── 33%                 │
+│       │                                                             │
+│       │  3% drop (wrote text, didn't submit)                      │
+│       ▼                                                             │
+│  appeal_submitted ─────────────────────────── 32%                 │
+│       │                                                             │
+│       │                                                             │
+│       ├─── appeal_overturned ──────────────── 14% (of total)      │
+│       └─── appeal_upheld ──────────────────── 18% (of total)      │
+│                                                                     │
+│  KEY METRIC: 44% of submitted appeals were overturned.             │
+│  This is TOO HIGH — it means reviewers are wrong too often.        │
+│  Target: 10-15%.                                                   │
+└─────────────────────────────────────────────────────────────────────┘
