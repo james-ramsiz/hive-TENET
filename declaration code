@@ -1,0 +1,274 @@
+// queue-topology.ts
+// This file is the SINGLE SOURCE OF TRUTH for the entire queue topology.
+// Every service imports this. No service declares its own queues.
+// This is loaded once at service startup and asserted against the broker.
+
+import amqplib, { Connection, Channel } from 'amqplib';
+
+// ─── Types ───
+
+interface ExchangeDef {
+  name: string;
+  type: 'direct' | 'topic' | 'fanout' | 'headers';
+  durable: boolean;
+  autoDelete: boolean;
+}
+
+interface QueueDef {
+  name: string;
+  durable: boolean;
+  autoDelete: boolean;
+  exclusive: boolean;
+  // Message TTL — messages older than this are dropped
+  messageTtlMs?: number;
+  // Max length — queue drops oldest messages when full
+  maxLength?: number;
+  // Dead letter exchange — where failed messages go
+  dlx?: string;
+  // Dead letter routing key — what key to use when forwarding to DLX
+  dlxRoutingKey?: string;
+  // Per-consumer prefetch — how many unacked messages a consumer can hold
+  prefetchCount: number;
+  // Priority queue support
+  maxPriority?: number;
+}
+
+interface BindingDef {
+  queue: string;
+  exchange: string;
+  routingKeyPattern: string;  // * and # wildcards for topic exchanges
+  // For priority routing: map routing key substrings to priority values
+  priorityMap?: Array<{ pattern: string; priority: number }>;
+}
+
+// ─── The Topology ───
+
+const EXCHANGES: ExchangeDef[] = [
+  {
+    name: 'task.events',
+    type: 'topic',
+    durable: true,
+    autoDelete: false,
+  },
+  {
+    name: 'task.events.dlx',
+    type: 'fanout',
+    durable: true,
+    autoDelete: false,
+  },
+  // Separate exchange for control messages (SLA advances, flush signals)
+  // that shouldn't mix with business events
+  {
+    name: 'task.control',
+    type: 'direct',
+    durable: true,
+    autoDelete: false,
+  },
+  {
+    name: 'task.control.dlx',
+    type: 'fanout',
+    durable: true,
+    autoDelete: false,
+  },
+];
+
+const QUEUES: QueueDef[] = [
+  // ─── Worker performance signals ───
+  // Consumed by: worker-performance-signal service
+  // Events: rejected, accepted (for completeness)
+  {
+    name: 'q.worker.signal',
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    messageTtlMs: 24 * 60 * 60 * 1000, // 24h — signals older than this are useless
+    maxLength: 100_000,               // Drop oldest if queue is enormous
+    dlx: 'task.events.dlx',
+    prefetchCount: 50,                // Can process 50 signals in parallel
+  },
+  
+  // ─── Appeal review assignment ───
+  // Consumed by: reviewer-pool service (appeal assignment logic)
+  // Events: appealed, queued_for_appeal
+  {
+    name: 'q.appeal.assignment',
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    messageTtlMs: 48 * 60 * 60 * 1000, // 48h — appeals have longer windows
+    dlx: 'task.events.dlx',
+    prefetchCount: 10,                // Appeal assignment is slower — don't overload
+    maxPriority: 5,                   // Overturned tasks generate priority appeals
+  },
+  
+  // ─── Signal retraction ───
+  // Consumed by: signal-event-log service (retraction handler)
+  // Events: overturned
+  {
+    name: 'q.signal.retraction',
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    messageTtlMs: 72 * 60 * 60 * 1000, // 72h — retractions are critical, don't lose them
+    dlx: 'task.events.dlx',
+    prefetchCount: 100,               // Retractions must be processed fast
+  },
+  
+  // ─── Reviewer performance tracking ───
+  // Consumed by: reviewer-performance-tracker service
+  // Events: accepted, rejected, upheld, overturned
+  {
+    name: 'q.reviewer.perf',
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    messageTtlMs: 30 * 24 * 60 * 60 * 1000, // 30 days — reviewer stats have a long window
+    maxLength: 500_000,
+    dlx: 'task.events.dlx',
+    prefetchCount: 50,
+  },
+  
+  // ─── Audit log ───
+  // Consumed by: audit service
+  // Events: ALL transitions
+  {
+    name: 'q.audit.log',
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    messageTtlMs: 90 * 24 * 60 * 60 * 1000, // 90 days — compliance requirement
+    maxLength: 1_000_000,
+    dlx: 'task.events.dlx',
+    prefetchCount: 20,                // Audit is low priority
+  },
+  
+  // ─── Catch-all for debugging ───
+  // Consumed by: dev tools, replay service
+  // Events: ALL
+  {
+    name: 'q.catchall',
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    messageTtlMs: 7 * 24 * 60 * 60 * 1000, // 7 days — just for debugging
+    maxLength: 50_000,
+    dlx: 'task.events.dlx',
+    prefetchCount: 5,
+  },
+  
+  // ─── Dead letter queues (one per source queue) ───
+  // Each DLQ has the same name as the source queue, prefixed with "dlq."
+  ...[
+    'q.worker.signal',
+    'q.appeal.assignment',
+    'q.signal.retraction',
+    'q.reviewer.perf',
+    'q.audit.log',
+    'q.catchall',
+  ].map(sourceQueue => ({
+    name: `dlq.${sourceQueue}`,
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    messageTtlMs: 7 * 24 * 60 * 60 * 1000, // DLQ messages live for 7 days before expiry
+    maxLength: 10_000,
+    prefetchCount: 1,                  // DLQ consumer processes one at a time
+  })),
+  
+  // ─── Control queues ───
+  {
+    name: 'q.control.sla',
+    durable: true,
+    autoDelete: false,
+    exclusive: false,
+    dlx: 'task.control.dlx',
+    prefetchCount: 10,
+  },
+];
+
+const BINDINGS: BindingDef[] = [
+  // Worker signal queue: all rejection events → emit performance signal
+  { queue: 'q.worker.signal', exchange: 'task.events', routingKeyPattern: '*.rejected.*' },
+  { queue: 'q.worker.signal', exchange: 'task.events', routingKeyPattern: '*.accepted.*' },
+  
+  // Appeal assignment queue: appealed events
+  { queue: 'q.appeal.assignment', exchange: 'task.events', routingKeyPattern: '*.appealed.*' },
+  { queue: 'q.appeal.assignment', exchange: 'task.events', routingKeyPattern: '*.queued_for_appeal.*' },
+  
+  // Signal retraction queue: overturn events
+  { queue: 'q.signal.retraction', exchange: 'task.events', routingKeyPattern: '*.overturned.*' },
+  
+  // Reviewer performance: all decisions
+  { queue: 'q.reviewer.perf', exchange: 'task.events', routingKeyPattern: '*.accepted.*' },
+  { queue: 'q.reviewer.perf', exchange: 'task.events', routingKeyPattern: '*.rejected.*' },
+  { queue: 'q.reviewer.perf', exchange: 'task.events', routingKeyPattern: '*.upheld.*' },
+  { queue: 'q.reviewer.perf', exchange: 'task.events', routingKeyPattern: '*.overturned.*' },
+  
+  // Audit: everything
+  { queue: 'q.audit.log', exchange: 'task.events', routingKeyPattern: '*.*.*' },
+  
+  // Catch-all: everything (for debugging/replay)
+  { queue: 'q.catchall', exchange: 'task.events', routingKeyPattern: '#*' },
+  
+  // DLQ bindings: fanout exchange → all DLQs
+  // (Each source queue's DLX is configured to route to its specific DLQ
+  //  via the dlxRoutingKey setting on the queue itself, not via binding.
+  //  The fanout DLX is a safety net for messages that don't match.)
+];
+
+// ─── Topology Assertion ───
+// This function asserts that the broker's topology matches our declarations.
+// If there's a mismatch, it THROWS — we'd rather fail to start than run
+// with a wrong topology.
+
+export async function assertTopology(channel: Channel): Promise<void> {
+  // Assert exchanges
+  for (const ex of EXCHANGES) {
+    await channel.assertExchange(ex.name, ex.type, {
+      durable: ex.durable,
+      autoDelete: ex.autoDelete,
+    });
+  }
+  
+  // Assert queues
+  const dlxQueueNames = new Set(QUEUES.filter(q => q.name.startsWith('dlq.')).map(q => q.name));
+  
+  for (const q of QUEUES) {
+    const args: any = {};
+    
+    if (q.messageTtlMs) args['x-message-ttl'] = q.messageTtlMs;
+    if (q.maxLength) args['x-max-length'] = q.maxLength;
+    if (q.dlx && !dlxQueueNames.has(q.name)) {
+      // Non-DLQ queues get a DLX configured
+      args['x-dead-letter-exchange'] = q.dlx;
+      // Use the queue name as the dead letter routing key so the DLX
+      // can route to the correct DLQ
+      args['x-dead-letter-routing-key'] = q.name;
+    }
+    if (q.maxPriority) args['x-max-priority'] = q.maxPriority;
+    
+    await channel.assertQueue(q.name, {
+      durable: q.durable,
+      autoDelete: q.autoDelete,
+      exclusive: q.exclusive,
+      arguments: args,
+    });
+  }
+  
+  // Assert bindings
+  for (const b of BINDINGS) {
+    await channel.bindQueue(b.queue, b.exchange, b.routingKeyPattern);
+  }
+  
+  // Assert DLX → DLQ bindings
+  // Each DLQ binds to its corresponding DLX with the source queue name as routing key
+  for (const q of QUEUES) {
+    if (q.dlx && !dlxQueueNames.has(q.name)) {
+      const dlqName = `dlq.${q.name}`;
+      await channel.bindQueue(dlqName, q.dlx, q.name);
+    }
+  }
+}
+
+export { EXCHANGES, QUEUES, BINDINGS };
+export type { ExchangeDef, QueueDef, BindingDef };
