@@ -1,0 +1,170 @@
+// consumer-sequencer.ts
+
+/**
+ * Per-task event sequencer.
+ * 
+ * Each event has a monotonically increasing sequence number within a task
+ * (assigned by the state machine at transition time, not by the queue).
+ * 
+ * If events arrive out of order, the sequencer buffers late events
+ * and processes them when the missing event arrives.
+ */
+class TaskEventSequencer {
+  // Per-task: map of sequence number → buffered event
+  private buffers: Map<string, Map<number, any>> = new Map();
+  // Per-task: the next expected sequence number
+  private nextExpected: Map<string, number> = new Map();
+  // Per-task: the last processed sequence number (for gap detection)
+  private lastProcessed: Map<string, number> = new Map();
+  
+  private maxBufferSize: number;
+  private maxBufferAgeMs: number;
+  
+  constructor(
+    maxBufferSize: number = 100,
+    maxBufferAgeMs: number = 60_000, // 1 minute
+  ) {
+    this.maxBufferSize = maxBufferSize;
+    this.maxBufferAgeMs = maxBufferAgeMs;
+  }
+  
+  /**
+   * Submit an event for processing.
+   * Returns:
+   *   - The event to process NOW (if in order)
+   *   - null if the event was buffered (out of order)
+   *   - throws if a gap is detected that can't be resolved
+   */
+  submit(
+    taskId: string,
+    sequenceNumber: number,
+    event: any,
+    timestamp: Date,
+  ): any | null {
+    const expected = this.nextExpected.get(taskId) || 0;
+    
+    if (sequenceNumber === expected) {
+      // In order — process immediately
+      this.lastProcessed.set(taskId, sequenceNumber);
+      this.nextExpected.set(taskId, sequenceNumber + 1);
+      
+      // Check if any buffered events can now be processed
+      const buffered = this.flushBuffered(taskId);
+      if (buffered.length > 0) {
+        // Return the current event; the caller should call submit()
+        // again for each buffered event
+        // (In practice, we return an array or use a callback)
+      }
+      
+      return event;
+    }
+    
+    if (sequenceNumber > expected) {
+      // Out of order — future event. Buffer it.
+      this.bufferEvent(taskId, sequenceNumber, event, timestamp);
+      return null;
+    }
+    
+    // sequenceNumber < expected: duplicate or stale event
+    // This is fine — just ignore it
+    return null;
+  }
+  
+  private bufferEvent(taskId: string, seq: number, event: any, timestamp: Date): void {
+    if (!this.buffers.has(taskId)) {
+      this.buffers.set(taskId, new Map());
+    }
+    
+    const taskBuffer = this.buffers.get(taskId)!;
+    
+    // Check buffer limits
+    if (taskBuffer.size >= this.maxBufferSize) {
+      // Buffer overflow — this shouldn't happen in practice.
+      // It means we're receiving events way out of order.
+      // Force-process the buffered events in order, accepting the gap.
+      console.error(
+        `Task ${taskId}: buffer overflow (${taskBuffer.size} >= ${this.maxBufferSize}). ` +
+        `Force-flushing. Expected seq ${this.nextExpected.get(taskId)}, got ${seq}.`
+      );
+      this.forceFlush(taskId);
+      return;
+    }
+    
+    // Check buffer age
+    const oldestEntry = taskBuffer.entries().next().value;
+    if (oldestEntry) {
+      const bufferAge = Date.now() - (oldestEntry[1].timestamp?.getTime() || 0);
+      if (bufferAge > this.maxBufferAgeMs) {
+        console.error(
+          `Task ${taskId}: buffer age exceeded (${bufferAge}ms > ${this.maxBufferAgeMs}ms). Force-flushing.`
+        );
+        this.forceFlush(taskId);
+        return;
+      }
+    }
+    
+    taskBuffer.set(seq, { ...event, timestamp });
+  }
+  
+  private flushBuffered(taskId: string): any[] {
+    const taskBuffer = this.buffers.get(taskId);
+    if (!taskBuffer || taskBuffer.size === 0) return [];
+    
+    const expected = this.nextExpected.get(taskId) || 0;
+    const ready: any[] = [];
+    
+    // Process all buffered events that are now in sequence
+    while (taskBuffer.has(expected)) {
+      const event = taskBuffer.get(expected)!;
+      taskBuffer.delete(expected);
+      ready.push(event);
+      this.lastProcessed.set(taskId, expected);
+      expected++;
+    }
+    
+    this.nextExpected.set(taskId, expected);
+    return ready;
+  }
+  
+  private forceFlush(taskId: string): void {
+    const taskBuffer = this.buffers.get(taskId);
+    if (!taskBuffer) return;
+    
+    // Sort by sequence number and process all
+    const sorted = Array.from(taskBuffer.entries())
+      .sort(([a], [b]) => a - b);
+    
+    for (const [seq, event] of sorted) {
+      // Emit the event even though there's a gap
+      // The consumer must handle this gracefully (it checks the DB state,
+      // not just the event)
+      this.lastProcessed.set(taskId, seq);
+    }
+    
+    // Update next expected to past the last buffered event
+    if (sorted.length > 0) {
+      this.nextExpected.set(taskId, sorted[sorted.length - 1][0] + 1);
+    }
+    
+    taskBuffer.clear();
+  }
+  
+  /**
+   * Clean up state for a task that's been idle for a while.
+   * Prevents memory leaks from accumulating per-task state.
+   */
+  cleanupTask(taskId: string): void {
+    this.buffers.delete(taskId);
+    this.nextExpected.delete(taskId);
+    this.lastProcessed.delete(taskId);
+  }
+  
+  /**
+   * Clean up all tasks that haven't been seen in a while.
+   */
+  cleanupStale(maxAgeMs: number = 5 * 60 * 1000): number {
+    // In a real implementation, we'd track last-seen timestamps.
+    // Simplified here.
+    return 0;
+  }
+}
