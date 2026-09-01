@@ -1,0 +1,42 @@
+-- Consumer idempotency tracking
+CREATE TABLE consumer_processed_messages (
+    queue_name   TEXT NOT NULL,
+    message_id   TEXT NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (queue_name, message_id)
+);
+
+-- Auto-cleanup: delete processed message records after 7 days
+CREATE INDEX idx_processed_cleanup ON consumer_processed_messages (processed_at);
+
+-- DLQ parked messages (poison pills)
+CREATE TABLE dlq_parked_messages (
+    id              BIGSERIAL PRIMARY KEY,
+    message_id      TEXT NOT NULL UNIQUE,
+    source_queue    TEXT NOT NULL,
+    routing_key     TEXT NOT NULL,
+    payload         JSONB NOT NULL,
+    death_count     INT NOT NULL,
+    first_death_at  TIMESTAMPTZ NOT NULL,
+    last_death_at   TIMESTAMPTZ NOT NULL,
+    death_reason    TEXT NOT NULL,
+    parked_at       TIMESTAMPTZ NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'parked'
+                    CHECK (status IN ('parked', 'replaying', 'replayed', 'discarded')),
+    replayed_at     TIMESTAMPTZ,
+    replay_result   TEXT
+);
+
+CREATE INDEX idx_dlq_parked_source ON dlq_parked_messages (source_queue, status);
+CREATE INDEX idx_dlq_parked_time ON dlq_parked_messages (parked_at);
+
+-- DLQ decision log (for audit)
+CREATE TABLE dlq_decisions (
+    id              BIGSERIAL PRIMARY KEY,
+    message_id      TEXT NOT NULL,
+    source_queue    TEXT NOT NULL,
+    decision        TEXT NOT NULL,
+    decided_at      TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_dlq_decisions_time ON dlq_decisions (decided_at);
