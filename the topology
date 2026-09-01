@@ -1,0 +1,67 @@
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                     │
+│  ┌──────────────────┐                                                              │
+│  │  STATE MACHINE   │                                                              │
+│  │  SERVICE         │                                                              │
+│  │                  │                                                              │
+│  │  Emits events    │                                                              │
+│  │  as side effects │                                                              │
+│  │  of transitions  │                                                              │
+│  └────────┬─────────┘                                                              │
+│           │                                                                         │
+│           │ publishes to                                                            │
+│           ▼                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────────┐       │
+│  │                                                                          │       │
+│  │                    task.events EXCHANGE (topic)                          │       │
+│  │                                                                          │       │
+│  │   Binding key pattern:  {job_type}.{event_type}.{task_id}               │       │
+│  │                                                                          │       │
+│  │   Examples:                                                              │       │
+│  │     photo_compliance.rejected.task_abc123                               │       │
+│  │     logo_detection.appealed.task_def456                                 │       │
+│  │     *.accepted.*                  (matches all acceptances)              │       │
+│  │     *.overturned.*                (matches all overturns)                │       │
+│  │                                                                          │       │
+│  └──┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────────┘       │
+│     │          │          │          │          │          │                       │
+│     │ #        │ #        │ #        │ #        │ #        │ #                     │
+│     │ binding  │ binding  │ binding  │ binding  │ binding  │ binding              │
+│     │ key:     │ key:     │ key:     │ key:     │ key:     │ key:                 │
+│     │ *.rej.*  │ *.app.*  │ *.over.* │ *.acc.*  │ *.*.*    │ photo_*              │
+│     │          │          │          │          │          │ (all photo           │
+│     ▼          ▼          ▼          ▼          ▼          │  events)             │
+│  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐   ▼                       │
+│  │ worker│ │ appeal│ │ signal│ │ perf  │ │ audit │ ┌──────────────┐            │
+│  │ signal│ │ queue │ │ retract│ │ update│ │ log   │ │ photo-specific│            │
+│  │ queue │ │       │ │ queue │ │ queue │ │ queue │ │ queue        │            │
+│  └───┬───┘ └───┬───┘ └───┬───┘ └───┬───┘ └───┬───┘ └──────┬───────┘            │
+│      │         │         │         │         │             │                     │
+│      ▼         ▼         ▼         ▼         ▼             ▼                     │
+│  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐ ┌──────────┐               │
+│  │worker │ │appeal │ │signal │ │reviewer│ │audit  │ │photo     │               │
+│  │perf   │ │review │ │store  │ │perf   │ │service│ │compliance│               │
+│  │service│ │assign │ │       │ │tracker│ │       │ │service   │               │
+│  └───────┘ └───────┘ └───────┘ └───────┘ └───────┘ └──────────┘               │
+│                                                                              │     │
+│  ─── DEAD LETTER EXCHANGE (fanout) ────────────────────────────────────        │     │
+│  │                                                                           │  │     │
+│  │  Every queue above has DLX configured. Failed messages                    │  │     │
+│  │  (after retries) route here.                                             │  │     │
+│  │                                                                           │  │     │
+│  │  ┌──────────────────────┐  ┌──────────────────────┐                       │  │     │
+│  │  │ dlq.worker_signal    │  │ dlq.appeal_queue     │  ...                  │  │     │
+│  │  └──────────┬───────────┘  └──────────┬───────────┘                       │  │     │
+│  │             │                         │                                  │  │     │
+│  │             ▼                         ▼                                  │  │     │
+│  │  ┌──────────────────────────────────────────────┐                        │  │     │
+│  │  │         DLQ MONITOR SERVICE                  │                        │  │     │
+│  │  │  - Inspects failed messages                  │                        │  │     │
+│  │  │  - Classifies: retryable vs poison           │                        │  │     │
+│  │  │  - Auto-retries retryable with backoff       │                        │  │     │
+│  │  │  - Alerts on poison pills                     │                        │  │     │
+│  │  │  - Provides manual replay UI                  │                        │  │     │
+│  │  └──────────────────────────────────────────────┘                        │  │     │
+│  └──────────────────────────────────────────────────────────────────────────┘  │     │
+│                                                                                 │     │
+└─────────────────────────────────────────────────────────────────────────────────┘     │
