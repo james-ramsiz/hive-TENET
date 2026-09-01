@@ -1,0 +1,217 @@
+// fatigue-intervention.ts
+
+import { FatigueSignal } from './fatigue-detector';
+import { MetricsClient } from './metrics';
+
+interface InterventionAction {
+  type: 'notify' | 'slow_queue' | 'pause_queue' | 'force_break' | 'log_only';
+  message: string;
+  durationMs?: number;
+}
+
+class FatigueInterventionPolicy {
+  // How many fatigue signals before escalating?
+  // We use a leaky bucket: signals add water, time drains it.
+  private signalBuckets: Map<string, { count: number; lastSignalAt: Date }> = new Map();
+  
+  // Intervention thresholds
+  private readonly NOTIFY_THRESHOLD = 1;
+  private readonly SLOW_QUEUE_THRESHOLD = 2;
+  private readonly PAUSE_QUEUE_THRESHOLD = 4;
+  private readonly FORCE_BREAK_THRESHOLD = 6;
+  
+  // Drain rate: one signal "leaks" every 15 minutes
+  private readonly DRAIN_INTERVAL_MS = 15 * 60 * 1000;
+  
+  constructor(private metrics: MetricsClient) {}
+  
+  /**
+   * Determine what intervention to apply for a fatigue signal.
+   * Called by the reviewer service when the fatigue detector fires.
+   */
+  getAction(signal: FatigueSignal): InterventionAction {
+    const bucket = this.getOrCreateBucket(signal.reviewerId);
+    
+    // Drain the bucket based on time since last signal
+    const timeSinceLastSignal = Date.now() - bucket.lastSignalAt.getTime();
+    const drainAmount = Math.floor(timeSinceLastSignal / this.DRAIN_INTERVAL_MS);
+    bucket.count = Math.max(0, bucket.count - drainAmount);
+    
+    // Add the new signal
+    // Critical signals count double
+    const weight = signal.severity === 'critical' ? 2 : 1;
+    bucket.count += weight;
+    bucket.lastSignalAt = new Date();
+    
+    // Determine intervention level
+    if (bucket.count >= this.FORCE_BREAK_THRESHOLD) {
+      this.metrics.increment('fatigue.intervention', {
+        type: 'force_break',
+        reviewerId: signal.reviewerId,
+      });
+      
+      return {
+        type: 'force_break',
+        message: 'We\'ve noticed your review patterns have shifted significantly. ' +
+                 'Taking a 15-minute break will help maintain review quality. ' +
+                 'Your queue has been paused — it will resume automatically.',
+        durationMs: 15 * 60 * 1000,
+      };
+    }
+    
+    if (bucket.count >= this.PAUSE_QUEUE_THRESHOLD) {
+      this.metrics.increment('fatigue.intervention', {
+        type: 'pause_queue',
+        reviewerId: signal.reviewerId,
+      });
+      
+      return {
+        type: 'pause_queue',
+        message: 'Your queue has been temporarily paused. Take a few minutes ' +
+                 'to stretch and refocus before continuing.',
+        durationMs: 5 * 60 * 1000,
+      };
+    }
+    
+    if (bucket.count >= this.SLOW_QUEUE_THRESHOLD) {
+      this.metrics.increment('fatigue.intervention', {
+        type: 'slow_queue',
+        reviewerId: signal.reviewerId,
+      });
+      
+      return {
+        type: 'slow_queue',
+        message: 'You\'ve been reviewing for a while. New tasks will arrive ' +
+                 'more slowly — consider taking a short break.',
+        // "Slow queue" means increasing the interval between task assignments
+        // from ~2s to ~30s. Reviewer can still review if they want, but 
+        // the reduced pace naturally encourages breaks.
+        durationMs: 10 * 60 * 1000,
+      };
+    }
+    
+    if (bucket.count >= this.NOTIFY_THRESHOLD) {
+      this.metrics.increment('fatigue.intervention', {
+        type: 'notify',
+        reviewerId: signal.reviewerId,
+      });
+      
+      return {
+        type: 'notify',
+        message: `Heads up: ${this.formatSignalForHuman(signal)}`,
+        // Notification only — no queue changes
+      };
+    }
+    
+    return {
+      type: 'log_only',
+      message: '',
+    };
+  }
+  
+  private formatSignalForHuman(signal: FatigueSignal): string {
+    switch (signal.signalType) {
+      case 'slowdown':
+        return 'your review times have been increasing. If you\'re feeling tired, ' +
+               'consider taking a break — there\'s no penalty for stepping away.';
+      case 'rejection_drift':
+        return 'your rejection rate has shifted from your usual pattern. ' +
+               'This can happen naturally when focusing hard, but it\'s worth ' +
+               'double-checking recent decisions.';
+      case 'session_length':
+        return `you've been reviewing for ${Math.round(signal.currentValue / 60000)} minutes. ` +
+               'Most reviewers take a break around 90 minutes.';
+      case 'pattern_break':
+        return `several of your recent decisions have been overturned on appeal. ` +
+               'This might indicate the guidelines have changed — check for updates.';
+      default:
+        return 'we noticed a shift in your review patterns.';
+    }
+  }
+  
+  private getOrCreateBucket(reviewerId: string) {
+    let bucket = this.signalBuckets.get(reviewerId);
+    if (!bucket) {
+      bucket = { count: 0, lastSignalAt: new Date(0) };
+      this.signalBuckets.set(reviewerId, bucket);
+    }
+    return bucket;
+  }
+}
+
+// ─── How the intervention is applied ───
+// This sits in the reviewer pool service.
+
+class ReviewerPoolWithFatigue {
+  constructor(
+    private interventionPolicy: FatigueInterventionPolicy,
+    private reviewerQueue: ReviewerQueue,
+    private metrics: MetricsClient,
+  ) {}
+  
+  async handleFatigueSignal(signal: FatigueSignal): Promise<void> {
+    const action = this.interventionPolicy.getAction(signal);
+    
+    switch (action.type) {
+      case 'force_break': {
+        // Pause the reviewer's queue for the specified duration
+        await this.reviewerQueue.pauseReviewer(
+          signal.reviewerId,
+          action.durationMs!,
+          'fatigue_force_break'
+        );
+        // Send a prominent notification
+        await ReviewerNotificationService.send(signal.reviewerId, {
+          type: 'fatigue_intervention',
+          level: 'force_break',
+          message: action.message,
+          durationMs: action.durationMs,
+        });
+        break;
+      }
+      
+      case 'pause_queue': {
+        await this.reviewerQueue.pauseReviewer(
+          signal.reviewerId,
+          action.durationMs!,
+          'fatigue_pause'
+        );
+        await ReviewerNotificationService.send(signal.reviewerId, {
+          type: 'fatigue_intervention',
+          level: 'pause',
+          message: action.message,
+          durationMs: action.durationMs,
+        });
+        break;
+      }
+      
+      case 'slow_queue': {
+        // Change the reviewer's delivery rate
+        await this.reviewerQueue.setDeliveryInterval(
+          signal.reviewerId,
+          30000, // 30 seconds between tasks (normal is ~2s)
+          action.durationMs!,
+        );
+        await ReviewerNotificationService.send(signal.reviewerId, {
+          type: 'fatigue_intervention',
+          level: 'slow',
+          message: action.message,
+        });
+        break;
+      }
+      
+      case 'notify': {
+        // Just a non-blocking notification — no queue changes
+        await ReviewerNotificationService.send(signal.reviewerId, {
+          type: 'fatigue_intervention',
+          level: 'notify',
+          message: action.message,
+        });
+        break;
+      }
+      
+      case 'log_only':
+        break;
+    }
+  }
+}
