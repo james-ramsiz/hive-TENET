@@ -1,0 +1,254 @@
+// components/AppealForm.tsx
+
+import React, { useState, useCallback } from 'react';
+import { APPEAL_CATEGORIES, AppealCategory, getVisibleOverturnRate } from '../appeal-form-config';
+
+interface AppealFormProps {
+  taskId: string;
+  rejectionReasons: string[];
+  appealDeadline: Date;
+  remainingAppeals: number;
+  maxAppealRate: number;
+  currentAppealRate: number;
+  onSubmit: (data: AppealSubmission) => Promise<void>;
+  onCancel: () => void;
+}
+
+interface AppealSubmission {
+  taskId: string;
+  categoryId: string;
+  freeformText: string;
+  evidenceAttachmentUrl?: string;
+}
+
+export const AppealForm: React.FC<AppealFormProps> = ({
+  taskId,
+  rejectionReasons,
+  appealDeadline,
+  remainingAppeals,
+  maxAppealRate,
+  currentAppealRate,
+  onSubmit,
+  onCancel,
+}) => {
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [freeformText, setFreeformText] = useState('');
+  const [evidenceUrl, setEvidenceUrl] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  
+  const category = APPEAL_CATEGORIES.find(c => c.id === selectedCategory);
+  const charLimit = category?.maxFreeformChars || 500;
+  const charCount = freeformText.length;
+  const isOverLimit = charCount > charLimit;
+  
+  // ─── Appeal rate display ───
+  // Framing: "remaining appeals" not "percentage used"
+  // The word "remaining" implies a renewable resource.
+  // The word "used X%" implies a punishment meter.
+  
+  const appealRateDisplay = (
+    <div className="appeal-rate-info">
+      <div className="appeal-rate-remaining">
+        <span className="appeal-rate-number">{remainingAppeals}</span>
+        <span className="appeal-rate-label">
+          {remainingAppeals === 1 ? 'appeal remaining' : 'appeals remaining'}
+        </span>
+      </div>
+      <div className="appeal-rate-context">
+        Appeals are limited to keep the review process fair for everyone.
+        Use them when you're confident the rejection was incorrect.
+      </div>
+      {/* Only show the bar if they're getting close to the limit */}
+      {remainingAppeals <= 3 && (
+        <div className="appeal-rate-bar">
+          <div 
+            className="appeal-rate-bar-fill" 
+            style={{ width: `${(currentAppealRate / maxAppealRate) * 100}%` }}
+          />
+        </div>
+      )}
+    </div>
+  );
+  
+  // ─── Deadline display ───
+  const timeRemaining = appealDeadline.getTime() - Date.now();
+  const hoursRemaining = Math.floor(timeRemaining / (1000 * 60 * 60));
+  const minutesRemaining = Math.floor((timeRemaining % (1000 * 60 * 60)) / (1000 * 60));
+  const isUrgent = hoursRemaining < 4;
+  
+  const handleSubmit = useCallback(async () => {
+    if (!selectedCategory || isSubmitting) return;
+    
+    setIsSubmitting(true);
+    setSubmitError(null);
+    
+    try {
+      await onSubmit({
+        taskId,
+        categoryId: selectedCategory,
+        freeformText: freeformText.trim(),
+        evidenceAttachmentUrl: evidenceUrl || undefined,
+      });
+    } catch (err) {
+      if (err instanceof AppealRateExceededError) {
+        setSubmitError('You\'ve reached your appeal limit for this period.');
+      } else if (err instanceof AppealWindowExpiredError) {
+        setSubmitError('The appeal window for this task has closed.');
+      } else {
+        setSubmitError('Something went wrong. Please try again.');
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [selectedCategory, freeformText, evidenceUrl, taskId, onSubmit, isSubmitting]);
+  
+  const canSubmit = selectedCategory !== null 
+    && !isOverLimit 
+    && (!category?.requiresEvidence || evidenceUrl)
+    && !isSubmitting;
+  
+  return (
+    <div className="appeal-form">
+      {/* ─── Header ─── */}
+      <div className="appeal-form-header">
+        <h2>Request an appeal</h2>
+        <p className="appeal-form-subtitle">
+          If you believe this rejection was incorrect, you can request a review 
+          by a senior reviewer.
+        </p>
+      </div>
+      
+      {/* ─── Context: what was rejected and why ─── */}
+      <div className="appeal-form-context">
+        <div className="appeal-form-rejection-summary">
+          <span className="rejection-label">Rejected for:</span>
+          <span className="rejection-reasons">
+            {rejectionReasons.join(', ')}
+          </span>
+        </div>
+        
+        {isUrgent && (
+          <div className="appeal-deadline-urgent">
+            ⏰ {hoursRemaining}h {minutesRemaining}m remaining to appeal
+          </div>
+        )}
+        {!isUrgent && (
+          <div className="appeal-deadline-normal">
+            Appeal window closes in {hoursRemaining}h {minutesRemaining}m
+          </div>
+        )}
+      </div>
+      
+      {/* ─── Appeal rate info ─── */}
+      {appealRateDisplay}
+      
+      {/* ─── Category selection ─── */}
+      <div className="appeal-categories">
+        <label className="appeal-categories-label">
+          Why do you believe this rejection was incorrect?
+          <span className="required-marker"> *</span>
+        </label>
+        
+        <div className="appeal-categories-grid">
+          {APPEAL_CATEGORIES.map((cat) => {
+            const overturnRate = getVisibleOverturnRate(cat);
+            const isSelected = selectedCategory === cat.id;
+            
+            return (
+              <button
+                key={cat.id}
+                className={`appeal-category-card ${isSelected ? 'selected' : ''}`}
+                onClick={() => {
+                  setSelectedCategory(cat.id);
+                  // Clear freeform text when switching categories — 
+                  // the placeholder changes and the old text may not fit
+                  setFreeformText('');
+                }}
+                type="button"
+              >
+                <div className="appeal-category-label">{cat.label}</div>
+                <div className="appeal-category-description">{cat.description}</div>
+                {overturnRate !== null && (
+                  <div className="appeal-category-overturn-rate">
+                    ~{Math.round(overturnRate * 100)}% of appeals in this 
+                    category are overturned
+                  </div>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      
+      {/* ─── Freeform text ─── */}
+      {category && (
+        <div className="appeal-freeform">
+          <label className="appeal-freeform-label">
+            Additional details
+            {!category.requiresEvidence && (
+              <span className="optional-marker"> (optional)</span>
+            )}
+            {category.requiresEvidence && (
+              <span className="required-marker"> *</span>
+            )}
+          </label>
+          
+          <textarea
+            className="appeal-freeform-textarea"
+            placeholder={category.placeholder}
+            value={freeformText}
+            onChange={(e) => setFreeformText(e.target.value)}
+            maxLength={charLimit + 50} // Allow slightly over for typing, but show warning
+            rows={3}
+          />
+          
+          <div className={`appeal-char-count ${isOverLimit ? 'over-limit' : ''}`}>
+            {charCount} / {charLimit} characters
+            {isOverLimit && ' — please shorten your explanation'}
+          </div>
+          
+          {/* ─── Evidence attachment (only for categories that require it) ─── */}
+          {category.requiresEvidence && (
+            <div className="appeal-evidence">
+              <label className="appeal-evidence-label">
+                Screenshot of the technical issue
+                <span className="required-marker"> *</span>
+              </label>
+              <EvidenceUploader
+                onUploaded={(url) => setEvidenceUrl(url)}
+                currentUrl={evidenceUrl}
+              />
+            </div>
+          )}
+        </div>
+      )}
+      
+      {/* ─── Error display ─── */}
+      {submitError && (
+        <div className="appeal-error">{submitError}</div>
+      )}
+      
+      {/* ─── Actions ─── */}
+      <div className="appeal-form-actions">
+        <button
+          className="appeal-cancel-btn"
+          onClick={onCancel}
+          type="button"
+          disabled={isSubmitting}
+        >
+          Dismiss
+        </button>
+        
+        <button
+          className="appeal-submit-btn"
+          onClick={handleSubmit}
+          disabled={!canSubmit}
+          type="button"
+        >
+          {isSubmitting ? 'Submitting...' : 'Submit appeal'}
+        </button>
+      </div>
+    </div>
+  );
+};
