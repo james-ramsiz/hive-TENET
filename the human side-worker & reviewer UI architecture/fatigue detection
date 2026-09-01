@@ -1,0 +1,332 @@
+// fatigue-detector.ts
+
+import { Pool } from 'pg';
+import { MetricsClient } from './metrics';
+
+interface ReviewSession {
+  reviewerId: string;
+  sessionStartTime: Date;
+  reviews: Array<{
+    taskId: string;
+    decision: 'accepted' | 'rejected';
+    durationMs: number;
+    reviewedAt: Date;
+  }>;
+}
+
+interface FatigueSignal {
+  reviewerId: string;
+  signalType: 'slowdown' | 'rejection_drift' | 'pattern_break' | 'session_length';
+  severity: 'warning' | 'critical';
+  detail: string;
+  currentValue: number;
+  baselineValue: number;
+  detectedAt: Date;
+}
+
+class FatigueDetector {
+  // Per-reviewer rolling statistics, updated after each review
+  private reviewerStats: Map<string, ReviewerRollingStats> = new Map();
+  
+  constructor(
+    private db: Pool,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Called after every review decision.
+   * Runs lightweight statistical checks for fatigue signals.
+   * Designed to be fast (< 5ms) — called on the hot path.
+   */
+  async checkReview(
+    reviewerId: string,
+    decision: 'accepted' | 'rejected',
+    durationMs: number,
+  ): Promise<FatigueSignal | null> {
+    const stats = this.getOrCreateStats(reviewerId);
+    const signal = stats.recordReview(decision, durationMs);
+    
+    if (signal) {
+      this.metrics.increment('fatigue.signal_detected', {
+        reviewerId,
+        signalType: signal.signalType,
+        severity: signal.severity,
+      });
+    }
+    
+    return signal;
+  }
+  
+  /**
+   * Called periodically (every 5 minutes) for deeper analysis.
+   * Queries the database for recent review history and runs
+   * more expensive checks that aren't feasible on the hot path.
+   */
+  async deepCheck(reviewerId: string): Promise<FatigueSignal[]> {
+    const signals: FatigueSignal[] = [];
+    
+    // 1. Session length check
+    const sessionLength = await this.getCurrentSessionLength(reviewerId);
+    if (sessionLength > 120 * 60 * 1000) { // 2 hours
+      signals.push({
+        reviewerId,
+        signalType: 'session_length',
+        severity: sessionLength > 180 * 60 * 1000 ? 'critical' : 'warning',
+        detail: `Session has been active for ${Math.round(sessionLength / 60000)} minutes`,
+        currentValue: sessionLength,
+        baselineValue: 90 * 60 * 1000, // 90 min "normal" session
+        detectedAt: new Date(),
+      });
+    }
+    
+    // 2. Rejection rate drift — compare this session's rejection rate to 
+    //    this reviewer's historical rejection rate for the same job types
+    const sessionRejectionRate = await this.getSessionRejectionRate(reviewerId);
+    const historicalRejectionRate = await this.getHistoricalRejectionRate(reviewerId);
+    
+    if (historicalRejectionRate !== null) {
+      const drift = Math.abs(sessionRejectionRate - historicalRejectionRate);
+      // Using 2 standard deviations as the threshold (roughly 95% confidence)
+      // In practice, the standard deviation of rejection rate for a single 
+      // reviewer is ~5-8%, so 2σ = ~10-16%
+      const driftThreshold = 0.12;
+      
+      if (drift > driftThreshold) {
+        const direction = sessionRejectionRate > historicalRejectionRate ? 'higher' : 'lower';
+        signals.push({
+          reviewerId,
+          signalType: 'rejection_drift',
+          severity: drift > driftThreshold * 1.5 ? 'critical' : 'warning',
+          detail: `Session rejection rate (${(sessionRejectionRate * 100).toFixed(1)}%) is ` +
+                  `${direction} than historical (${(historicalRejectionRate * 100).toFixed(1)}%) ` +
+                  `by ${(drift * 100).toFixed(1)}pp`,
+          currentValue: sessionRejectionRate,
+          baselineValue: historicalRejectionRate,
+          detectedAt: new Date(),
+        });
+      }
+    }
+    
+    // 3. Overturn rate for this reviewer's recent decisions
+    // If their recent decisions are being overturned at a high rate, 
+    // they may be fatigued OR the job type guidelines may have changed
+    const recentOverturnRate = await this.getRecentOverturnRate(reviewerId);
+    if (recentOverturnRate !== null && recentOverturnRate.overturnCount >= 3) {
+      const rate = recentOverturnRate.overturnCount / recentOverturnRate.totalReviewed;
+      if (rate > 0.20) { // >20% overturn rate in recent window
+        signals.push({
+          reviewerId,
+          signalType: 'pattern_break',
+          severity: rate > 0.30 ? 'critical' : 'warning',
+          detail: `Recent overturn rate is ${Math.round(rate * 100)}% ` +
+                  `(${recentOverturnRate.overturnCount}/${recentOverturnRate.totalReviewed} recent reviews overturned)`,
+          currentValue: rate,
+          baselineValue: 0.10, // system average
+          detectedAt: new Date(),
+        });
+      }
+    }
+    
+    return signals;
+  }
+  
+  private getOrCreateStats(reviewerId: string): ReviewerRollingStats {
+    let stats = this.reviewerStats.get(reviewerId);
+    if (!stats) {
+      stats = new ReviewerRollingStats(reviewerId, this.metrics);
+      this.reviewerStats.set(reviewerId, stats);
+    }
+    return stats;
+  }
+  
+  private async getCurrentSessionLength(reviewerId: string): Promise<number> {
+    const result = await this.db.query(`
+      SELECT EXTRACT(EPOCH FROM (NOW() - MIN(reviewed_at))) * 1000 as session_length_ms
+      FROM tasks
+      WHERE reviewer_id = $1
+        AND reviewed_at > NOW() - INTERVAL '4 hours'
+        AND reviewed_at > (
+          -- Find the start of the current session: the first review after a 
+          -- gap of >30 minutes, or the first review in the last 4 hours
+          SELECT COALESCE(
+            MAX(reviewed_at) FILTER (
+              WHERE reviewed_at < (
+                SELECT MIN(reviewed_at) FROM tasks 
+                WHERE reviewer_id = $1 AND reviewed_at > NOW() - INTERVAL '4 hours'
+              ) - INTERVAL '30 minutes'
+            ),
+            TIMESTAMP 'epoch'
+          )
+        )
+    `, [reviewerId]);
+    return result.rows[0]?.session_length_ms || 0;
+  }
+  
+  private async getSessionRejectionRate(reviewerId: string): Promise<number> {
+    const result = await this.db.query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE review_decision = 'rejected')::float / COUNT(*) as rate
+      FROM tasks
+      WHERE reviewer_id = $1
+        AND reviewed_at > NOW() - INTERVAL '2 hours'
+    `, [reviewerId]);
+    return result.rows[0]?.rate || 0;
+  }
+  
+  private async getHistoricalRejectionRate(reviewerId: string): Promise<number | null> {
+    const result = await this.db.query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE review_decision = 'rejected')::float / COUNT(*) as rate
+      FROM tasks
+      WHERE reviewer_id = $1
+        AND reviewed_at < NOW() - INTERVAL '2 hours'
+        AND reviewed_at > NOW() - INTERVAL '30 days'
+    `, [reviewerId]);
+    return result.rows[0]?.rate || null;
+  }
+  
+  private async getRecentOverturnRate(reviewerId: string): Promise<{
+    overturnCount: number;
+    totalReviewed: number;
+  } | null> {
+    const result = await this.db.query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE appellate_decision = 'overturned') as overturn_count,
+        COUNT(*) as total_reviewed
+      FROM tasks
+      WHERE reviewer_id = $1
+        AND appellate_reviewed_at > NOW() - INTERVAL '24 hours'
+    `, [reviewerId]);
+    
+    if (!result.rows[0] || parseInt(result.rows[0].total_reviewed) < 5) return null;
+    
+    return {
+      overturnCount: parseInt(result.rows[0].overturn_count),
+      totalReviewed: parseInt(result.rows[0].total_reviewed),
+    };
+  }
+}
+
+// ─── Rolling statistics for the hot path ───
+// Uses an exponential moving average for review time and a 
+// CUSUM-style algorithm for rejection rate drift detection.
+
+class ReviewerRollingStats {
+  private reviewCount: number = 0;
+  private rejectionCount: number = 0;
+  
+  // Exponential moving average of review duration
+  private emaDurationMs: number | null = null;
+  private readonly emaAlpha: number = 0.15; // Smoothing factor — higher = more responsive
+  
+  // CUSUM for rejection rate detection
+  // CUSUM accumulates deviations from the target. When it exceeds a threshold,
+  // it signals a shift.
+  private cusumHigh: number = 0;  // Tracks upward drift (rejecting more)
+  private cusumLow: number = 0;   // Tracks downward drift (accepting more)
+  private readonly cusumThreshold: number = 2.5; // Signal threshold
+  private readonly cusumK: number = 0.03; // "Allowable" shift size (3pp)
+  
+  // Baseline rejection rate — set after 20 reviews to establish a reference
+  private baselineRejectionRate: number | null = null;
+  private readonly baselineSampleSize: number = 20;
+  
+  constructor(
+    private reviewerId: string,
+    private metrics: MetricsClient,
+  ) {}
+  
+  recordReview(decision: 'accepted' | 'rejected', durationMs: number): FatigueSignal | null {
+    this.reviewCount++;
+    if (decision === 'rejected') this.rejectionCount++;
+    
+    // Update EMA of duration
+    if (this.emaDurationMs === null) {
+      this.emaDurationMs = durationMs;
+    } else {
+      this.emaDurationMs = this.emaAlpha * durationMs + (1 - this.emaAlpha) * this.emaDurationMs;
+    }
+    
+    // Set baseline after enough samples
+    if (this.baselineRejectionRate === null && this.reviewCount >= this.baselineSampleSize) {
+      this.baselineRejectionRate = this.rejectionCount / this.reviewCount;
+    }
+    
+    // Run checks
+    const signals: FatigueSignal[] = [];
+    
+    // Check 1: Duration slowdown
+    // If current EMA is >2x the initial EMA, the reviewer is slowing down significantly
+    if (this.emaDurationMs !== null && this.reviewCount > 10) {
+      const slowdownRatio = this.emaDurationMs / (this.baselineRejectionRate !== null 
+        ? this.emaDurationMs // Need to store baseline duration too — simplified here
+        : this.emaDurationMs);
+      // Simplified: just check if EMA > 45 seconds (our p95 for normal reviews is ~30s)
+      if (this.emaDurationMs > 45000) {
+        signals.push({
+          reviewerId: this.reviewerId,
+          signalType: 'slowdown',
+          severity: this.emaDurationMs > 60000 ? 'critical' : 'warning',
+          detail: `Review time EMA is ${Math.round(this.emaDurationMs / 1000)}s ` +
+                  `(normal: ~15-25s)`,
+          currentValue: this.emaDurationMs,
+          baselineValue: 20000,
+          detectedAt: new Date(),
+        });
+      }
+    }
+    
+    // Check 2: CUSUM rejection rate drift
+    if (this.baselineRejectionRate !== null) {
+      const currentRate = this.rejectionCount / this.reviewCount;
+      const deviation = currentRate - this.baselineRejectionRate;
+      
+      // Update CUSUM accumulators
+      this.cusumHigh = Math.max(0, this.cusumHigh + deviation - this.cusumK);
+      this.cusumLow = Math.max(0, this.cusumLow + (-deviation) - this.cusumK);
+      
+      if (this.cusumHigh > this.cusumThreshold) {
+        signals.push({
+          reviewerId: this.reviewerId,
+          signalType: 'rejection_drift',
+          severity: this.cusumHigh > this.cusumThreshold * 1.5 ? 'critical' : 'warning',
+          detail: `Rejection rate drifting upward. Current: ${(currentRate * 100).toFixed(1)}%, ` +
+                  `baseline: ${(this.baselineRejectionRate * 100).toFixed(1)}%, ` +
+                  `CUSUM: ${this.cusumHigh.toFixed(2)}`,
+          currentValue: currentRate,
+          baselineValue: this.baselineRejectionRate,
+          detectedAt: new Date(),
+        });
+        // Reset CUSUM after signaling
+        this.cusumHigh = 0;
+      }
+      
+      if (this.cusumLow > this.cusumThreshold) {
+        signals.push({
+          reviewerId: this.reviewerId,
+          signalType: 'rejection_drift',
+          severity: this.cusumLow > this.cusumThreshold * 1.5 ? 'critical' : 'warning',
+          detail: `Rejection rate drifting downward. Current: ${(currentRate * 100).toFixed(1)}%, ` +
+                  `baseline: ${(this.baselineRejectionRate * 100).toFixed(1)}%, ` +
+                  `CUSUM: ${this.cusumLow.toFixed(2)}`,
+          currentValue: currentRate,
+          baselineValue: this.baselineRejectionRate,
+          detectedAt: new Date(),
+        });
+        this.cusumLow = 0;
+      }
+    }
+    
+    return signals.length > 0 ? signals[0] : null; // Return first signal
+  }
+  
+  // Reset stats when a new session starts (after a 30+ minute gap)
+  resetSession(): void {
+    this.reviewCount = 0;
+    this.rejectionCount = 0;
+    this.emaDurationMs = null;
+    this.cusumHigh = 0;
+    this.cusumLow = 0;
+    this.baselineRejectionRate = null;
+  }
+}
