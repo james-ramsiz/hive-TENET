@@ -1,0 +1,157 @@
+// behavioral-analytics.ts
+
+import { Pool } from 'pg';
+import { MetricsClient } from './metrics';
+
+/**
+ * Behavioral funnel tracking.
+ * 
+ * Every worker interaction with the rejection/appeal flow is tracked as a 
+ * funnel event. We can then measure:
+ * 
+ * - What % of workers who see a rejection click "learn more"?
+ * - What % who click "learn more" then start an appeal?
+ * - What % who start an appeal actually submit it?
+ * - What % who submit have their appeal overturned?
+ * 
+ * These funnels are segmented by:
+ * - Rejection reason code
+ * - Appeal category selected
+ * - Notification timing strategy
+ * - Rejection explanation variant (A/B test)
+ * - Worker tenure
+ * - Time of day
+ */
+
+type FunnelStep = 
+  | 'rejection_seen'
+  | 'rejection_reason_read'
+  | 'learn_more_clicked'
+  | 'appeal_started'
+  | 'appeal_category_selected'
+  | 'appeal_text_entered'
+  | 'appeal_submitted'
+  | 'appeal_overturned'
+  | 'appeal_upheld'
+  | 'appeal_abandoned';
+
+interface FunnelEvent {
+  workerId: string;
+  taskId: string;
+  step: FunnelStep;
+  timestamp: Date;
+  metadata: Record<string, string>;
+}
+
+class BehavioralAnalytics {
+  // Buffer events in memory, flush to DB every 5 seconds
+  private buffer: FunnelEvent[] = [];
+  private flushInterval: NodeJS.Timeout;
+  
+  constructor(
+    private db: Pool,
+    private metrics: MetricsClient,
+  ) {
+    this.flushInterval = setInterval(() => this.flush(), 5000);
+    this.flushInterval.unref(); // Don't block process exit
+  }
+  
+  /**
+   * Record a funnel event. Called from the frontend via analytics endpoint.
+   * This is the ONLY way frontend code should record events — no direct DB writes.
+   */
+  async record(event: FunnelEvent): Promise<void> {
+    this.buffer.push(event);
+    
+    // Also emit a real-time metric for dashboards
+    this.metrics.increment(`funnel.${event.step}`, {
+      rejectionReason: event.metadata.rejectionReason || 'unknown',
+      notificationTiming: event.metadata.notificationTiming || 'unknown',
+      explanationVariant: event.metadata.explanationVariant || 'unknown',
+    });
+    
+    // Flush immediately if buffer is large
+    if (this.buffer.length >= 100) {
+      await this.flush();
+    }
+  }
+  
+  private async flush(): Promise<void> {
+    if (this.buffer.length === 0) return;
+    
+    const events = this.buffer.splice(0, this.buffer.length);
+    
+    try {
+      await this.db.query(`
+        INSERT INTO funnel_events (
+          worker_id, task_id, step, timestamp, metadata
+        ) SELECT * FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::timestamptz[], $5::jsonb[]
+        )
+      `, [
+        events.map(e => e.workerId),
+        events.map(e => e.taskId),
+        events.map(e => e.step),
+        events.map(e => e.timestamp),
+        events.map(e => JSON.stringify(e.metadata)),
+      ]);
+    } catch (err) {
+      // Put events back in the buffer for retry
+      this.buffer.unshift(...events);
+      this.metrics.increment('behavioral_analytics.flush_error');
+    }
+  }
+  
+  /**
+   * Compute funnel conversion rates for a given time window and segmentation.
+   * Used by the experimentation framework to measure A/B test outcomes.
+   */
+  async computeFunnel(options: {
+    startTime: Date;
+    endTime: Date;
+    segment?: Record<string, string>;
+    steps: FunnelStep[];
+  }): Promise<Array<{
+    step: FunnelStep;
+    count: number;
+    conversionRate: number; // Relative to the first step
+    dropoffRate: number;    // Relative to the previous step
+  }>> {
+    const segmentClause = options.segment 
+      ? `AND metadata @> '${JSON.stringify(options.segment)}'::jsonb`
+      : '';
+    
+    const stepCounts: number[] = [];
+    
+    for (const step of options.steps) {
+      const result = await this.db.query(`
+        SELECT COUNT(DISTINCT task_id) as count
+        FROM funnel_events
+        WHERE step = $1
+          AND timestamp BETWEEN $2 AND $3
+          ${segmentClause}
+      `, [step, options.startTime, options.endTime]);
+      
+      stepCounts.push(parseInt(result.rows[0].count));
+    }
+    
+    const baseCount = stepCounts[0] || 1;
+    
+    return options.steps.map((step, i) => ({
+      step,
+      count: stepCounts[i],
+      conversionRate: stepCounts[i] / baseCount,
+      dropoffRate: i === 0 ? 0 : 1 - (stepCounts[i] / (stepCounts[i - 1] || 1)),
+    }));
+  }
+  
+  /**
+   * Destroy the buffer and stop flushing.
+   */
+  destroy(): void {
+    clearInterval(this.flushInterval);
+    if (this.buffer.length > 0) {
+      this.flush().catch(() => {}); // Best effort
+    }
+  }
+}
