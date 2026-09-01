@@ -1,0 +1,336 @@
+// dlq-monitor.ts
+
+import amqplib, { Channel, Connection } from 'amqplib';
+import { Pool } from 'pg';
+import { MetricsClient } from './metrics';
+
+interface DLQMessage {
+  messageId: string;
+  sourceQueue: string;
+  routingKey: string;
+  payload: any;
+  deathCount: number;
+  firstDeathAt: Date;
+  lastDeathAt: Date;
+  deathReason: string;
+}
+
+class DLQMonitor {
+  constructor(
+    private connection: Connection,
+    private db: Pool,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Process all DLQ queues. Called on a schedule (every 30 seconds).
+   * 
+   * Classification:
+   * - RETRYABLE: Transient failure (DB timeout, network blip). Re-publish with backoff.
+   * - POISON: Structural problem (malformed payload, missing required field). Alert and park.
+   * - STALE: Event is too old to be useful. Discard.
+   * - DUPLICATE: Already processed (idempotency check). Discard.
+   */
+  async processAllDLQs(): Promise<{
+    processed: number;
+    retried: number;
+    discarded: number;
+    parked: number;
+  }> {
+    const dlqNames = [
+      'dlq.q.worker.signal',
+      'dlq.q.appeal.assignment',
+      'dlq.q.signal.retraction',
+      'dlq.q.reviewer.perf',
+      'dlq.q.audit.log',
+      'dlq.q.catchall',
+    ];
+    
+    let processed = 0, retried = 0, discarded = 0, parked = 0;
+    
+    const channel = await this.connection.createChannel();
+    await channel.prefetch(1); // Process one at a time — DLQ is not performance-critical
+    
+    for (const dlqName of dlqNames) {
+      const result = await this.processDLQ(channel, dlqName);
+      processed += result.processed;
+      retried += result.retried;
+      discarded += result.discarded;
+      parked += result.parked;
+    }
+    
+    await channel.close();
+    
+    this.metrics.increment('dlq.batch_processed', { 
+      processed: processed.toString(),
+      retried: retried.toString(),
+      discarded: discarded.toString(),
+      parked: parked.toString(),
+    });
+    
+    return { processed, retried, discarded, parked };
+  }
+  
+  private async processDLQ(channel: Channel, dlqName: string): Promise<{
+    processed: number;
+    retried: number;
+    discarded: number;
+    parked: number;
+  }> {
+    let processed = 0, retried = 0, discarded = 0, parked = 0;
+    
+    // Get messages from the DLQ without consuming them (peek)
+    const queueInfo = await channel.checkQueue(dlqName);
+    const messageCount = queueInfo.messageCount;
+    
+    if (messageCount === 0) return { processed: 0, retried: 0, discarded: 0, parked: 0 };
+    
+    // Consume messages
+    const messages: amqplib.GetMessage | null = await channel.get(dlqName, { noAck: false });
+    
+    if (!messages) return { processed: 0, retried: 0, discarded: 0, parked: 0 };
+    
+    const msg = messages;
+    const dlqMessage = this.parseDLQMessage(dlqName, msg);
+    
+    const classification = this.classify(dlqMessage);
+    
+    switch (classification) {
+      case 'duplicate': {
+        // Already processed — safe to discard
+        channel.ack(msg);
+        discarded++;
+        this.metrics.increment('dlq.classified_duplicate', { sourceQueue: dlqMessage.sourceQueue });
+        break;
+      }
+      
+      case 'stale': {
+        // Too old to be useful — discard with logging
+        await this.logDLQDecision(dlqMessage, 'discarded_stale');
+        channel.ack(msg);
+        discarded++;
+        this.metrics.increment('dlq.classified_stale', { sourceQueue: dlqMessage.sourceQueue });
+        break;
+      }
+      
+      case 'retryable': {
+        // Re-publish to the ORIGINAL queue with a delay
+        // We use a delay queue pattern: publish to a delay exchange
+        // that routes to the original queue after a TTL
+        const delayMs = Math.min(
+          1000 * Math.pow(2, dlqMessage.deathCount), // Exponential backoff
+          300_000 // Max 5 minute delay
+        );
+        
+        await this.republishWithDelay(channel, dlqMessage, delayMs);
+        channel.ack(msg);
+        retried++;
+        this.metrics.increment('dlq.classified_retryable', { 
+          sourceQueue: dlqMessage.sourceQueue,
+          delayMs: delayMs.toString(),
+        });
+        break;
+      }
+      
+      case 'poison': {
+        // Can't be processed — park it and alert
+        await this.parkMessage(dlqMessage);
+        channel.ack(msg);
+        parked++;
+        this.metrics.increment('dlq.classified_poison', { sourceQueue: dlqMessage.sourceQueue });
+        
+        // Alert if this is a new poison message (not a re-alert for the same one)
+        const isNew = await this.checkIfNewPoison(dlqMessage);
+        if (isNew) {
+          this.metrics.increment('dlq.new_poison_alert', { 
+            sourceQueue: dlqMessage.sourceQueue,
+            reason: dlqMessage.deathReason,
+          });
+        }
+        break;
+      }
+    }
+    
+    processed++;
+    return { processed, retried, discarded, parked };
+  }
+  
+  private classify(msg: DLQMessage): 'duplicate' | 'stale' | 'retryable' | 'poison' {
+    // 1. Check if it's a duplicate (already processed)
+    // We can't check the DB here efficiently for every message,
+    // so we use a heuristic: if the death reason includes "idempotency",
+    // it was probably a duplicate
+    if (msg.deathReason.includes('duplicate') || msg.deathReason.includes('idempotency')) {
+      return 'duplicate';
+    }
+    
+    // 2. Check if it's stale
+    const ageMs = Date.now() - msg.firstDeathAt.getTime();
+    const maxAgeByQueue: Record<string, number> = {
+      'dlq.q.worker.signal': 24 * 60 * 60 * 1000,
+      'dlq.q.appeal.assignment': 48 * 60 * 60 * 1000,
+      'dlq.q.signal.retraction': 72 * 60 * 60 * 1000,
+      'dlq.q.reviewer.perf': 30 * 24 * 60 * 60 * 1000,
+      'dlq.q.audit.log': 90 * 24 * 60 * 60 * 1000,
+    };
+    const maxAge = maxAgeByQueue[msg.sourceQueue] || 24 * 60 * 60 * 1000;
+    if (ageMs > maxAge) return 'stale';
+    
+    // 3. Check if it's a poison pill (structural problem)
+    if (this.isPoison(msg)) return 'poison';
+    
+    // 4. Default: retryable
+    return 'retryable';
+  }
+  
+  private isPoison(msg: DLQMessage): boolean {
+    // Heuristics for poison pills:
+    
+    // Too many deaths — if it's been through DLQ 5+ times, it's probably not transient
+    if (msg.deathCount >= 5) return true;
+    
+    // Malformed payload
+    if (!msg.payload || typeof msg.payload !== 'object') return true;
+    
+    // Missing required fields
+    if (!msg.payload.taskId || !msg.payload.previousState || !msg.payload.newState) {
+      return true;
+    }
+    
+    // Death reason indicates a code bug, not a transient failure
+    const codeBugPatterns = [
+      'column .* does not exist',
+      'cannot read property',
+      'is not a function',
+      'invalid transition',
+      'validation error',
+    ];
+    for (const pattern of codeBugPatterns) {
+      if (new RegExp(pattern, 'i').test(msg.deathReason)) return true;
+    }
+    
+    return false;
+  }
+  
+  private async parkMessage(msg: DLQMessage): Promise<void> {
+    await this.db.query(`
+      INSERT INTO dlq_parked_messages (
+        message_id, source_queue, routing_key, payload,
+        death_count, first_death_at, last_death_at, death_reason,
+        parked_at, status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), 'parked')
+      ON CONFLICT (message_id) DO UPDATE SET
+        death_count = EXCLUDED.death_count,
+        last_death_at = EXCLUDED.last_death_at,
+        parked_at = NOW()
+    `, [
+      msg.messageId,
+      msg.sourceQueue,
+      msg.routingKey,
+      JSON.stringify(msg.payload),
+      msg.deathCount,
+      msg.firstDeathAt,
+      msg.lastDeathAt,
+      msg.deathReason,
+    ]);
+  }
+  
+  private async checkIfNewPoison(msg: DLQMessage): Promise<boolean> {
+    const result = await this.db.query(`
+      SELECT 1 FROM dlq_parked_messages WHERE message_id = $1
+    `, [msg.messageId]);
+    return result.rows.length === 0;
+  }
+  
+  private async logDLQDecision(msg: DLQMessage, decision: string): Promise<void> {
+    await this.db.query(`
+      INSERT INTO dlq_decisions (message_id, source_queue, decision, decided_at)
+      VALUES ($1, $2, $3, NOW())
+    `, [msg.messageId, msg.sourceQueue, decision]);
+  }
+  
+  private async republishWithDelay(
+    channel: Channel,
+    msg: DLQMessage,
+    delayMs: number,
+  ): Promise<void> {
+    // RabbitMQ doesn't natively support delayed message delivery.
+    // The standard pattern is:
+    // 1. Publish to a delay queue with a TTL = delayMs
+    // 2. The delay queue has a DLX that routes to the original queue
+    // 3. When the message expires in the delay queue, it's routed to the original queue
+    
+    // For simplicity, we publish directly with a small delay.
+    // In production, we'd use the rabbitmq_delayed_message_exchange plugin
+    // or the per-message TTL + DLX pattern.
+    
+    const originalQueue = msg.sourceQueue; // "dlq.q.worker.signal" → "q.worker.signal"
+    const targetQueue = originalQueue.replace(/^dlq\./, '');
+    
+    await channel.publish(
+      '', // Default exchange — route directly to queue
+      targetQueue,
+      Buffer.from(JSON.stringify(msg.payload)),
+      {
+        persistent: true,
+        messageId: msg.messageId,
+        expiration: delayMs.toString(), // Per-message TTL (approximate delay)
+        headers: {
+          'x-dlq-retry': 'true',
+          'x-dlq-retry-count': msg.deathCount + 1,
+          'x-original-routing-key': msg.routingKey,
+        },
+      },
+    );
+  }
+  
+  private parseDLQMessage(dlqName: string, msg: amqplib.GetMessage): DLQMessage {
+    const xDeath = msg.properties.headers?.['x-death'];
+    const deathInfo = Array.isArray(xDeath) && xDeath.length > 0 ? xDeath[0] : {};
+    
+    return {
+      messageId: msg.properties.messageId || `dlq-${Date.now()}`,
+      sourceQueue: deathInfo.queue || dlqName.replace(/^dlq\./, ''),
+      routingKey: msg.fields.routingKey || deathInfo['routing-keys']?.[0] || '',
+      payload: JSON.parse(msg.content.toString()),
+      deathCount: deathInfo.count || 1,
+      firstDeathAt: deathInfo.time ? new Date(deathInfo.time) : new Date(),
+      lastDeathAt: new Date(),
+      deathReason: deathInfo.reason || 'unknown',
+    };
+  }
+  
+  /**
+   * Manual replay: re-publish a parked poison message after a fix has been deployed.
+   * Called by an admin endpoint or CLI.
+   */
+  async replayParkedMessage(messageId: string, channel: Channel): Promise<boolean> {
+    const result = await this.db.query(`
+      UPDATE dlq_parked_messages 
+      SET status = 'replaying'
+      WHERE message_id = $1 AND status = 'parked'
+      RETURNING source_queue, payload
+    `, [messageId]);
+    
+    if (result.rows.length === 0) return false;
+    
+    const { source_queue, payload } = result.rows[0];
+    
+    await channel.publish(
+      '',
+      source_queue,
+      Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload)),
+      {
+        persistent: true,
+        messageId,
+        headers: { 'x-dlq-replay': 'true' },
+      },
+    );
+    
+    await this.db.query(`
+      UPDATE dlq_parked_messages SET status = 'replayed' WHERE message_id = $1
+    `, [messageId]);
+    
+    return true;
+  }
+}
