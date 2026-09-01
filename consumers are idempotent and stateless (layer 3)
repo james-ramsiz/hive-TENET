@@ -1,0 +1,214 @@
+// consumer-framework.ts
+
+import amqplib, { Channel, ConsumeMessage } from 'amqplib';
+import { Pool } from 'pg';
+import { TaskEventSequencer } from './consumer-sequencer';
+import { MetricsClient } from './metrics';
+
+interface ConsumerConfig {
+  queueName: string;
+  handler: (event: ConsumerEvent, db: Pool) => Promise<void>;
+  prefetchCount: number;
+  // Should this consumer use per-task sequencing?
+  useSequencing: boolean;
+  // Retry config
+  maxRetries: number;
+  retryDelayMs: number;
+}
+
+interface ConsumerEvent {
+  messageId: string;
+  routingKey: string;
+  payload: any;
+  sequenceNumber: number;
+  taskId: string;
+  timestamp: Date;
+  redeliveryCount: number;
+}
+
+class ConsumerFramework {
+  private channels: Map<string, Channel> = new Map();
+  private sequencers: Map<string, TaskEventSequencer> = new Map();
+  
+  constructor(
+    private connection: Connection,
+    private db: Pool,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Start consuming from a queue.
+   * This handles all the boilerplate: ack/nack, retry, dead-lettering,
+   * sequencing, and metrics.
+   */
+  async startConsumer(config: ConsumerConfig): Promise<void> {
+    // Create a dedicated channel for this consumer
+    // (RabbitMQ best practice: one channel per consumer)
+    const channel = await this.connection.createChannel();
+    await channel.prefetch(config.prefetchCount);
+    this.channels.set(config.queueName, channel);
+    
+    if (config.useSequencing) {
+      this.sequencers.set(config.queueName, new TaskEventSequencer());
+    }
+    
+    const sequencer = this.sequencers.get(config.queueName);
+    
+    await channel.consume(config.queueName, async (msg: ConsumeMessage | null) => {
+      if (!msg) return;
+      
+      const startTime = Date.now();
+      const event = this.parseMessage(msg);
+      
+      try {
+        // ─── Sequencing check ───
+        if (sequencer) {
+          const sequencedEvent = sequencer.submit(
+            event.taskId,
+            event.sequenceNumber,
+            event,
+            event.timestamp,
+          );
+          
+          if (!sequencedEvent) {
+            // Event was buffered — ack it (don't requeue)
+            // The sequencer will process it when the gap is filled
+            channel.ack(msg);
+            this.metrics.increment('consumer.sequenced_buffered', {
+              queue: config.queueName,
+            });
+            return;
+          }
+        }
+        
+        // ─── Idempotency check ───
+        // Before processing, check if we've already processed this message
+        const alreadyProcessed = await this.checkAlreadyProcessed(
+          config.queueName,
+          event.messageId,
+        );
+        
+        if (alreadyProcessed) {
+          channel.ack(msg);
+          this.metrics.increment('consumer.deduplicated', {
+            queue: config.queueName,
+          });
+          return;
+        }
+        
+        // ─── Process the event ───
+        await config.handler(event, this.db);
+        
+        // ─── Mark as processed ───
+        await this.markProcessed(config.queueName, event.messageId);
+        
+        // ─── Ack ───
+        channel.ack(msg);
+        
+        // ─── Process any buffered events that are now in sequence ───
+        if (sequencer) {
+          const buffered = sequencer.flushBuffered(event.taskId);
+          for (const bufferedEvent of buffered) {
+            try {
+              await config.handler(bufferedEvent, this.db);
+              await this.markProcessed(config.queueName, bufferedEvent.messageId);
+            } catch (err) {
+              // Buffered event failed — log but don't nack (the original 
+              // message is already acked)
+              this.metrics.increment('consumer.buffered_event_failed', {
+                queue: config.queueName,
+                taskId: bufferedEvent.taskId,
+              });
+            }
+          }
+        }
+        
+        // ─── Metrics ───
+        const duration = Date.now() - startTime;
+        this.metrics.histogram('consumer.process_duration_ms', duration, {
+          queue: config.queueName,
+        });
+        this.metrics.increment('consumer.processed', {
+          queue: config.queueName,
+        });
+        
+      } catch (err) {
+        const duration = Date.now() - startTime;
+        this.metrics.histogram('consumer.error_duration_ms', duration, {
+          queue: config.queueName,
+        });
+        
+        // ─── Error handling: requeue or dead-letter ───
+        if (event.redeliveryCount < config.maxRetries) {
+          // Requeue with a delay
+          // RabbitMQ doesn't support delayed requeue natively.
+          // We use the "dead letter + TTL + requeue" pattern:
+          // Nack with requeue=false, let it go to DLQ, then the DLQ 
+          // monitor re-publishes it after a delay.
+          channel.nack(msg, false, false);
+          
+          this.metrics.increment('consumer.requeued', {
+            queue: config.queueName,
+            attempt: (event.redeliveryCount + 1).toString(),
+          });
+        } else {
+          // Max retries exceeded — dead letter it
+          channel.nack(msg, false, false);
+          
+          this.metrics.increment('consumer.dead_lettered', {
+            queue: config.queueName,
+            error: err instanceof Error ? err.message : 'unknown',
+          });
+        }
+      }
+    });
+    
+    console.log(`✅ Consumer started: ${config.queueName} (prefetch: ${config.prefetchCount}, sequencing: ${config.useSequencing})`);
+  }
+  
+  private parseMessage(msg: ConsumeMessage): ConsumerEvent {
+    const payload = JSON.parse(msg.content.toString());
+    return {
+      messageId: msg.properties.messageId || `unknown-${Date.now()}`,
+      routingKey: msg.fields.routingKey,
+      payload,
+      sequenceNumber: payload.sequenceNumber || 0,
+      taskId: this.extractTaskId(msg.fields.routingKey),
+      timestamp: msg.properties.timestamp ? new Date(msg.properties.timestamp) : new Date(),
+      redeliveryCount: this.getRedeliveryCount(msg),
+    };
+  }
+  
+  private extractTaskId(routingKey: string): string {
+    // routing key format: {job_type}.{event_type}.{task_id}
+    const parts = routingKey.split('.');
+    return parts[parts.length - 1];
+  }
+  
+  private getRedeliveryCount(msg: ConsumeMessage): number {
+    // RabbitMQ doesn't expose redelivery count directly.
+    // We use the x-death header which is set when a message is dead-lettered.
+    const xDeath = msg.properties.headers?.['x-death'];
+    if (Array.isArray(xDeath) && xDeath.length > 0) {
+      return xDeath[0].count || 1;
+    }
+    // If the message has been redelivered (RabbitMQ flag), count as 1
+    return msg.fields.redelivered ? 1 : 0;
+  }
+  
+  private async checkAlreadyProcessed(queueName: string, messageId: string): Promise<boolean> {
+    const result = await this.db.query(`
+      SELECT 1 FROM consumer_processed_messages
+      WHERE queue_name = $1 AND message_id = $2
+    `, [queueName, messageId]);
+    return result.rows.length > 0;
+  }
+  
+  private async markProcessed(queueName: string, messageId: string): Promise<void> {
+    await this.db.query(`
+      INSERT INTO consumer_processed_messages (queue_name, message_id, processed_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT DO NOTHING
+    `, [queueName, messageId]);
+  }
+}
