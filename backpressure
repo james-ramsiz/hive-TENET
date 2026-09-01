@@ -1,0 +1,124 @@
+// backpressure-monitor.ts
+
+import amqplib, { Channel, Connection } from 'amqplib';
+import { MetricsClient } from './metrics';
+
+interface QueueHealth {
+  queueName: string;
+  messageCount: number;
+  consumerCount: number;
+  publishRate: number;       // messages/sec over last 5 min
+  consumeRate: number;       // messages/sec over last 5 min
+  backlogSeconds: number;    // At current consume rate, how long to drain
+  isHealthy: boolean;
+  severity: 'healthy' | 'warning' | 'critical';
+}
+
+class BackpressureMonitor {
+  private checkInterval: NodeJS.Timeout;
+  
+  // Thresholds per queue (different queues have different SLAs)
+  private thresholds: Map<string, {
+    warningBacklogSeconds: number;
+    criticalBacklogSeconds: number;
+    minConsumers: number;
+  }> = new Map([
+    ['q.worker.signal', { warningBacklogSeconds: 30, criticalBacklogSeconds: 120, minConsumers: 1 }],
+    ['q.appeal.assignment', { warningBacklogSeconds: 60, criticalBacklogSeconds: 300, minConsumers: 1 }],
+    ['q.signal.retraction', { warningBacklogSeconds: 10, criticalBacklogSeconds: 60, minConsumers: 1 }],
+    ['q.reviewer.perf', { warningBacklogSeconds: 120, criticalBacklogSeconds: 600, minConsumers: 1 }],
+    ['q.audit.log', { warningBacklogSeconds: 600, criticalBacklogSeconds: 1800, minConsumers: 1 }],
+  ]);
+  
+  constructor(
+    private connection: Connection,
+    private metrics: MetricsClient,
+  ) {}
+  
+  start(intervalMs: number = 10000): void {
+    this.checkInterval = setInterval(() => this.check(), intervalMs);
+    this.checkInterval.unref();
+  }
+  
+  stop(): void {
+    clearInterval(this.checkInterval);
+  }
+  
+  private async check(): Promise<void> {
+    const channel = await this.connection.createChannel();
+    
+    const queueNames = Array.from(this.thresholds.keys());
+    const healths: QueueHealth[] = [];
+    
+    for (const queueName of queueNames) {
+      try {
+        const health = await this.checkQueue(channel, queueName);
+        healths.push(health);
+        
+        this.metrics.gauge(`queue.depth.${queueName}`, health.messageCount);
+        this.metrics.gauge(`queue.consumers.${queueName}`, health.consumerCount);
+        this.metrics.gauge(`queue.backlog_seconds.${queueName}`, health.backlogSeconds);
+        this.metrics.gauge(`queue.consume_rate.${queueName}`, health.consumeRate);
+        
+        if (health.severity === 'warning') {
+          this.metrics.increment('queue.backpressure_warning', { queue: queueName });
+        }
+        if (health.severity === 'critical') {
+          this.metrics.increment('queue.backpressure_critical', { queue: queueName });
+        }
+      } catch (err) {
+        this.metrics.increment('queue.health_check_error', { queue: queueName });
+      }
+    }
+    
+    await channel.close();
+  }
+  
+  private async checkQueue(channel: Channel, queueName: string): Promise<QueueHealth> {
+    const info = await channel.checkQueue(queueName);
+    const threshold = this.thresholds.get(queueName)!;
+    
+    const messageCount = info.messageCount;
+    const consumerCount = info.consumerCount;
+    
+    // Estimate consume rate from metrics (simplified — in production this
+    // comes from a rolling counter in the metrics system)
+    const consumeRate = this.getRecentConsumeRate(queueName);
+    
+    // Calculate backlog in seconds
+    const backlogSeconds = consumeRate > 0 ? messageCount / consumeRate : 
+      (messageCount > 0 ? Infinity : 0);
+    
+    let severity: 'healthy' | 'warning' | 'critical' = 'healthy';
+    
+    if (backlogSeconds >= threshold.criticalBacklogSeconds || consumerCount < threshold.minConsumers) {
+      severity = 'critical';
+    } else if (backlogSeconds >= threshold.warningBacklogSeconds) {
+      severity = 'warning';
+    }
+    
+    return {
+      queueName,
+      messageCount,
+      consumerCount,
+      publishRate: 0, // Would need publisher-side metrics
+      consumeRate,
+      backlogSeconds: Math.round(backlogSeconds),
+      isHealthy: severity === 'healthy',
+      severity,
+    };
+  }
+  
+  private getRecentConsumeRate(queueName: string): number {
+    // In production: query the metrics system for a 5-minute rate
+    // Simplified: return a fixed estimate based on queue type
+    const rateEstimates: Record<string, number> = {
+      'q.worker.signal': 50,
+      'q.appeal.assignment': 5,
+      'q.signal.retraction': 30,
+      'q.reviewer.perf': 40,
+      'q.audit.log': 15,
+    };
+    return rateEstimates[queueName] || 10;
+  }
+}
