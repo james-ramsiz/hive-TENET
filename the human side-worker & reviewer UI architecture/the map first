@@ -1,0 +1,33 @@
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────────────────┐    │
+│  │   WORKER     │     │   REVIEWER   │     │  BEHAVIORAL ANALYTICS   │    │
+│  │   FACING     │     │   FACING     │     │  LAYER                  │    │
+│  │              │     │              │     │                          │    │
+│  │ • Rejection  │     │ • Evidence   │     │ • Funnel tracking       │    │
+│  │   display    │     │   rendering  │     │ • A/B experiment        │    │
+│  │ • Appeal     │     │ • Example    │     │   assignment            │    │
+│  │   flow       │     │   presentation│     │ • Real-time signal      │    │
+│  │ • Rate limit │     │ • Fatigue    │     │   aggregation           │    │
+│  │   display    │     │   detection  │     │ • Feedback to UI        │    │
+│  │ • Notification│    │ • Phase 1→2  │     │   (dynamic content)     │    │
+│  │   timing     │     │   handoff    │     │ • Feedback to backend   │    │
+│  └──────┬───────┘     └──────┬───────┘     │   (fatigue alerts)     │    │
+│         │                    │              └──────────┬───────────────┘    │
+│         │                    │                         │                    │
+│         ▼                    ▼                         ▼                    │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │                      SHARED SERVICES                            │       │
+│  │                                                                  │       │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐  │       │
+│  │  │ Notification│  │ Content      │  │ Experiment             │  │       │
+│  │  │ Timing      │  │ Service      │  │ Framework              │  │       │
+│  │  │ Engine      │  │ (versioned   │  │ (assignment +          │  │       │
+│  │  │             │  │  rejection   │  │  measurement)          │  │       │
+│  │  │             │  │  explanations│  │                        │  │       │
+│  │  │             │  │  + appeal    │  │                        │  │       │
+│  │  │             │  │  categories) │  │                        │  │       │
+│  │  └─────────────┘  └──────────────┘  └────────────────────────┘  │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
