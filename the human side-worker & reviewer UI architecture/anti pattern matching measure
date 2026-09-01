@@ -1,0 +1,227 @@
+// components/reviewer/EvidencePanel.tsx
+
+import React, { useMemo } from 'react';
+import { EvidencePacket } from '../../types';
+
+interface EvidencePanelProps {
+  packet: EvidencePacket;
+  phase: 1 | 2;
+  onDecision: (decision: 'accepted' | 'rejected', reasons?: string[]) => void;
+}
+
+export const EvidencePanel: React.FC<EvidencePanelProps> = ({ packet, phase, onDecision }) => {
+  // ─── ANTI-PATTERN-MATCHING: Randomize example order ───
+  // If we always show accepted examples first, reviewers anchor on "accept."
+  // If we always show rejected first, they anchor on "reject."
+  // Randomize per-render so there's no consistent bias.
+  
+  const shuffledAccepted = useMemo(
+    () => shuffleArray(packet.reference.similarAcceptedExamples),
+    [packet.reference.similarAcceptedExamples]
+  );
+  const shuffledRejected = useMemo(
+    () => shuffleArray(packet.reference.similarRejectedExamples),
+    [packet.reference.similarRejectedExamples]
+  );
+  
+  // ─── ANTI-PATTERN-MATCHING: Interleave examples ───
+  // Don't show all accepted then all rejected. Interleave them so the 
+  // reviewer has to evaluate each one individually.
+  const interleavedExamples = useMemo(() => {
+    const result: Array<{ example: any; outcome: 'accepted' | 'rejected' }> = [];
+    const maxLen = Math.max(shuffledAccepted.length, shuffledRejected.length);
+    for (let i = 0; i < maxLen; i++) {
+      if (i < shuffledAccepted.length) {
+        result.push({ example: shuffledAccepted[i], outcome: 'accepted' });
+      }
+      if (i < shuffledRejected.length) {
+        result.push({ example: shuffledRejected[i], outcome: 'rejected' });
+      }
+    }
+    return result;
+  }, [shuffledAccepted, shuffledRejected]);
+  
+  // ─── ANTI-PATTERN-MATCHING: Hide the outcome label initially ───
+  // Show the example WITHOUT the "accepted/rejected" label. The reviewer 
+  // forms their own judgment first, then reveals the label.
+  // This forces active evaluation instead of passive pattern-matching.
+  const [revealedOutcomes, setRevealedOutcomes] = useState<Set<number>>(new Set());
+  
+  const toggleReveal = (index: number) => {
+    setRevealedOutcomes(prev => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+  
+  return (
+    <div className={`evidence-panel phase-${phase}`}>
+      {/* ─── Phase indicator ─── */}
+      {phase === 2 && (
+        <div className="phase-2-banner">
+          <div className="phase-2-banner-icon">📋</div>
+          <div className="phase-2-banner-text">
+            <strong>Phase 2: Context Review</strong>
+            <span>You've made an initial judgment. Now review the additional 
+            context below before confirming.</span>
+          </div>
+        </div>
+      )}
+      
+      {/* ─── THE TASK ITSELF ─── */}
+      <section className="evidence-task">
+        <h2 className="evidence-section-title">Task to Review</h2>
+        <TaskRenderer
+          payload={packet.task.taskPayload}
+          response={packet.task.workerResponse}
+        />
+      </section>
+      
+      {/* ─── GUIDELINES ─── */}
+      <section className="evidence-guidelines">
+        <h2 className="evidence-section-title">Guidelines</h2>
+        {packet.task.guidelines.map((section) => (
+          <GuidelineSection
+            key={section.id}
+            section={section}
+            // Highlighted sections are expanded by default
+            defaultExpanded={section.isHighlighted}
+          />
+        ))}
+      </section>
+      
+      {/* ─── REFERENCE EXAMPLES ─── */}
+      <section className="evidence-examples">
+        <h2 className="evidence-section-title">
+          Similar Past Tasks
+          <span className="evidence-section-hint">
+            Form your own judgment on each example before revealing the outcome.
+          </span>
+        </h2>
+        
+        <div className="evidence-examples-grid">
+          {interleavedExamples.map((item, index) => (
+            <div 
+              key={index} 
+              className={`evidence-example-card ${revealedOutcomes.has(index) ? `revealed-${item.outcome}` : 'unrevealed'}`}
+            >
+              <ExampleRenderer
+                example={item.example}
+                showOutcome={revealedOutcomes.has(index)}
+                outcome={item.outcome}
+              />
+              <button
+                className="evidence-reveal-btn"
+                onClick={() => toggleReveal(index)}
+                type="button"
+              >
+                {revealedOutcomes.has(index) ? 'Hide outcome' : 'Reveal outcome'}
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
+      
+      {/* ─── PHASE 2 ONLY: Additional context ─── */}
+      {phase === 2 && packet.context && (
+        <section className="evidence-phase2-context">
+          <h2 className="evidence-section-title phase2-title">
+            Additional Context
+          </h2>
+          
+          {/* Original rejection reasons */}
+          {(packet.context as any).originalRejectionReasons && (
+            <div className="phase2-rejection-reasons">
+              <h3>Original rejection reasons:</h3>
+              <ul>
+                {(packet.context as any).originalRejectionReasons.map((r: string, i: number) => (
+                  <li key={i}>{r}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          
+          {/* Worker's appeal reason */}
+          {(packet.context as any).appealReason && (
+            <div className="phase2-appeal-reason">
+              <h3>Worker's explanation:</h3>
+              <blockquote className="appeal-reason-quote">
+                {(packet.context as any).appealReason}
+              </blockquote>
+              {/* ─── BIAS MITIGATION: Post-quote reminder ─── */}
+              <p className="phase2-reminder">
+                Consider the worker's explanation, but make your own independent 
+                assessment of the task. The worker's argument may be persuasive 
+                even if the task is genuinely incorrect.
+              </p>
+            </div>
+          )}
+        </section>
+      )}
+      
+      {/* ─── DECISION CONTROLS ─── */}
+      <section className={`evidence-decision phase-${phase}`}>
+        {phase === 1 && (
+          <div className="decision-phase1">
+            <button
+              className="decision-btn accept-btn"
+              onClick={() => onDecision('accepted')}
+              type="button"
+            >
+              Accept
+            </button>
+            <button
+              className="decision-btn reject-btn"
+              onClick={() => {
+                // Show reason selector modal
+                setShowReasonSelector(true);
+              }}
+              type="button"
+            >
+              Reject
+            </button>
+          </div>
+        )}
+        
+        {phase === 2 && (
+          <div className="decision-phase2">
+            <p className="phase2-prompt">
+              You initially rejected this task. After reviewing the additional 
+              context, do you stand by your decision?
+            </p>
+            <button
+              className="decision-btn uphold-btn"
+              onClick={() => onDecision('upheld', selectedReasons)}
+              type="button"
+            >
+              Yes, uphold rejection
+            </button>
+            <button
+              className="decision-btn overturn-btn"
+              onClick={() => onDecision('overturned')}
+              type="button"
+            >
+              No, overturn — this task should be accepted
+            </button>
+            {/* ─── KEY: The "overturn" button is styled differently from "accept" ─── */}
+            {/* In Phase 1, "accept" is green and prominent. */}
+            {/* In Phase 2, "overturn" is orange and EQUAL SIZE to "uphold". */}
+            {/* We don't want to make overturning feel like "going back on your word." */}
+            {/* It should feel like an equally valid option. */}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+};
+
+function shuffleArray<T>(array: T[]): T[] {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
