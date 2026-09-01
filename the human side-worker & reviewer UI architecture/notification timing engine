@@ -1,0 +1,179 @@
+// notification-timing-engine.ts
+
+interface RejectionNotification {
+  taskId: string;
+  workerId: string;
+  jobTypeId: string;
+  rejectionReasons: string[];
+  rejectedAt: Date;
+  appealDeadline: Date;
+}
+
+interface TimingStrategy {
+  name: string;
+  calculateDeliveryTime: (notification: RejectionNotification) => Date;
+}
+
+// ─── Strategy implementations ───
+
+const ImmediateStrategy: TimingStrategy = {
+  name: 'immediate',
+  calculateDeliveryTime: (n) => new Date(n.rejectedAt.getTime() + 500), // 500ms delay for render
+};
+
+const Delayed15MinStrategy: TimingStrategy = {
+  name: 'delayed_15min',
+  calculateDeliveryTime: (n) => new Date(n.rejectedAt.getTime() + 15 * 60 * 1000),
+};
+
+const Delayed1HourStrategy: TimingStrategy = {
+  name: 'delayed_1hour',
+  calculateDeliveryTime: (n) => new Date(n.rejectedAt.getTime() + 60 * 60 * 1000),
+};
+
+const BatchedStrategy: TimingStrategy = {
+  name: 'batched_end_of_session',
+  calculateDeliveryTime: (n) => {
+    // Schedule for the next "session boundary" — defined as the end of the 
+    // current hour or the next hour, whichever is closer to 30+ minutes away
+    const now = new Date(n.rejectedAt);
+    const endOfHour = new Date(now);
+    endOfHour.setMinutes(59, 59, 999);
+    
+    const startOfNextHour = new Date(now);
+    startOfNextHour.setHours(startOfNextHour.getHours() + 1, 0, 0, 0);
+    
+    const minutesToEndOfHour = (endOfHour.getTime() - now.getTime()) / 60000;
+    
+    // If less than 30 minutes to end of hour, batch to start of next hour
+    return minutesToEndOfHour < 30 ? startOfNextHour : endOfHour;
+  },
+};
+
+// ─── The engine itself ───
+
+import { Pool } from 'pg';
+import { ExperimentFramework } from './experiment-framework';
+import { MetricsClient } from './metrics';
+
+class NotificationTimingEngine {
+  private strategies: Map<string, TimingStrategy> = new Map([
+    ['immediate', ImmediateStrategy],
+    ['delayed_15min', Delayed15MinStrategy],
+    ['delayed_1hour', Delayed1HourStrategy],
+    ['batched_end_of_session', BatchedStrategy],
+  ]);
+  
+  constructor(
+    private db: Pool,
+    private experiments: ExperimentFramework,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Called when a rejection enters the 'appealable' state.
+   * Determines WHEN to deliver the notification and schedules it.
+   */
+  async scheduleRejectionNotification(notification: RejectionNotification): Promise<{
+    scheduledFor: Date;
+    strategy: string;
+  }> {
+    // 1. Determine which strategy this worker is in (via A/B experiment)
+    const strategyName = await this.experiments.getAssignment(
+      notification.workerId,
+      'notification_timing_v3',
+      {
+        // Fallback: use the winning strategy from last experiment round
+        fallback: 'delayed_1hour',
+        // Segmentation: new workers (< 100 tasks) get immediate so they 
+        // learn faster. Experienced workers get delayed.
+        segment: notification.workerId, // experiment framework handles segmentation
+      }
+    );
+    
+    const strategy = this.strategies.get(strategyName);
+    if (!strategy) throw new Error(`Unknown timing strategy: ${strategyName}`);
+    
+    // 2. Calculate delivery time
+    const scheduledFor = strategy.calculateDeliveryTime(notification);
+    
+    // 3. Don't schedule delivery AFTER the appeal deadline
+    // If the calculated time is past the deadline, deliver at deadline - 5min
+    const latestPossible = new Date(notification.appealDeadline.getTime() - 5 * 60 * 1000);
+    const effectiveDeliveryTime = scheduledFor > latestPossible ? latestPossible : scheduledFor;
+    
+    // 4. Persist the scheduled notification
+    await this.db.query(`
+      INSERT INTO scheduled_notifications (
+        worker_id, task_id, notification_type, 
+        payload, scheduled_for, strategy,
+        status, created_at
+      ) VALUES ($1, $2, 'rejection', $3, $4, $5, 'scheduled', NOW())
+      ON CONFLICT (worker_id, task_id, notification_type) DO NOTHING
+    `, [
+      notification.workerId,
+      notification.taskId,
+      JSON.stringify({
+        jobTypeId: notification.jobTypeId,
+        rejectionReasons: notification.rejectionReasons,
+        appealDeadline: notification.appealDeadline.toISOString(),
+      }),
+      effectiveDeliveryTime,
+      strategyName,
+    ]);
+    
+    this.metrics.increment('notification.scheduled', { strategy: strategyName });
+    
+    return {
+      scheduledFor: effectiveDeliveryTime,
+      strategy: strategyName,
+    };
+  }
+  
+  /**
+   * Poll for notifications that are due and deliver them.
+   * Called by a scheduler process every 10 seconds.
+   */
+  async deliverDueNotifications(): Promise<number> {
+    const result = await this.db.query(`
+      UPDATE scheduled_notifications
+      SET status = 'delivering', delivered_at = NOW()
+      WHERE status = 'scheduled'
+        AND scheduled_for <= NOW()
+      RETURNING id, worker_id, task_id, payload, strategy
+    `);
+    
+    let delivered = 0;
+    
+    for (const row of result.rows) {
+      try {
+        // Push to the worker's notification channel (WebSocket, push notification, etc.)
+        await WorkerNotificationChannel.send(row.worker_id, {
+          type: 'rejection',
+          taskId: row.task_id,
+          payload: JSON.parse(row.payload),
+          scheduledStrategy: row.strategy,
+        });
+        
+        // Mark as delivered
+        await this.db.query(`
+          UPDATE scheduled_notifications SET status = 'delivered' WHERE id = $1
+        `, [row.id]);
+        
+        delivered++;
+        this.metrics.increment('notification.delivered', { strategy: row.strategy });
+      } catch (err) {
+        // Mark as failed — will be retried by a separate retry job
+        await this.db.query(`
+          UPDATE scheduled_notifications 
+          SET status = 'failed', error = $2, retry_count = retry_count + 1
+          WHERE id = $1
+        `, [row.id, err instanceof Error ? err.message : 'unknown']);
+        
+        this.metrics.increment('notification.delivery_failed', { strategy: row.strategy });
+      }
+    }
+    
+    return delivered;
+  }
+}
