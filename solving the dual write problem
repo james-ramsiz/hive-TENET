@@ -1,0 +1,202 @@
+// event-publisher.ts
+
+import amqplib, { Channel, Connection } from 'amqplib';
+import { Pool } from 'pg';
+import { MetricsClient } from './metrics';
+
+interface TaskEvent {
+  // The routing key is: {job_type}.{event_type}.{task_id}
+  jobTypeId: string;
+  eventType: string;  // The NEW state after transition
+  taskId: string;
+  
+  // The event payload
+  payload: {
+    previousState: string;
+    newState: string;
+    actor: string;
+    transitionContext: Record<string, unknown>;
+    timestamp: string;
+  };
+  
+  // For priority queues
+  priority?: number;
+  
+  // Idempotency key — prevents duplicate publishes
+  idempotencyKey: string;  // Format: "event:{taskId}:{newState}"
+}
+
+/**
+ * Outbox-pattern publisher.
+ * 
+ * Instead of publishing directly to RabbitMQ after the DB commit,
+ * we write the event to an "outbox" table IN THE SAME TRANSACTION
+ * as the state transition. A separate process polls the outbox
+ * and publishes to RabbitMQ.
+ * 
+ * This eliminates the dual-write problem: either both the state
+ * transition and the outbox write commit, or neither does.
+ * If the publish to RabbitMQ fails after the outbox write,
+ * the outbox poller will retry.
+ */
+class OutboxPublisher {
+  constructor(
+    private db: Pool,
+    private metrics: MetricsClient,
+  ) {}
+  
+  /**
+   * Write an event to the outbox table.
+   * MUST be called within the same DB transaction as the state transition.
+   * The caller passes the client from their ongoing transaction.
+   */
+  async writeToOutbox(
+    dbClient: any, // pg.PoolClient — the IN-TRANSACTION client
+    event: TaskEvent,
+  ): Promise<void> {
+    const routingKey = `${event.jobTypeId}.${event.eventType}.${event.taskId}`;
+    
+    await dbClient.query(`
+      INSERT INTO outbox_events (
+        idempotency_key,
+        routing_key,
+        exchange,
+        payload,
+        priority,
+        created_at,
+        published_at
+      ) VALUES ($1, $2, $3, $4, $5, NOW(), NULL)
+      ON CONFLICT (idempotency_key) DO NOTHING
+    `, [
+      event.idempotencyKey,
+      routingKey,
+      'task.events',
+      JSON.stringify(event.payload),
+      event.priority || 0,
+    ]);
+  }
+  
+  /**
+   * Poll the outbox for unpublished events and publish them.
+   * Called by a background process every 100-500ms.
+   */
+  async pollAndPublish(channel: Channel): Promise<number> {
+    // 1. Claim a batch of unpublished events
+    // Use SKIP LOCKED to allow multiple poller instances to run concurrently
+    const result = await this.db.query(`
+      UPDATE outbox_events
+      SET published_at = NOW()
+      WHERE id IN (
+        SELECT id FROM outbox_events
+        WHERE published_at IS NULL
+        ORDER BY created_at ASC
+        LIMIT 500
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING id, idempotency_key, routing_key, exchange, payload, priority, created_at
+    `);
+    
+    if (result.rows.length === 0) return 0;
+    
+    let published = 0;
+    let failed = 0;
+    
+    for (const row of result.rows) {
+      try {
+        const options: amqplib.Options.Publish = {
+          persistent: true,   // Survive broker restarts
+          messageId: row.idempotency_key,
+          timestamp: new Date(row.created_at),
+        };
+        
+        if (row.priority > 0) {
+          options.priority = row.priority;
+        }
+        
+        await channel.publish(
+          row.exchange,
+          row.routing_key,
+          Buffer.from(row.payload),
+          options,
+        );
+        
+        // Mark as successfully published
+        await this.db.query(`
+          UPDATE outbox_events SET status = 'published' WHERE id = $1
+        `, [row.id]);
+        
+        published++;
+      } catch (err) {
+        failed++;
+        
+        // Reset published_at to NULL so the next poll picks it up
+        await this.db.query(`
+          UPDATE outbox_events 
+          SET published_at = NULL, 
+              status = 'publish_failed',
+              last_error = $2,
+              attempt_count = attempt_count + 1
+          WHERE id = $1
+        `, [row.id, err instanceof Error ? err.message : 'unknown']);
+        
+        this.metrics.increment('outbox.publish_failed', {
+          exchange: row.exchange,
+          routingKey: row.routing_key,
+        });
+      }
+    }
+    
+    this.metrics.histogram('outbox.polled', result.rows.length);
+    this.metrics.histogram('outbox.published', published);
+    
+    if (failed > 0) {
+      this.metrics.increment('outbox.batch_has_failures', { failedCount: failed.toString() });
+    }
+    
+    return published;
+  }
+  
+  /**
+   * Clean up old outbox entries. Events that were published more than
+   * 7 days ago are deleted to prevent the outbox table from growing forever.
+   */
+  async cleanup(): Promise<number> {
+    const result = await this.db.query(`
+      DELETE FROM outbox_events
+      WHERE published_at IS NOT NULL
+        AND published_at < NOW() - INTERVAL '7 days'
+    `);
+    return result.rowCount;
+  }
+}
+
+// ─── The outbox table schema ───
+// This goes in the migrations, NOT in application code.
+
+const OUTBOX_SCHEMA = `
+CREATE TABLE outbox_events (
+    id              BIGSERIAL PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    routing_key     TEXT NOT NULL,
+    exchange        TEXT NOT NULL,
+    payload         JSONB NOT NULL,
+    priority        INT NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL,
+    published_at    TIMESTAMPTZ,           -- NULL = not yet published
+    status          TEXT NOT NULL DEFAULT 'pending' 
+                    CHECK (status IN ('pending', 'publish_failed', 'published')),
+    last_error      TEXT,
+    attempt_count   INT NOT NULL DEFAULT 0,
+    -- If an event fails more than 10 times, it's probably a poison pill.
+    -- Set a max attempt count so we don't retry forever.
+    CONSTRAINT max_attempts CHECK (attempt_count <= 10 OR published_at IS NOT NULL)
+);
+
+-- Index for the poller: find unpublished events quickly
+CREATE INDEX idx_outbox_unpublished ON outbox_events (created_at)
+    WHERE published_at IS NULL AND attempt_count < 10;
+
+-- Index for cleanup: find old published events
+CREATE INDEX idx_outbox_published ON outbox_events (published_at)
+    WHERE published_at IS NOT NULL;
+`;
