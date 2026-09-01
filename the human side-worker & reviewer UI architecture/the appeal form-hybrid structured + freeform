@@ -1,0 +1,82 @@
+// appeal-form-config.ts
+
+interface AppealCategory {
+  id: string;
+  label: string;
+  description: string;          // Shown below the label
+  placeholder: string;          // Shown in the freeform field when this category is selected
+  maxFreeformChars: number;     // Category-specific character limit
+  requiresEvidence: boolean;    // If true, show an "attach screenshot" button
+  // Prevalence tracking — how often this category is used and how often it wins
+  usageCount: number;           // Updated daily
+  overturnRate: number;         // What % of appeals in this category are overturned
+}
+
+const APPEAL_CATEGORIES: AppealCategory[] = [
+  {
+    id: 'guideline_ambiguity',
+    label: 'The guidelines are unclear for this case',
+    description: 'The rejection reason doesn\'t clearly apply, or the guidelines are ambiguous about this situation.',
+    placeholder: 'Explain which part of the guidelines is ambiguous and why...',
+    maxFreeformChars: 300,
+    requiresEvidence: false,
+    usageCount: 2840,
+    overturnRate: 0.32,
+  },
+  {
+    id: 'reviewer_misinterpreted',
+    label: 'The reviewer may have missed something',
+    description: 'The element the reviewer flagged is actually present or correct — they may have overlooked it.',
+    placeholder: 'Point to the specific element that was missed...',
+    maxFreeformChars: 200,
+    requiresEvidence: false,
+    usageCount: 1920,
+    overturnRate: 0.28,
+  },
+  {
+    id: 'technical_error',
+    label: 'There was a technical issue with the task',
+    description: 'The image didn\'t load properly, the task interface had a bug, or the submission didn\'t save correctly.',
+    placeholder: 'Describe the technical issue you encountered...',
+    maxFreeformChars: 200,
+    requiresEvidence: true,     // We want a screenshot for technical issues
+    usageCount: 410,
+    overturnRate: 0.61,         // High overturn rate — these are often legitimate
+  },
+  {
+    id: 'different_from_examples',
+    label: 'My submission matches the accepted examples',
+    description: 'You reviewed the accepted examples and your submission is similar, but it was still rejected.',
+    placeholder: 'Explain how your submission matches the accepted examples...',
+    maxFreeformChars: 300,
+    requiresEvidence: false,
+    usageCount: 1560,
+    overturnRate: 0.19,         // Low overturn rate — workers often misjudge similarity
+  },
+  {
+    id: 'other',
+    label: 'Something else',
+    description: 'None of the above categories fit your situation.',
+    placeholder: 'Explain why you believe the rejection was incorrect...',
+    maxFreeformChars: 500,      // Slightly more room for "other"
+    requiresEvidence: false,
+    usageCount: 890,
+    overturnRate: 0.11,         // Lowest overturn rate — often unfocused
+  },
+];
+
+// ─── The key insight: show overturn rates to set expectations ───
+// Workers who see "32% of appeals in this category are overturned" make 
+// better category selections than workers who don't see any data.
+// BUT: we A/B tested this and found it reduced appeal volume by 8% 
+// (good) but also reduced legitimate appeals by 4% (bad).
+// Current approach: show overturn rate only for categories where it's 
+// >25% (guideline_ambiguity, technical_error). Don't show it for 
+// categories where it's low — that would discourage legitimate appeals.
+
+function getVisibleOverturnRate(category: AppealCategory): number | null {
+  if (category.overturnRate >= 0.25) {
+    return category.overturnRate;
+  }
+  return null; // Don't show
+}
