@@ -1,0 +1,72 @@
+# example_store/ingestion/consumer.py
+from __future__ import annotations
+import asyncio
+import json
+import logging
+from typing import Awaitable, Callable
+
+import aiokafka
+
+from ..domain import ReviewOutcome, Label, Submission, Modality
+from .pipeline import IngestionPipeline
+
+log = logging.getLogger(__name__)
+
+class ReviewOutcomeConsumer:
+    def __init__(self, bootstrap: str, topic: str, group: str, pipeline: IngestionPipeline,
+                 concurrency: int = 16):
+        self._bootstrap = bootstrap
+        self._topic = topic
+        self._group = group
+        self._pipeline = pipeline
+        self._conc = concurrency
+        self._stop = asyncio.Event()
+
+    async def run(self) -> None:
+        consumer = aiokafka.AIOKafkaConsumer(
+            self._topic,
+            bootstrap_servers=self._bootstrap,
+            group_id=self._group,
+            enable_auto_commit=False,
+            auto_offset_reset="earliest",
+            isolation_level="read_committed",
+        )
+        await consumer.start()
+        log.info("consumer started topic=%s group=%s", self._topic, self._group)
+        sem = asyncio.Semaphore(self._conc)
+        try:
+            async for msg in consumer:
+                await sem.acquire()
+                asyncio.create_task(self._handle(consumer, msg, sem))
+        finally:
+            await consumer.stop()
+
+    async def _handle(self, consumer, msg, sem):
+        try:
+            payload = json.loads(msg.value)
+            outcome = self._parse(payload)
+            await self._pipeline.process(outcome)
+            await consumer.commit()
+        except Exception:
+            log.exception("ingestion failed for msg at offset %d", msg.offset)
+            # Don't commit — let it retry; poison messages are routed to DLQ by Kafka config.
+        finally:
+            sem.release()
+
+    @staticmethod
+    def _parse(p: dict) -> ReviewOutcome:
+        sub = Submission(
+            job_type_id=p["job_type_id"],
+            worker_id=p["worker_id"],
+            fields=p["fields"],
+            modality=Modality(p.get("modality", "text")),
+        )
+        return ReviewOutcome(
+            review_id=UUID(p["review_id"]),
+            submission=sub,
+            label=Label(p["label"]),
+            label_confidence=float(p.get("label_confidence", 1.0)),
+            guideline_version_id=p["guideline_version_id"],
+            reviewer_id=p["reviewer_id"],
+            occurred_at=datetime.fromisoformat(p["occurred_at"]),
+        )
