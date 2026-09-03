@@ -1,0 +1,30 @@
+# example_store/retrieval/rank.py
+from __future__ import annotations
+import math
+from typing import Sequence
+
+def mmr_rerank(candidates, picked_vectors, lambda_=0.7):
+    """
+    candidates: list[(id, sim_to_query, vector)]
+    picked_vectors: list[vector]
+    Returns the candidate that maximizes lambda*sim_query - (1-lambda)*max_sim_to_picked.
+    """
+    if not candidates:
+        return None
+    if not picked_vectors:
+        return max(candidates, key=lambda c: c[1])
+    best = None
+    best_score = -math.inf
+    for cid, sim_q, vec in candidates:
+        max_sim_picked = max(cosine(vec, p) for p in picked_vectors)
+        score = lambda_ * sim_q - (1 - lambda_) * max_sim_picked
+        if score > best_score:
+            best_score = score
+            best = (cid, sim_q, vec)
+    return best
+
+def cosine(a, b):
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    return dot / (na * nb + 1e-9)
