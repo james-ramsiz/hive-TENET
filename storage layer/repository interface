@@ -1,0 +1,43 @@
+# example_store/storage/repo.py
+from __future__ import annotations
+import abc
+from typing import Sequence
+from uuid import UUID
+
+from ..domain import Example, Label
+
+class ExampleRepo(abc.ABC):
+    @abc.abstractmethod
+    async def insert(self, example: Example, vector: list[float], embedding_text: str,
+                     raw_payload: dict, scrubbed_payload: dict, display_payload: dict) -> int:
+        ...
+
+    @abc.abstractmethod
+    async def exists_by_review(self, review_id: UUID) -> bool:
+        ...
+
+    @abc.abstractmethod
+    async def search(
+        self,
+        job_type_id: str,
+        guideline_version_id: str,
+        label: Label,
+        query_vector: list[float],
+        ef_search: int,
+        top_k: int,
+        max_age_days: int,
+    ) -> list[tuple[int, float, Example]]:
+        """Returns (internal_id, cosine_similarity, example) tuples."""
+        ...
+
+    @abc.abstractmethod
+    async def mark_superseded(self, example_id: int, by_id: int) -> None:
+        ...
+
+    @abc.abstractmethod
+    async def sample_for_drift(self, job_type_id: str, model_id: str, n: int) -> list[tuple[int, list[float]]]:
+        ...
+
+    @abc.abstractmethod
+    async def fetch_for_reembed(self, model_id: str, batch_size: int, offset: int) -> list[dict]:
+        ...
