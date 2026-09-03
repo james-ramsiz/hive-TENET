@@ -1,0 +1,97 @@
+# example_store/retrieval/balanced.py
+from __future__ import annotations
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Sequence
+
+from ..domain import Label, RetrievedExample, RetrievalRequest
+from ..storage.repo import ExampleRepo
+from ..embedding.encoder import EmbeddingEncoder
+from ..pii.service import PIIService
+from ..config import RetrievalConfig
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class BalancedRetriever:
+    repo: ExampleRepo
+    encoder: EmbeddingEncoder
+    pii: PIIService
+    cfg: RetrievalConfig
+
+    async def retrieve(self, req: RetrievalRequest) -> list[RetrievedExample]:
+        # 1. Scrub the incoming submission (don't trust caller-supplied scrubbing).
+        scrubbed = await self.pii.scrub(req.submission)
+
+        # 2. Embed the scrubbed content.
+        vectors = await self.encoder.encode_text([scrubbed.text_for_embedding])
+        if not vectors:
+            return []
+        qv = vectors[0].vector
+
+        # 3. Fan out parallel filtered-ANN queries per label.
+        acc_tasks = self._search_label(req, Label.ACCEPTED, qv)
+        rej_tasks = self._search_label(req, Label.REJECTED, qv)
+        accepted, rejected = await asyncio.gather(acc_tasks, rej_tasks)
+
+        # 4. Balance + quality-rerank within each label.
+        balanced = self._select_balanced(accepted, rejected, req.per_label)
+
+        # 5. If empty (cold case), fall back to superseded examples if allowed.
+        if not balanced and self.cfg.fallback_to_superseded_if_empty:
+            balanced = await self._fallback_superseded(req, qv)
+
+        return balanced
+
+    async def _search_label(self, req, label: Label, qv) -> list[tuple[int, float, "Example"]]:
+        return await self.repo.search(
+            job_type_id=req.job_type_id,
+            guideline_version_id=req.guideline_version_id,
+            label=label,
+            query_vector=qv,
+            ef_search=self.cfg.ann_ef_search,
+            top_k=self.cfg.ann_top_k_per_label,
+            max_age_days=self.cfg.max_age_days,
+        )
+
+    def _select_balanced(self, accepted, rejected, per_label):
+        """
+        Within each label, sort by quality-adjusted similarity:
+            score = similarity * (0.7 + 0.3 * quality_score)
+        Take top-N per label. The result is balanced by construction.
+        """
+        def rerank(rows):
+            rows.sort(key=lambda r: r[1] * (0.7 + 0.3 * r[2].quality_score), reverse=True)
+            return rows[:per_label]
+
+        chosen = rerank(list(accepted)) + rerank(list(rejected))
+        return [
+            RetrievedExample(
+                example_uid=ex.example_uid,
+                label=ex.label,
+                similarity=sim,
+                display_payload={},    # fetched lazily by the API layer via the display key
+                guideline_version_id=ex.guideline_version_id,
+                is_cold_start_seed=ex.is_cold_start_seed,
+                quality_score=ex.quality_score,
+            )
+            for _, sim, ex in chosen
+        ]
+
+    async def _fallback_superseded(self, req, qv):
+        # Re-issue the search without the guideline filter (rare path; logged).
+        log.warning("balanced retrieval empty for job=%s guideline=%s — falling back",
+                    req.job_type_id, req.guideline_version_id)
+        results = []
+        for label in (Label.ACCEPTED, Label.REJECTED):
+            rows = await self.repo.search(
+                job_type_id=req.job_type_id,
+                guideline_version_id="__any__",   # storage layer falls back if "__any__"
+                label=label, query_vector=qv,
+                ef_search=self.cfg.ann_ef_search,
+                top_k=per_label := req.per_label,
+                max_age_days=self.cfg.max_age_days * 3,
+            )
+            results.extend(rows)
+        return self._select_balanced(results, results, req.per_label)
