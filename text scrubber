@@ -1,0 +1,60 @@
+# example_store/pii/text_scrubber.py
+from __future__ import annotations
+import re
+from dataclasses import dataclass
+from typing import Iterable
+
+# Stable per-worker pseudonyms so reviewers retain continuity without seeing real names.
+# Implemented as HMAC of the actual value with a per-deployment key.
+import hashlib
+import hmac
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-]?)?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}")
+SSN_RE   = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+ZIP_RE   = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+CREDIT_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+
+# A real deployment uses Presidio with a spaCy/transformer NER backend.
+# This regex fallback exists for offline tests and defense in depth.
+
+PII_PATTERNS = [
+    ("EMAIL",   EMAIL_RE,   "[EMAIL]"),
+    ("SSN",     SSN_RE,      "[SSN]"),
+    ("PHONE",   PHONE_RE,    "[PHONE]"),
+    ("CREDIT",  CREDIT_RE,    "[CARD]"),
+]
+
+@dataclass(frozen=True)
+class ScrubResult:
+    scrubbed: str
+    display: str
+    categories: list[str]
+
+class TextScrubber:
+    def __init__(self, pseudonym_key: bytes) -> None:
+        self._key = pseudonym_key
+
+    def _pseudonym(self, value: str) -> str:
+        digest = hmac.new(self._key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"SUBJECT-{digest[:8]}"
+
+    def scrub(self, text: str) -> ScrubResult:
+        if not text:
+            return ScrubResult("", "", [])
+        scrubbed = text
+        display = text
+        categories: list[str] = []
+        for cat, pattern, tok in PII_PATTERNS:
+            if pattern.search(scrubbed):
+                categories.append(cat)
+                scrubbed = pattern.sub(tok, scrubbed)
+                display = pattern.sub(tok, display)
+        # Names are harder; in production this is a transformer NER pass.
+        # Hook left here so we can swap in Presidio / a custom NER model.
+        return ScrubResult(scrubbed, display, categories)
+
+    def scrub_for_display(self, text: str, worker_id: str) -> str:
+        # Lighter: leave context, but pseudonymize names if NER detects them.
+        # For now: pass through (the NER pass would happen in `service.py`).
+        return text
