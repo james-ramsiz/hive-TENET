@@ -1,0 +1,50 @@
+# example_store/pii/service.py
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+from typing import Iterable
+
+from ..domain import Submission, ScrubbedSubmission, Modality
+from .text_scrubber import TextScrubber
+from .image_scrubber import ImageScrubber
+from ..storage.object_store import ObjectStore  # thin S3/GCS wrapper
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class PIIService:
+    text: TextScrubber
+    images: ImageScrubber
+    objects: ObjectStore
+
+    async def scrub(self, sub: Submission) -> ScrubbedSubmission:
+        text_parts: list[str] = []
+        display: dict = {"fields": {}}
+        categories: list[str] = []
+        image_refs: list[str] = []
+
+        for name, value in sub.fields.items():
+            if isinstance(value, str):
+                s = self.text.scrub(value)
+                text_parts.append(s.scrubbed)
+                categories.extend(s.categories)
+                display["fields"][name] = s.display
+            elif isinstance(value, dict) and value.get("type") == "image_ref":
+                raw = await self.objects.get(value["key"])
+                r = self.images.scrub(raw)
+                categories.extend(["FACE"] * r.face_count)
+                categories.extend(["TEXT_PII"] * r.text_pii_redacted)
+                red_key = await self.objects.put(value["key"] + ".redacted", r.redacted_image_bytes)
+                disp_key = await self.objects.put(value["key"] + ".display", r.display_image_bytes)
+                image_refs.append(red_key)             # only redacted refs are used for embedding
+                display["fields"][name] = {"type": "image_ref", "key": disp_key}
+
+        joined_text = "\n".join(text_parts)[:8000]
+        modality = sub.modality
+        return ScrubbedSubmission(
+            text_for_embedding=joined_text,
+            image_refs_for_embedding=image_refs,
+            display_payload=display,
+            pii_detected=list(dict.fromkeys(categories)),   # dedup, preserve order
+            modality=modality,
+        )
