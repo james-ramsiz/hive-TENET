@@ -1,0 +1,78 @@
+-- migrations/0001_init.sql
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Guideline versions are the source of truth for freshness.
+CREATE TABLE guideline_versions (
+    id              TEXT PRIMARY KEY,           -- e.g. "gv-2024-09-15-v3"
+    job_type_id     TEXT NOT NULL,
+    version_label   TEXT NOT NULL,
+    effective_at    TIMESTAMPTZ NOT NULL,
+    superseded_at   TIMESTAMPTZ,
+    checksum        TEXT NOT NULL,              -- hash of guideline doc
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ON guideline_versions (job_type_id, effective_at DESC);
+
+-- Examples are immutable once written. Updates = new rows + tombstone.
+CREATE TABLE examples (
+    id                   BIGSERIAL PRIMARY KEY,
+    example_uid          UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    review_id            UUID NOT NULL UNIQUE,        -- idempotency key
+    job_type_id          TEXT NOT NULL,
+    worker_id            TEXT NOT NULL,
+    submission_payload   JSONB NOT NULL,              -- raw (encrypted at rest)
+    scrubbed_payload     JSONB NOT NULL,              -- PII-stripped
+    display_payload      JSONB NOT NULL,              -- reviewer-facing (lightly redacted)
+    label                TEXT NOT NULL CHECK (label IN ('accepted','rejected')),
+    label_confidence     REAL NOT NULL CHECK (label_confidence BETWEEN 0 AND 1),
+    guideline_version_id TEXT NOT NULL REFERENCES guideline_versions(id),
+    embedding_model_id   TEXT NOT NULL,               -- e.g. "emb-minilm-v3"
+    embedding            vector(384) NOT NULL,
+    embedding_text       TEXT NOT NULL,               -- the text that was embedded (for debug)
+    is_cold_start_seed   BOOLEAN NOT NULL DEFAULT false,
+    is_superseded        BOOLEAN NOT NULL DEFAULT false,
+    superseded_by        BIGINT REFERENCES examples(id),
+    quality_score        REAL NOT NULL DEFAULT 0.5,   -- reviewer-rated exemplar quality
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    embedded_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Filtered ANN indexes. pgvector supports HNSW with metadata filters.
+CREATE INDEX examples_embedding_idx
+    ON examples
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX examples_job_label_guideline_idx
+    ON examples (job_type_id, label, guideline_version_id)
+    WHERE is_superseded = false;
+
+CREATE INDEX examples_review_id_idx ON examples (review_id);
+
+-- Drift snapshots — embedding-space statistics per (job_type, model_version, week)
+CREATE TABLE drift_snapshots (
+    id                BIGSERIAL PRIMARY KEY,
+    job_type_id       TEXT NOT NULL,
+    embedding_model_id TEXT NOT NULL,
+    snapshot_at       TIMESTAMPTZ NOT NULL,
+    centroid          vector(384) NOT NULL,
+    mean_pairwise_dist REAL NOT NULL,
+    sample_count      INTEGER NOT NULL,
+    knn_density_p50   REAL NOT NULL,
+    knn_density_p95   REAL NOT NULL,
+    drift_score       REAL NOT NULL,             -- 0..1 vs prior snapshot
+    UNIQUE (job_type_id, embedding_model_id, snapshot_at)
+);
+
+-- Access audit — who saw raw (unscrubbed) content
+CREATE TABLE pii_access_audit (
+    id            BIGSERIAL PRIMARY KEY,
+    example_id    BIGINT NOT NULL REFERENCES examples(id),
+    reviewer_id   TEXT NOT NULL,
+    reason_code   TEXT NOT NULL,
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    request_id    UUID NOT NULL
+);
+CREATE INDEX ON pii_access_audit (example_id, requested_at DESC);
