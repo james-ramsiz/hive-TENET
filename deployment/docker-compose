@@ -1,0 +1,63 @@
+# deploy/docker-compose.yml
+version: "3.9"
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: es
+      POSTGRES_PASSWORD: es
+      POSTGRES_DB: example_store
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "es"]
+      interval: 5s
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  embedding-gpu:
+    image: example-store/embedding:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      DATABASE_DSN: postgresql://es:es@postgres:5432/example_store
+      REDIS_URL: redis://redis:6379/0
+      PSEUDONYM_KEY: ${PSEUDONYM_KEY}
+    command: ["python", "-m", "example_store.workers.runner", "embedding"]
+    depends_on: [postgres, redis]
+
+  ingestion-worker:
+    image: example-store/api:latest
+    environment:
+      DATABASE_DSN: postgresql://es:es@postgres:5432/example_store
+      KAFKA_BOOTSTRAP: kafka:9092
+      PSEUDONYM_KEY: ${PSEUDONYM_KEY}
+    command: ["python", "-m", "example_store.workers.runner", "ingestion"]
+    depends_on: [postgres, kafka]
+
+  reembed-worker:
+    image: example-store/api:latest
+    environment:
+      DATABASE_DSN: postgresql://es:es@postgres:5432/example_store
+    command: ["python", "-m", "example_store.workers.runner", "reembed"]
+    depends_on: [postgres]
+
+  api:
+    image: example-store/api:latest
+    environment:
+      DATABASE_DSN: postgresql://es:es@postgres:5432/example_store
+      REDIS_URL: redis://redis:6379/0
+      PSEUDONYM_KEY: ${PSEUDONYM_KEY}
+    ports: ["8080:8080"]
+    depends_on: [postgres, redis, embedding-gpu]
+
+volumes:
+  pgdata:
