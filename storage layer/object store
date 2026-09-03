@@ -1,0 +1,32 @@
+# example_store/storage/object_store.py
+from __future__ import annotations
+import abc
+import io
+from typing import Optional
+
+class ObjectStore(abc.ABC):
+    @abc.abstractmethod
+    async def get(self, key: str) -> bytes: ...
+    @abc.abstractmethod
+    async def put(self, key: str, data: bytes, content_type: str = "image/png") -> str: ...
+
+class InMemoryObjectStore(ObjectStore):
+    def __init__(self) -> None:
+        self._data: dict[str, bytes] = {}
+    async def get(self, key: str) -> bytes:
+        return self._data[key]
+    async def put(self, key: str, data: bytes, content_type: str = "image/png") -> str:
+        self._data[key] = data
+        return key
+
+class S3ObjectStore(ObjectStore):
+    def __init__(self, client, bucket: str) -> None:
+        self._c = client
+        self._b = bucket
+    async def get(self, key: str) -> bytes:
+        obj = await self._c.get_object(Bucket=self._b, Key=key)
+        async with obj["Body"] as stream:
+            return await stream.read()
+    async def put(self, key: str, data: bytes, content_type: str = "image/png") -> str:
+        await self._c.put_object(Bucket=self._b, Key=key, Body=data, ContentType=content_type)
+        return key
