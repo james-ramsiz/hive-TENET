@@ -1,0 +1,60 @@
+# example_store/embedding/batching.py
+from __future__ import annotations
+import asyncio
+import logging
+from collections import deque
+from typing import Awaitable, Callable, Generic, TypeVar
+
+T = TypeVar("T")
+R = TypeVar("R")
+
+log = logging.getLogger(__name__)
+
+class Batcher(Generic[T, R]):
+    """
+    Coalesces many small requests into batched calls. Used so that hundreds of
+    concurrent ingestion events share one GPU forward pass.
+    """
+    def __init__(
+        self,
+        processor: Callable[[list[T]], Awaitable[list[R]]],
+        max_batch: int = 64,
+        max_wait_ms: int = 25,
+    ) -> None:
+        self._processor = processor
+        self._max_batch = max_batch
+        self._max_wait = max_wait_ms / 1000.0
+        self._queue: deque[tuple[asyncio.Future, T]] = deque()
+        self._lock = asyncio.Lock()
+        self._flush_task = asyncio.create_task(self._flush_loop())
+
+    async def submit(self, item: T) -> R:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        async with self._lock:
+            self._queue.append((fut, item))
+            if len(self._queue) >= self._max_batch:
+                asyncio.create_task(self._drain())
+        return await fut
+
+    async def _flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._max_wait)
+            await self._drain()
+
+    async def _drain(self) -> None:
+        async with self._lock:
+            if not self._queue:
+                return
+            batch = [self._queue.popleft() for _ in range(min(self._max_batch, len(self._queue)))]
+        items = [it for _, it in batch]
+        try:
+            results = await self._processor(items)
+            for (fut, _), r in zip(batch, results):
+                if not fut.done():
+                    fut.set_result(r)
+        except Exception as exc:
+            log.exception("batch failed (%d items)", len(batch))
+            for fut, _ in batch:
+                if not fut.done():
+                    fut.set_exception(exc)
