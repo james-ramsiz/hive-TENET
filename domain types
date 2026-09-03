@@ -1,0 +1,80 @@
+# example_store/domain.py
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+from typing import Any, Optional, Sequence
+from uuid import UUID
+
+class Label(str, Enum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+class Modality(str, Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    MULTIMODAL = "multimodal"
+
+@dataclass(frozen=True)
+class Submission:
+    """Raw worker submission payload."""
+    job_type_id: str
+    worker_id: str
+    fields: dict[str, Any]          # typed field bag (text fields + image refs)
+    modality: Modality
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    review_id: UUID
+    submission: Submission
+    label: Label
+    label_confidence: float
+    guideline_version_id: str
+    reviewer_id: str
+    occurred_at: datetime
+
+@dataclass(frozen=True)
+class ScrubbedSubmission:
+    """Safe to embed and safe to display in scrubbed form."""
+    text_for_embedding: str
+    image_refs_for_embedding: list[str]   # object-store keys of redacted images
+    display_payload: dict[str, Any]        # lightly redacted for reviewer
+    pii_detected: list[str]                # categories, not values
+    modality: Modality
+
+@dataclass(frozen=True)
+class EmbeddingVector:
+    model_id: str
+    dim: int
+    vector: list[float]
+    embedded_text: str
+
+@dataclass(frozen=True)
+class Example:
+    example_uid: UUID
+    review_id: UUID
+    job_type_id: str
+    label: Label
+    guideline_version_id: str
+    embedding_model_id: str
+    quality_score: float
+    is_cold_start_seed: bool
+    created_at: datetime
+
+@dataclass(frozen=True)
+class RetrievedExample:
+    example_uid: UUID
+    label: Label
+    similarity: float
+    display_payload: dict[str, Any]
+    guideline_version_id: str
+    is_cold_start_seed: bool
+    quality_score: float
+
+@dataclass(frozen=True)
+class RetrievalRequest:
+    job_type_id: str
+    submission: Submission
+    guideline_version_id: str
+    per_label: int = 4
