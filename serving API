@@ -1,0 +1,92 @@
+# example_store/api/server.py
+from __future__ import annotations
+import logging
+import os
+from typing import AsyncIterator
+
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import ORJSONResponse
+
+from ..config import get_settings
+from ..embedding.encoder import EmbeddingEncoder
+from ..embedding.cache import EmbeddingCache
+from ..embedding.batching import Batcher
+from ..pii.service import PIIService
+from ..pii.text_scrubber import TextScrubber
+from ..storage.pg_vector import PgVectorRepo
+from ..storage.object_store import InMemoryObjectStore
+from ..retrieval.balanced import BalancedRetriever
+from . import handlers
+
+import asyncpg
+import redis.asyncio as redis
+
+log = logging.getLogger(__name__)
+
+def build_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title="example-store", default_response_class=ORJSONResponse)
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        pool = await asyncpg.create_pool(
+            dsn=settings.db.dsn,
+            min_size=settings.db.pool_min,
+            max_size=settings.db.pool_max,
+            statement_timeout=settings.db.statement_timeout_ms,
+        )
+        redis_client = redis.from_url(settings.redis_url)
+        encoder = EmbeddingEncoder(settings.embedding)
+        await encoder.load()
+        batcher = Batcher(
+            processor=encoder.encode_text,
+            max_batch=settings.embedding.gpu_batch_size,
+            max_wait_ms=25,
+        )
+        pii = PIIService(
+            text=TextScrubber(pseudonym_key=os.environ["PSEUDONYM_KEY"].encode()),
+            images=_build_image_scrubber(),
+            objects=InMemoryObjectStore(),
+        )
+        repo = PgVectorRepo(pool)
+        cache = EmbeddingCache(redis_client, ttl=settings.embedding.cache_ttl_seconds)
+        retriever = BalancedRetriever(repo=repo, encoder=encoder, pii=pii, cfg=settings.retrieval)
+        app.state.pool = pool
+        app.state.redis = redis_client
+        app.state.encoder = encoder
+        app.state.batcher = batcher
+        app.state.cache = cache
+        app.state.repo = repo
+        app.state.retriever = retriever
+        app.state.pii = pii
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await app.state.pool.close()
+        await app.state.redis.close()
+
+    app.post("/v1/retrieve", response_class=ORJSONResponse)(handlers.retrieve)
+    app.post("/v1/examples", response_class=ORJSONResponse, status_code=201)(handlers.ingest)
+    app.get("/v1/examples/{example_uid}/display")(handlers.display)
+    app.get("/v1/health")(handlers.health)
+    app.get("/v1/metrics")(handlers.metrics)
+    return app
+
+def _build_image_scrubber():
+    # Real impl loads a face detector (e.g. mediapipe or facenet-pytorch) and
+    # a tesseract OCR + PII text classifier. For brevity, stubs are used.
+    from ..pii.image_scrubber import ImageScrubber
+    return ImageScrubber(
+        face_detector=_StubFaceDetector(),
+        ocr_engine=_StubOCR(),
+        pii_text_classifier=_StubPIIClassifier(),
+    )
+
+class _StubFaceDetector:
+    def detect(self, img): return []
+class _StubOCR:
+    def extract(self, img): return []
+class _StubPIIClassifier:
+    def is_pii(self, text): return "@" in text or any(c.isdigit() for c in text) and len(text) >= 8
+
+app = build_app()
