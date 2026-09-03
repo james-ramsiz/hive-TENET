@@ -1,0 +1,21 @@
+# example_store/observability.py
+from __future__ import annotations
+from prometheus_client import Counter, Histogram, Gauge
+
+RETRIEVALS = Counter("example_store_retrievals_total", "Retrieval calls", ["job_type_id"])
+RETRIEVAL_LATENCY = Histogram(
+    "example_store_retrieval_latency_seconds",
+    "Retrieval latency",
+    ["job_type_id"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+INGESTIONS = Counter("example_store_ingestions_total", "Ingested examples", ["status"])
+INGESTION_LATENCY = Histogram(
+    "example_store_ingestion_latency_seconds",
+    "Ingestion latency",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0),
+)
+PII_DETECTED = Counter("example_store_pii_detected_total", "PII categories scrubbed", ["category"])
+BALANCE_EMPTY = Counter("example_store_balance_empty_total", "Times balanced retrieval returned empty")
+DRIFT_SCORE = Gauge("example_store_drift_score", "Latest drift score per (job, model)", ["job_type_id", "model_id"])
+REEMBED_PROGRESS = Counter("example_store_reembed_rows_total", "Rows re-embedded")
