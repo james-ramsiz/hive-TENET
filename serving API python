@@ -1,0 +1,110 @@
+# example_store/api/handlers.py
+from __future__ import annotations
+import logging
+from typing import Any
+from uuid import UUID
+
+from fastapi import Request, HTTPException
+from pydantic import BaseModel, Field
+
+from ..domain import Label, Modality, RetrievalRequest, Submission
+
+log = logging.getLogger(__name__)
+
+class RetrieveReq(BaseModel):
+    job_type_id: str
+    worker_id: str
+    fields: dict[str, Any]
+    modality: str = "text"
+    guideline_version_id: str
+    per_label: int = 4
+
+class RetrieveResp(BaseModel):
+    examples: list[dict]
+
+async def retrieve(req: Request, body: RetrieveReq) -> dict:
+    retriever = req.app.state.retriever
+    sub = Submission(
+        job_type_id=body.job_type_id,
+        worker_id=body.worker_id,
+        fields=body.fields,
+        modality=Modality(body.modality),
+    )
+    request = RetrievalRequest(
+        job_type_id=body.job_type_id,
+        submission=sub,
+        guideline_version_id=body.guideline_version_id,
+        per_label=body.per_label,
+    )
+    results = await retriever.retrieve(request)
+    return {"examples": [
+        {
+            "example_uid": str(r.example_uid),
+            "label": r.label.value,
+            "similarity": round(r.similarity, 4),
+            "guideline_version_id": r.guideline_version_id,
+            "is_cold_start_seed": r.is_cold_start_seed,
+            "quality_score": r.quality_score,
+            "display_key": r.example_uid,   # client fetches via /v1/examples/{uid}/display
+        } for r in results
+    ]}
+
+class IngestReq(BaseModel):
+    review_id: UUID
+    job_type_id: str
+    worker_id: str
+    fields: dict[str, Any]
+    modality: str = "text"
+    label: str
+    label_confidence: float = 1.0
+    guideline_version_id: str
+    reviewer_id: str
+
+async def ingest(req: Request, body: IngestReq) -> dict:
+    from ..ingestion.pipeline import IngestionPipeline
+    pipeline = IngestionPipeline(
+        repo=req.app.state.repo,
+        pii=req.app.state.pii,
+        encoder=req.app.state.encoder,
+    )
+    outcome = ReviewOutcome(
+        review_id=body.review_id,
+        submission=Submission(
+            job_type_id=body.job_type_id,
+            worker_id=body.worker_id,
+            fields=body.fields,
+            modality=Modality(body.modality),
+        ),
+        label=Label(body.label),
+        label_confidence=body.label_confidence,
+        guideline_version_id=body.guideline_version_id,
+        reviewer_id=body.reviewer_id,
+        occurred_at=datetime.now(timezone.utc),
+    )
+    new_id = await pipeline.process(outcome)
+    return {"inserted": new_id is not None, "id": new_id}
+
+async def display(req: Request, example_uid: UUID) -> dict:
+    """
+    Display endpoint returns the *scrubbed display_payload* — never raw PII.
+    Raw access requires a separate authenticated endpoint (not exposed here).
+    """
+    async with req.app.state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT display_payload, label, guideline_version_id FROM examples WHERE example_uid=$1",
+            example_uid,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return {
+            "display": row["display_payload"],
+            "label": row["label"],
+            "guideline_version_id": row["guideline_version_id"],
+        }
+
+async def health(req: Request) -> dict:
+    return {"ok": True, "env": get_settings().environment}
+
+async def metrics(req: Request) -> Response:
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
