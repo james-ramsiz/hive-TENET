@@ -1,0 +1,133 @@
+# example_store/storage/pg_vector.py
+from __future__ import annotations
+import asyncio
+import json
+import logging
+from typing import Sequence
+from uuid import UUID
+
+import asyncpg
+from asyncpg.exceptions import UniqueViolationError
+
+from ..domain import Example, Label, RetrievalRequest
+from .repo import ExampleRepo
+
+log = logging.getLogger(__name__)
+
+INSERT_SQL = """
+INSERT INTO examples (
+    example_uid, review_id, job_type_id, worker_id,
+    submission_payload, scrubbed_payload, display_payload,
+    label, label_confidence, guideline_version_id,
+    embedding_model_id, embedding, embedding_text,
+    is_cold_start_seed, quality_score
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+RETURNING id
+ON CONFLICT (review_id) DO NOTHING
+"""
+
+SEARCH_SQL = """
+WITH ranked AS (
+    SELECT id, example_uid, review_id, job_type_id, label, guideline_version_id,
+           embedding_model_id, is_cold_start_seed, quality_score, created_at,
+           1 - (embedding <=> $4::vector) AS similarity
+    FROM examples
+    WHERE job_type_id = $1
+      AND label = $2
+      AND guideline_version_id = $3
+      AND is_superseded = false
+      AND created_at >= now() - ($5 || ' days')::interval
+    ORDER BY embedding <=> $4::vector
+    LIMIT $6
+)
+SELECT id, similarity, example_uid, review_id, job_type_id, label,
+       guideline_version_id, embedding_model_id, is_cold_start_seed,
+       quality_score, created_at
+FROM ranked
+ORDER BY similarity DESC
+"""
+
+class PgVectorRepo(ExampleRepo):
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def insert(self, example: Example, vector, embedding_text, raw_payload,
+                     scrubbed_payload, display_payload) -> int:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                INSERT_SQL,
+                example.example_uid, example.review_id, example.job_type_id,
+                example.worker_id, json.dumps(raw_payload), json.dumps(scrubbed_payload),
+                json.dumps(display_payload), example.label.value, example.label_confidence,
+                example.guideline_version_id, example.embedding_model_id,
+                vector, embedding_text, example.is_cold_start_seed, example.quality_score,
+            )
+            if row is None:
+                # Already present via ON CONFLICT — fetch existing id
+                row = await conn.fetchrow(
+                    "SELECT id FROM examples WHERE review_id=$1", example.review_id
+                )
+            return row["id"]
+
+    async def exists_by_review(self, review_id: UUID) -> bool:
+        async with self._pool.acquire() as conn:
+            v = await conn.fetchval(
+                "SELECT 1 FROM examples WHERE review_id=$1", review_id
+            )
+            return v is not None
+
+    async def search(self, job_type_id, guideline_version_id, label, query_vector,
+                     ef_search, top_k, max_age_days):
+        async with self._pool.acquire() as conn:
+            # pgvector: SET LOCAL hnsw.ef_search is per-transaction.
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL hnsw.ef_search = {int(ef_search)}")
+                rows = await conn.fetch(
+                    SEARCH_SQL, job_type_id, label.value, guideline_version_id,
+                    query_vector, max_age_days, top_k,
+                )
+            return [
+                (r["id"], float(r["similarity"]),
+                 Example(
+                     example_uid=r["example_uid"], review_id=r["review_id"],
+                     job_type_id=r["job_type_id"], label=Label(r["label"]),
+                     guideline_version_id=r["guideline_version_id"],
+                     embedding_model_id=r["embedding_model_id"],
+                     quality_score=float(r["quality_score"]),
+                     is_cold_start_seed=r["is_cold_start_seed"],
+                     created_at=r["created_at"],
+                 ))
+                for r in rows
+            ]
+
+    async def mark_superseded(self, example_id: int, by_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE examples SET is_superseded=true, superseded_by=$2 WHERE id=$1",
+                example_id, by_id,
+            )
+
+    async def sample_for_drift(self, job_type_id, model_id, n):
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, embedding FROM examples
+                WHERE job_type_id=$1 AND embedding_model_id=$2 AND is_superseded=false
+                ORDER BY random() LIMIT $3
+                """,
+                job_type_id, model_id, n,
+            )
+            return [(r["id"], list(r["embedding"])) for r in rows]
+
+    async def fetch_for_reembed(self, model_id, batch_size, offset):
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, scrubbed_payload, embedding_text
+                FROM examples
+                WHERE embedding_model_id=$1 AND is_superseded=false
+                ORDER BY id LIMIT $2 OFFSET $3
+                """,
+                model_id, batch_size, offset,
+            )
+            return [dict(r) for r in rows]
