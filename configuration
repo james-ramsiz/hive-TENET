@@ -1,0 +1,79 @@
+# example_store/config.py
+from __future__ import annotations
+import os
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    dsn: str
+    pool_min: int = 5
+    pool_max: int = 20
+    statement_timeout_ms: int = 5000
+
+@dataclass(frozen=True)
+class PIIConfig:
+    text_scrubber_model: str = " presidio-en-default"
+    image_face_detection_threshold: float = 0.85
+    ocr_pii_redact: bool = True
+    # If true, store lightly-redacted (faces blurred, names tokenized) display payload
+    produce_display_payload: bool = True
+
+@dataclass(frozen=True)
+class EmbeddingConfig:
+    text_model_id: str = "emb-minilm-v3"
+    text_model_path: str = "sentence-transformers/all-MiniLM-L6-v2"
+    image_model_id: str = "emb-clip-v1"
+    image_model_path: str = "openai/clip-vit-base-patch32"
+    dim: int = 384
+    gpu_batch_size: int = 64
+    cpu_batch_size: int = 16
+    max_text_chars: int = 8000
+    cache_ttl_seconds: int = 86400
+
+@dataclass(frozen=True)
+class RetrievalConfig:
+    ann_ef_search: int = 128          # HNSW ef_search at query time
+    ann_top_k_per_label: int = 50     # candidates fetched per label before balance
+    final_per_label: int = 4          # examples per label in the evidence packet
+    max_age_days: int = 180
+    require_current_guideline: bool = True
+    fallback_to_superseded_if_empty: bool = True
+
+@dataclass(frozen=True)
+class DriftConfig:
+    snapshot_interval_hours: int = 24
+    drift_score_threshold: float = 0.35
+    min_sample_count: int = 200
+    reembed_batch_size: int = 500
+
+@dataclass(frozen=True)
+class ColdStartConfig:
+    seed_count_per_label: int = 6
+    synthetic_model_id: str = "synth-v1"
+    curator_review_required: bool = True
+
+@dataclass(frozen=True)
+class Settings:
+    db: DatabaseConfig
+    pii: PIIConfig = field(default_factory=PIIConfig)
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    drift: DriftConfig = field(default_factory=DriftConfig)
+    coldstart: ColdStartConfig = field(default_factory=ColdStartConfig)
+    kafka_bootstrap: str = "kafka:9092"
+    kafka_review_topic: str = "review.outcomes.v1"
+    kafka_consumer_group: str = "example-store-ingestion"
+    redis_url: str = "redis://redis:6379/0"
+    environment: str = "production"
+
+def _env(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings(
+        db=DatabaseConfig(dsn=_env("DATABASE_DSN", "postgresql://es:es@postgres:5432/example_store")),
+        kafka_bootstrap=_env("KAFKA_BOOTSTRAP", "kafka:9092"),
+        environment=_env("ENV", "production"),
+    )
