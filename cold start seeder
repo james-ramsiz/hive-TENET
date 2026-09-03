@@ -1,0 +1,89 @@
+# example_store/coldstart/seeder.py
+from __future__ import annotations
+import asyncio
+import json
+import logging
+from dataclasses import dataclass
+from typing import Sequence
+from uuid import uuid4
+
+from ..domain import Example, Label, Submission, Modality
+from ..embedding.encoder import EmbeddingEncoder
+from ..pii.service import PIIService
+from ..storage.repo import ExampleRepo
+from ..config import ColdStartConfig
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class SeedSubmission:
+    text: str
+    label: Label
+    rationale: str   # why this is a canonical example
+
+class ColdStartSeeder:
+    """
+    Two sources for seeds:
+      (a) Curator-supplied: a human writes canonical accepted/rejected examples
+          into a YAML/JSON file shipped with the guideline doc.
+      (b) Synthetic: a language model conditioned on the guideline text generates
+          hypothetical submissions that the guideline would accept/reject.
+
+    Both go through the same PII + embedding + insert pipeline as real reviews.
+    They're marked is_cold_start_seed=true and have a slightly lower quality_score
+    (0.4 default) until promoted by a curator.
+    """
+    def __init__(self, repo: ExampleRepo, encoder: EmbeddingEncoder, pii: PIIService,
+                 cfg: ColdStartConfig, synth_generator):
+        self._repo = repo
+        self._encoder = encoder
+        self._pii = pii
+        self._cfg = cfg
+        self._synth = synth_generator
+
+    async def seed_new_job_type(self, job_type_id: str, guideline_version_id: str,
+                                 guideline_text: str, curator_seeds: Sequence[SeedSubmission]) -> int:
+        seeds = list(curator_seeds)
+        if len(seeds) < self._cfg.seed_count_per_label * 2:
+            synth = await self._synth.generate(
+                guideline_text=guideline_text,
+                count_per_label=self._cfg.seed_count_per_label,
+            )
+            seeds.extend(synth)
+
+        inserted = 0
+        for s in seeds:
+            sub = Submission(
+                job_type_id=job_type_id,
+                worker_id="COLDSTART",
+                fields={"body": s.text},
+                modality=Modality.TEXT,
+            )
+            scrubbed = await self._pii.scrub(sub)
+            vecs = await self._encoder.encode_text([scrubbed.text_for_embedding])
+            if not vecs:
+                continue
+            v = vecs[0]
+            ex = Example(
+                example_uid=uuid4(),
+                review_id=uuid4(),
+                job_type_id=job_type_id,
+                worker_id="COLDSTART",
+                label=s.label,
+                guideline_version_id=guideline_version_id,
+                embedding_model_id=v.model_id,
+                quality_score=0.4 if not self._cfg.curator_review_required else 0.7,
+                is_cold_start_seed=True,
+                created_at=datetime.now(timezone.utc),
+            )
+            await self._repo.insert(
+                example=ex,
+                vector=v.vector,
+                embedding_text=v.embedded_text,
+                raw_payload={"body": s.text, "rationale": s.rationale},
+                scrubbed_payload={"text": scrubbed.text_for_embedding},
+                display_payload=scrubbed.display_payload,
+            )
+            inserted += 1
+        log.info("cold-start seeded %d examples for job=%s", inserted, job_type_id)
+        return inserted
