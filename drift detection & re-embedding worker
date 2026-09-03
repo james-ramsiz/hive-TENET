@@ -1,0 +1,127 @@
+# example_store/drift/detector.py
+from __future__ import annotations
+import asyncio
+import logging
+import math
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Sequence
+
+import redis.asyncio as redis
+
+from ..config import DriftConfig
+from ..storage.repo import ExampleRepo
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class DriftSnapshot:
+    job_type_id: str
+    model_id: str
+    snapshot_at: datetime
+    centroid: list[float]
+    mean_pairwise_dist: float
+    knn_density_p50: float
+    drift_score: float
+
+class DriftDetector:
+    def __init__(self, repo: ExampleRepo, pool, cfg: DriftConfig):
+        self._repo = repo
+        self._pool = pool
+        self._cfg = cfg
+
+    async def snapshot_if_due(self, job_type_id: str, model_id: str) -> DriftSnapshot | None:
+        async with self._pool.acquire() as conn:
+            last = await conn.fetchval(
+                """
+                SELECT snapshot_at FROM drift_snapshots
+                WHERE job_type_id=$1 AND embedding_model_id=$2
+                ORDER BY snapshot_at DESC LIMIT 1
+                """,
+                job_type_id, model_id,
+            )
+            if last and (datetime.now(timezone.utc) - last).total_seconds() < self._cfg.snapshot_interval_hours * 3600:
+                return None
+
+            samples = await self._repo.sample_for_drift(job_type_id, model_id, 1000)
+            if len(samples) < self._cfg.min_sample_count:
+                log.info("drift snapshot skipped: insufficient samples (%d)", len(samples))
+                return None
+            vecs = [v for _, v in samples]
+            centroid = self._centroid(vecs)
+            mpd = self._mean_pairwise_distance(vecs, max_pairs=5000)
+            knn_p50, knn_p95 = self._knn_density(vecs, k=10)
+
+            # Compute drift vs previous snapshot's centroid.
+            prior_centroid = await self._prior_centroid(conn, job_type_id, model_id)
+            drift = 0.0 if prior_centroid is None else 1 - cosine(centroid, prior_centroid)
+            drift = max(0.0, min(1.0, drift))
+
+            snap = DriftSnapshot(job_type_id, model_id, datetime.now(timezone.utc),
+                                 centroid, mpd, knn_p50, drift)
+            await conn.execute(
+                """
+                INSERT INTO drift_snapshots
+                (job_type_id, embedding_model_id, snapshot_at, centroid,
+                 mean_pairwise_dist, sample_count, knn_density_p50, knn_density_p95, drift_score)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                """,
+                snap.job_type_id, snap.model_id, snap.snapshot_at, snap.centroid,
+                snap.mean_pairwise_dist, len(vecs), knn_p50, knn_p95, snap.drift_score,
+            )
+            if drift >= self._cfg.drift_score_threshold:
+                log.warning("drift threshold exceeded job=%s model=%s drift=%.3f",
+                            job_type_id, model_id, drift)
+            return snap
+
+    @staticmethod
+    def _centroid(vecs):
+        n = len(vecs)
+        d = len(vecs[0])
+        out = [0.0] * d
+        for v in vecs:
+            for i in range(d):
+                out[i] += v[i]
+        return [x / n for x in out]
+
+    @staticmethod
+    def _mean_pairwise_distance(vecs, max_pairs=5000):
+        import random
+        if len(vecs) > 200:
+            sample = random.sample(vecs, 200)
+        else:
+            sample = vecs
+        total, count = 0.0, 0
+        for i, a in enumerate(sample):
+            for b in sample[i+1:]:
+                total += math.sqrt(sum((x-y)**2 for x, y in zip(a, b)))
+                count += 1
+                if count >= max_pairs:
+                    break
+            if count >= max_pairs:
+                break
+        return total / max(count, 1)
+
+    @staticmethod
+    def _knn_density(vecs, k=10):
+        # crude: average distance to k nearest, per point, then percentiles
+        import statistics
+        densities = []
+        for i, v in enumerate(vecs):
+            dists = sorted(math.sqrt(sum((x-y)**2 for x, y in zip(v, w)))
+                           for j, w in enumerate(vecs) if j != i)
+            densities.append(sum(dists[:k]) / k)
+        densities.sort()
+        n = len(densities)
+        return densities[n // 2], densities[int(n * 0.95)]
+
+    async def _prior_centroid(self, conn, job_type_id, model_id):
+        row = await conn.fetchrow(
+            """
+            SELECT centroid FROM drift_snapshots
+            WHERE job_type_id=$1 AND embedding_model_id=$2
+            ORDER BY snapshot_at DESC LIMIT 1 OFFSET 1
+            """,
+            job_type_id, model_id,
+        )
+        return list(row["centroid"]) if row else None
