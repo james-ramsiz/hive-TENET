@@ -1,0 +1,43 @@
+# example_store/workers/runner.py
+from __future__ import annotations
+import argparse
+import asyncio
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+async def main(role: str) -> None:
+    if role == "ingestion":
+        from ..ingestion.consumer import ReviewOutcomeConsumer
+        from ..ingestion.pipeline import IngestionPipeline
+        from ..embedding.encoder import EmbeddingEncoder
+        from ..pii.service import PIIService
+        from ..storage.pg_vector import PgVectorRepo
+        import asyncpg, os
+        pool = await asyncpg.create_pool(dsn=os.environ["DATABASE_DSN"])
+        encoder = EmbeddingEncoder(get_settings().embedding)
+        await encoder.load()
+        pii = _build_pii()
+        repo = PgVectorRepo(pool)
+        pipeline = IngestionPipeline(repo, pii, encoder)
+        consumer = ReviewOutcomeConsumer(
+            bootstrap=os.environ["KAFKA_BOOTSTRAP"],
+            topic="review.outcomes.v1",
+            group="example-store-ingestion",
+            pipeline=pipeline,
+            concurrency=16,
+        )
+        await consumer.run()
+    elif role == "reembed":
+        from ..drift.reembed_worker import ReEmbedWorker
+        # ... wiring omitted for brevity
+        pass
+    elif role == "embedding":
+        # Standalone GPU embedding service over gRPC (omitted)
+        pass
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("role", choices=["ingestion", "reembed", "embedding"])
+    args = p.parse_args()
+    asyncio.run(main(args.role))
