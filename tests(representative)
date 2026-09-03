@@ -1,0 +1,31 @@
+# tests/test_retrieval_balance.py
+import asyncio
+import pytest
+
+@pytest.mark.asyncio
+async def test_returns_balanced_accepted_rejected(retriever_with_seed_data):
+    req = RetrievalRequest(
+        job_type_id="JT-1",
+        submission=Submission(job_type_id="JT-1", worker_id="w", fields={"body": "x"}, modality=Modality.TEXT),
+        guideline_version_id="gv-current",
+        per_label=3,
+    )
+    out = await retriever_with_seed_data.retrieve(req)
+    labels = [r.label for r in out]
+    assert labels.count(Label.ACCEPTED) == 3
+    assert labels.count(Label.REJECTED) == 3
+    # No duplicates
+    uids = {r.example_uid for r in out}
+    assert len(uids) == len(out)
+
+@pytest.mark.asyncio
+async def test_stale_guideline_excluded(retriever_with_seed_data):
+    req = RetrievalRequest(
+        job_type_id="JT-1",
+        submission=Submission(job_type_id="JT-1", worker_id="w", fields={"body": "x"}, modality=Modality.TEXT),
+        guideline_version_id="gv-new",
+        per_label=3,
+    )
+    out = await retriever_with_seed_data.retrieve(req)
+    for r in out:
+        assert r.guideline_version_id == "gv-new"
