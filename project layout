@@ -1,0 +1,61 @@
+example_store/
+├── pyproject.toml
+├── alembic/
+│   └── versions/0001_init.py
+├── example_store/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── observability.py
+│   ├── domain.py                 # typed dataclasses/enums
+│   ├── pii/
+│   │   ├── __init__.py
+│   │   ├── text_scrubber.py
+│   │   ├── image_scrubber.py
+│   │   └── service.py
+│   ├── embedding/
+│   │   ├── __init__.py
+│   │   ├── encoder.py
+│   │   ├── batching.py
+│   │   └── cache.py
+│   ├── storage/
+│   │   ├── __init__.py
+│   │   ├── repo.py
+│   │   └── pg_vector.py
+│   ├── retrieval/
+│   │   ├── __init__.py
+│   │   ├── balanced.py
+│   │   └── rank.py
+│   ├── freshness/
+│   │   ├── __init__.py
+│   │   └── tracker.py
+│   ├── coldstart/
+│   │   ├── __init__.py
+│   │   └── seeder.py
+│   ├── drift/
+│   │   ├── __init__.py
+│   │   ├── detector.py
+│   │   └── reembed_worker.py
+│   ├── ingestion/
+│   │   ├── __init__.py
+│   │   ├── consumer.py
+│   │   └── pipeline.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── server.py
+│   │   └── handlers.py
+│   └── workers/
+│       ├── __init__.py
+│       └── runner.py
+├── tests/
+│   ├── test_pii.py
+│   ├── test_retrieval_balance.py
+│   ├── test_freshness.py
+│   ├── test_coldstart.py
+│   └── test_drift.py
+└── deploy/
+    ├── docker-compose.yml
+    └── k8s/
+        ├── api.yaml
+        ├── ingestion-worker.yaml
+        ├── reembed-worker.yaml
+        └── embedding-gpu.yaml
