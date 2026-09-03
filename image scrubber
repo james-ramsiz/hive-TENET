@@ -1,0 +1,73 @@
+# example_store/pii/image_scrubber.py
+from __future__ import annotations
+import io
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+log = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class ImageScrubResult:
+    redacted_image_bytes: bytes       # for embedding (heavily redacted)
+    display_image_bytes: bytes        # for reviewer (lightly redacted, faces blurred)
+    face_count: int
+    text_pii_redacted: int
+
+class ImageScrubber:
+    """
+    Heavily redacted version (for embedding): faces fully blocked, OCR-detected
+    PII text masked with black boxes.
+    Display version (for reviewer): faces Gaussian-blurred, PII text masked with
+    neutral gray blocks (so reviewer still sees layout).
+    """
+    def __init__(self, face_detector, ocr_engine, pii_text_classifier):
+        self._faces = face_detector
+        self._ocr = ocr_engine
+        self._pii_text = pii_text_classifier
+
+    def scrub(self, image_bytes: bytes) -> ImageScrubResult:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        faces = self._faces.detect(img)
+        ocr_results = self._ocr.extract(img)
+        pii_text_boxes = [r.box for r in ocr_results if self._pii_text.is_pii(r.text)]
+
+        redacted = img.copy()
+        display = img.copy()
+
+        for f in faces:
+            self._block(redacted, f.box, fill=(0, 0, 0))
+            self._blur(display, f.box)
+
+        for box in pii_text_boxes:
+            self._block(redacted, box, fill=(0, 0, 0))
+            self._block(display, box, fill=(128, 128, 128))
+
+        return ImageScrubResult(
+            redacted_image_bytes=self._encode(redacted),
+            display_image_bytes=self._encode(display),
+            face_count=len(faces),
+            text_pii_redacted=len(pii_text_boxes),
+        )
+
+    @staticmethod
+    def _block(img: Image.Image, box, fill) -> None:
+        x0, y0, x1, y1 = box
+        arr = np.array(img)
+        arr[int(y0):int(y1), int(x0):int(x1)] = fill
+        img.paste(Image.fromarray(arr), (0, 0))
+
+    @staticmethod
+    def _blur(img: Image.Image, box) -> None:
+        x0, y0, x1, y1 = [int(v) for v in box]
+        crop = img.crop((x0, y0, x1, y1)).filter(ImageFilter.GaussianBlur(radius=18))
+        img.paste(crop, (x0, y0))
+
+    @staticmethod
+    def _encode(img: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
