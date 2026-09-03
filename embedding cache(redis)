@@ -1,0 +1,26 @@
+# example_store/embedding/cache.py
+from __future__ import annotations
+import hashlib
+import json
+from typing import Optional
+
+import redis.asyncio as redis
+
+class EmbeddingCache:
+    def __init__(self, client: redis.Redis, ttl: int = 86400) -> None:
+        self._r = client
+        self._ttl = ttl
+
+    @staticmethod
+    def _key(model_id: str, text: str) -> str:
+        h = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return f"emb:{model_id}:{h}"
+
+    async def get(self, model_id: str, text: str) -> Optional[list[float]]:
+        v = await self._r.get(self._key(model_id, text))
+        if v is None:
+            return None
+        return json.loads(v)
+
+    async def set(self, model_id: str, text: str, vec: list[float]) -> None:
+        await self._r.setex(self._key(model_id, text), self._ttl, json.dumps(vec))
