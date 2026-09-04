@@ -1,0 +1,12 @@
+.
+├── cascade/
+│   ├── __init__.py
+│   ├── orchestrator.py       # The state machine driving the saga
+│   ├── steps.py              # Individual step implementations (gRPC/Kafka clients)
+│   └── repo.py               # Persistence for cascade state
+├── observability/
+│   ├── __init__.py
+│   ├── consumer.py           # Kafka stream processor
+│   ├── aggregations.py       # Windowed metric calculations
+│   ├── anomaly_detector.py   # Static threshold + EWMA drift detection
+│   └── exporter.py           # Prometheus custom collector
