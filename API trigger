@@ -1,0 +1,36 @@
+# api/guideline_handler.py (added to FastAPI app)
+from __future__ import annotations
+import uuid
+from fastapi import APIRouter, Request, HTTPException
+from pydantic import BaseModel
+
+router = APIRouter(prefix="/v1/guidelines")
+
+class GuidelineChangeReq(BaseModel):
+    job_type_id: str
+    old_version_id: str
+    new_version_id: str
+    severity: str # "minor" | "major"
+
+@router.post("/cascade", status_code=202)
+async def trigger_cascade(req: Request, body: GuidelineChangeReq):
+    # Enforces the invariant: don't trigger if one is already running
+    repo = req.app.state.cascade_repo
+    existing = await repo.find_active_cascade(body.job_type_id)
+    if existing:
+        raise HTTPException(status_code=409, detail="Cascade already in progress for this job_type")
+    
+    cascade_id = uuid.uuid4()
+    await repo.create_cascade(
+        cascade_id=cascade_id,
+        job_type_id=body.job_type_id,
+        old_version_id=body.old_version_id,
+        new_version_id=body.new_version_id,
+        severity=body.severity
+    )
+    
+    # Fire and forget the orchestrator task
+    orchestrator = req.app.state.cascade_orchestrator
+    asyncio.create_task(orchestrator.run(cascade_id))
+    
+    return {"cascade_id": str(cascade_id), "status": "initiated"}
