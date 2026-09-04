@@ -1,0 +1,72 @@
+# observability/anomaly_detector.py
+from __future__ import annotations
+import logging
+from collections import deque
+from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class EWMATracker:
+    """
+    Exponentially Weighted Moving Average for drift detection.
+    More sensitive to recent changes than a simple rolling average.
+    """
+    alpha: float = 0.1  # smoothing factor
+    mean: float = 0.0
+    variance: float = 0.0
+    initialized: bool = False
+
+    def update(self, value: float) -> None:
+        if not self.initialized:
+            self.mean = value
+            self.variance = 0.0
+            self.initialized = True
+            return
+        
+        delta = value - self.mean
+        self.mean += self.alpha * delta
+        self.variance = (1 - self.alpha) * (self.variance + self.alpha * (delta ** 2))
+
+    @property
+    def std_dev(self) -> float:
+        return self.variance ** 0.5
+
+    def is_anomalous(self, value: float, threshold: float = 3.0) -> bool:
+        if not self.initialized:
+            return False
+        # 3-sigma rule
+        return abs(value - self.mean) > threshold * self.std_dev
+
+
+class BehavioralAnomalyDetector:
+    """
+    Maintains EWMA trackers for key metrics per (job_type, reviewer) cohort.
+    """
+    def __init__(self):
+        self._trackers: dict[str, EWMATracker] = {}
+
+    def _get_tracker(self, key: str) -> EWMATracker:
+        if key not in self._trackers:
+            self._trackers[key] = EWMATracker(alpha=0.05)
+        return self._trackers[key]
+
+    def check_overturn_rate(self, job_type_id: str, rate: float) -> bool:
+        key = f"overturn:{job_type_id}"
+        tracker = self._get_tracker(key)
+        is_anomaly = tracker.is_anomalous(rate, threshold=3.5)
+        tracker.update(rate)
+        if is_anomaly:
+            log.warning("Anomaly detected: Overturn rate for %s spiked to %.3f (mean=%.3f)", 
+                        job_type_id, rate, tracker.mean)
+        return is_anomaly
+
+    def check_reviewer_agreement(self, reviewer_id: str, rate: float) -> bool:
+        key = f"agreement:{reviewer_id}"
+        tracker = self._get_tracker(key)
+        is_anomaly = tracker.is_anomalous(rate, threshold=3.0)
+        tracker.update(rate)
+        if is_anomaly:
+            log.warning("Anomaly detected: Reviewer %s agreement dropped to %.3f (mean=%.3f)", 
+                        reviewer_id, rate, tracker.mean)
+        return is_anomaly
