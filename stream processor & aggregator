@@ -1,0 +1,56 @@
+# observability/consumer.py
+from __future__ import annotations
+import asyncio
+import json
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+import aiokafka
+
+log = logging.getLogger(__name__)
+
+class ObservabilityProcessor:
+    """
+    Consumes events from multiple topics, joins them in memory for windowed
+    aggregation, and flushes to TimescaleDB and Prometheus.
+    """
+    def __init__(self, bootstrap: str, topics: list[str], db_pool, exporter):
+        self._bootstrap = bootstrap
+        self._topics = topics
+        self._pool = db_pool
+        self._exporter = exporter
+        self._stop = asyncio.Event()
+
+    async def run(self):
+        consumer = aiokafka.AIOKafkaConsumer(
+            *self._topics,
+            bootstrap_servers=self._bootstrap,
+            group_id="observability-processor",
+            auto_offset_reset="latest"
+        )
+        await consumer.start()
+        log.info("Observability processor started.")
+        
+        # Simple in-memory buffers for the current 5-minute window
+        # In production, use a proper windowing library or Flink/ksqlDB
+        self._buffers = defaultdict(list)
+        
+        try:
+            async for msg in consumer:
+                await self._process_event(msg.topic, json.loads(msg.value))
+        finally:
+            await consumer.stop()
+
+    async def _process_event(self, topic: str, event: dict):
+        ts = datetime.fromisoformat(event["occurred_at"])
+        
+        if topic == "review.outcomes.v1":
+            await self._exporter.observe_review_outcome(event)
+            self._buffers["overturn_rate"].append((ts, event))
+            
+        elif topic == "deck.assignments.v1":
+            await self._exporter.observe_assignment(event)
+            self._buffers["assignment_churn"].append((ts, event))
+
+        # Flush every 1000 events or 60 seconds (omitted for brevity)
