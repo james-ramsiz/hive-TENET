@@ -1,0 +1,30 @@
+# api/observability_handler.py
+from __future__ import annotations
+from fastapi import APIRouter, Request, Query
+from datetime import datetime, timedelta, timezone
+
+router = APIRouter(prefix="/v1/observability")
+
+@router.get("/overturn_rate")
+async def get_overturn_rate(req: Request, job_type_id: str, hours: int = 24):
+    """
+    Queries the TimescaleDB behavioral_aggregates table.
+    """
+    pool = req.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT window_start, value, sample_count
+            FROM behavioral_aggregates
+            WHERE metric_name = 'overturn_rate'
+              AND job_type_id = $1
+              AND window_start >= now() - ($2 || ' hours')::interval
+            ORDER BY window_start ASC
+            """,
+            job_type_id, hours
+        )
+        return {
+            "job_type_id": job_type_id,
+            "metric": "overturn_rate",
+            "data": [{"ts": r["window_start"].isoformat(), "value": r["value"], "n": r["sample_count"]} for r in rows]
+        }
