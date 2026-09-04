@@ -1,0 +1,23 @@
+# deploy/docker-compose.yml (additions)
+
+  cascade-orchestrator:
+    image: example-store/api:latest
+    environment:
+      DATABASE_DSN: postgresql://es:es@postgres:5432/example_store
+      KAFKA_BOOTSTRAP: kafka:9092
+    command: ["python", "-m", "example_store.workers.runner", "cascade"]
+    depends_on: [postgres, kafka]
+
+  observability-processor:
+    image: example-store/api:latest
+    environment:
+      DATABASE_DSN: postgresql://es:es@postgres:5432/example_store
+      KAFKA_BOOTSTRAP: kafka:9092
+    command: ["python", "-m", "example_store.workers.runner", "observability"]
+    depends_on: [postgres, kafka]
+    
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports: ["9090:9090"]
