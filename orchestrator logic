@@ -1,0 +1,82 @@
+# cascade/orchestrator.py
+from __future__ import annotations
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Callable, Awaitable
+from uuid import UUID
+
+from .repo import CascadeRepo
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class StepContext:
+    cascade_id: UUID
+    job_type_id: str
+    old_version_id: str
+    new_version_id: str
+    severity: str
+
+class CascadeOrchestrator:
+    """
+    Executes the guideline change as a sequence of steps.
+    If a step fails, it triggers compensation actions for previously completed steps.
+    State is persisted before and after every step.
+    """
+    def __init__(self, repo: CascadeRepo, steps: dict[str, Callable]):
+        self._repo = repo
+        self._steps = steps
+
+    async def run(self, cascade_id: UUID) -> None:
+        await self._repo.update_state(cascade_id, 'PAUSING_ASSIGNMENTS')
+        ctx = await self._repo.get_context(cascade_id)
+        
+        try:
+            # Step 1: Pause new deck assignments for this job type
+            await self._execute_step(cascade_id, ctx, 'PAUSING_ASSIGNMENTS', 'pause_assignments')
+            
+            # Step 2: Update the model (or verify shadow model is ready)
+            await self._execute_step(cascade_id, ctx, 'UPDATING_MODEL', 'update_model')
+            
+            # Step 3: Supersede old examples in the Example Store
+            await self._execute_step(cascade_id, ctx, 'SUPERSEDING_EXAMPLES', 'supersede_examples')
+            
+            # Step 4: Push new calibration decks to reviewers
+            await self._execute_step(cascade_id, ctx, 'CALIBRATING_REVIEWERS', 'calibrate_reviewers')
+            
+            # Step 5: Notify workers of the new guidelines
+            await self._execute_step(cascade_id, ctx, 'NOTIFYING_WORKERS', 'notify_workers')
+            
+            # Step 6: Resume assignments
+            await self._execute_step(cascade_id, ctx, 'COMPLETED', 'resume_assignments')
+            log.info("Cascade %s completed successfully", cascade_id)
+
+        except Exception as e:
+            log.exception("Cascade %s failed at step. Initiating rollback.", cascade_id)
+            await self._rollback(cascade_id, ctx)
+
+    async def _execute_step(self, cascade_id: UUID, ctx: StepContext, new_state: str, step_name: str):
+        log.info("Cascade %s executing step: %s", cascade_id, step_name)
+        await self._repo.update_state(cascade_id, new_state)
+        await self._repo.log_step(cascade_id, step_name, 'started')
+        
+        step_func = self._steps[step_name]
+        await step_func(ctx)
+        
+        await self._repo.log_step(cascade_id, step_name, 'succeeded')
+        await self._repo.add_compensation_action(cascade_id, step_name)
+
+    async def _rollback(self, cascade_id: UUID, ctx: StepContext):
+        await self._repo.update_state(cascade_id, 'ROLLED_BACK')
+        actions = await self._repo.get_compensation_actions(cascade_id)
+        
+        # Execute in reverse order
+        for step_name in reversed(actions):
+            log.warning("Cascade %s compensating step: %s", cascade_id, step_name)
+            comp_func = self._steps.get(f"undo_{step_name}")
+            if comp_func:
+                try:
+                    await comp_func(ctx)
+                except Exception:
+                    log.exception("Compensation failed for step %s. Manual intervention required.", step_name)
