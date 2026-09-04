@@ -1,0 +1,41 @@
+# example_store/workers/runner.py (additions)
+async def main(role: str) -> None:
+    # ... previous roles ...
+    elif role == "cascade":
+        from ..cascade.orchestrator import CascadeOrchestrator
+        from ..cascade.steps import *
+        from ..cascade.repo import CascadeRepo
+        pool = await asyncpg.create_pool(dsn=os.environ["DATABASE_DSN"])
+        repo = CascadeRepo(pool)
+        
+        steps = {
+            'pause_assignments': pause_assignments,
+            'undo_pause_assignments': undo_pause_assignments,
+            'update_model': update_model,
+            'undo_update_model': undo_update_model,
+            'supersede_examples': supersede_examples,
+            'calibrate_reviewers': calibrate_reviewers,
+            'notify_workers': notify_workers,
+            'resume_assignments': resume_assignments
+        }
+        orchestrator = CascadeOrchestrator(repo, steps)
+        
+        # Listen for cascade triggers via Kafka (alternative to API)
+        # ... kafka consumer loop calls orchestrator.run(cascade_id) ...
+        
+    elif role == "observability":
+        from ..observability.consumer import ObservabilityProcessor
+        from ..observability.anomaly_detector import BehavioralAnomalyDetector
+        from ..observability.exporter import MetricsExporter
+        pool = await asyncpg.create_pool(dsn=os.environ["DATABASE_DSN"])
+        
+        detector = BehavioralAnomalyDetector()
+        exporter = MetricsExporter(detector)
+        
+        processor = ObservabilityProcessor(
+            bootstrap=os.environ["KAFKA_BOOTSTRAP"],
+            topics=["review.outcomes.v1", "deck.assignments.v1", "model.predictions.v1"],
+            db_pool=pool,
+            exporter=exporter
+        )
+        await processor.run()
