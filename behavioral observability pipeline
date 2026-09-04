@@ -1,0 +1,9 @@
+graph TD
+    K1[Kafka: Review Outcomes] --> O(Observability Stream Processor)
+    K2[Kafka: Deck Assignments] --> O
+    K3[Kafka: Model Predictions] --> O
+    O --> TS[(TimescaleDB / Postgres)]
+    O --> P[Prometheus Exporter]
+    P --> G(Grafana Dashboards)
+    O --> A[Anomaly Detector]
+    A --> S[Alertmanager / PagerDuty]
