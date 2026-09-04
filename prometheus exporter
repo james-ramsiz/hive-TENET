@@ -1,0 +1,52 @@
+# observability/exporter.py
+from __future__ import annotations
+import asyncio
+import logging
+from prometheus_client import Gauge, Counter
+
+log = logging.getLogger(__name__)
+
+# Prometheus gauges
+P_REVIEW_LATENCY = Gauge(
+    "behavioral_review_latency_ms", 
+    "Median time for a reviewer to complete a review", 
+    ["job_type_id", "reviewer_id"]
+)
+P_OVERTURN_RATE = Gauge(
+    "behavioral_overturn_rate", 
+    "Rolling rate of accepted submissions later overturned", 
+    ["job_type_id"]
+)
+P_ASSIGNMENT_CHURN = Gauge(
+    "behavioral_assignment_churn_rate", 
+    "Rate at which workers are assigned unfamiliar job types", 
+    ["job_type_id"]
+)
+
+class MetricsExporter:
+    """
+    Translates domain events into Prometheus metric updates.
+    """
+    def __init__(self, detector: BehavioralAnomalyDetector):
+        self._detector = detector
+
+    async def observe_review_outcome(self, event: dict):
+        job_type = event.get("job_type_id")
+        reviewer = event.get("reviewer_id")
+        latency_ms = event.get("latency_ms", 0)
+        
+        P_REVIEW_LATENCY.labels(job_type_id=job_type, reviewer_id=reviewer).set(latency_ms)
+        
+        if "overturn_flag" in event:
+            # Calculate windowed rate externally, pass it here
+            rate = event.get("rolling_overturn_rate", 0.0)
+            P_OVERTURN_RATE.labels(job_type_id=job_type).set(rate)
+            self._detector.check_overturn_rate(job_type, rate)
+
+    async def observe_assignment(self, event: dict):
+        job_type = event.get("job_type_id")
+        is_novel = event.get("is_novel_for_worker", False)
+        # In a full impl, we'd compute the windowed churn rate in the stream processor
+        # and just set the gauge here.
+        if is_novel:
+            P_ASSIGNMENT_CHURN.labels(job_type_id=job_type).inc()
