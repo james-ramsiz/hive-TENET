@@ -1,0 +1,40 @@
+# cascade/steps.py
+from __future__ import annotations
+import asyncio
+import logging
+from typing import Awaitable
+from .orchestrator import StepContext
+
+log = logging.getLogger(__name__)
+
+# In a real system, these make gRPC calls or publish Kafka commands 
+# to the respective microservices (Deck Service, Model Service, Example Store, etc.)
+
+async def pause_assignments(ctx: StepContext) -> None:
+    log.info("Publishing PAUSE command to Deck Service for job %s", ctx.job_type_id)
+    # await deck_client.pause(ctx.job_type_id)
+
+async def undo_pause_assignments(ctx: StepContext) -> None:
+    log.info("Publishing RESUME command to Deck Service for job %s (rollback)", ctx.job_type_id)
+    # await deck_client.resume(ctx.job_type_id)
+
+async def update_model(ctx: StepContext) -> None:
+    log.info("Triggering Model Service to swap active model for job %s to version %s", ctx.job_type_id, ctx.new_version_id)
+    # If this fails (e.g. model accuracy is below threshold), it raises an exception,
+    # which triggers the orchestrator's rollback.
+
+async def undo_update_model(ctx: StepContext) -> None:
+    log.info("Reverting Model Service to old model version %s (rollback)", ctx.old_version_id)
+
+async def supersede_examples(ctx: StepContext) -> None:
+    log.info("Calling Example Store to supersede examples for job %s", ctx.job_type_id)
+    # await example_store.supersede(ctx.job_type_id, ctx.old_version_id, ctx.new_version_id)
+
+async def calibrate_reviewers(ctx: StepContext) -> None:
+    log.info("Pushing calibration decks to Reviewer Service for job %s", ctx.job_type_id)
+
+async def notify_workers(ctx: StepContext) -> None:
+    log.info("Sending push notification to workers regarding new guidelines for job %s", ctx.job_type_id)
+
+async def resume_assignments(ctx: StepContext) -> None:
+    log.info("Publishing RESUME command to Deck Service for job %s with new model", ctx.job_type_id)
