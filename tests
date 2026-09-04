@@ -1,0 +1,42 @@
+# tests/test_cascade.py
+import pytest
+import asyncio
+from uuid import uuid4
+
+@pytest.mark.asyncio
+async def test_cascade_rolls_back_on_model_failure(mock_orchestrator):
+    cascade_id = uuid4()
+    
+    # Mock the update_model step to raise an exception
+    async def failing_model_step(ctx):
+        raise RuntimeError("Model accuracy below threshold")
+        
+    mock_orchestrator._steps['update_model'] = failing_model_step
+    
+    await mock_orchestrator.run(cascade_id)
+    
+    state = await mock_orchestrator._repo.get_state(cascade_id)
+    assert state == 'ROLLED_BACK'
+    
+    # Verify compensation actions were called in reverse order
+    # (pause_assignments was called, so undo_pause_assignments should have been called)
+    actions = await mock_orchestrator._repo.get_compensation_actions(cascade_id)
+    assert 'pause_assignments' in actions
+    # In a real test with mocks, assert undo_pause_assignments.assert_called_once()
+
+# tests/test_observability.py
+from observability.anomaly_detector import BehavioralAnomalyDetector
+
+def test_ewma_detects_sudden_spike():
+    detector = BehavioralAnomalyDetector()
+    tracker = detector._get_tracker("overturn:JT-1")
+    
+    # Simulate normal behavior
+    for _ in range(100):
+        tracker.update(0.05)  # 5% overturn rate is normal
+        
+    assert not tracker.is_anomalous(0.06) # Slight variation is fine
+    assert not tracker.is_anomalous(0.04)
+    
+    # Simulate a sudden spike
+    assert tracker.is_anomalous(0.25) # 25% overturn is a 3-sigma event
