@@ -1,0 +1,75 @@
+-- migrations/0002_cascade_and_observability.sql
+
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+-- ==========================================
+-- 3B: GUIDELINE CASCADE
+-- ==========================================
+
+CREATE TYPE cascade_state AS ENUM (
+    'PENDING', 
+    'PAUSING_ASSIGNMENTS', 
+    'UPDATING_MODEL', 
+    'SUPERSEDING_EXAMPLES', 
+    'CALIBRATING_REVIEWERS', 
+    'NOTIFYING_WORKERS', 
+    'COMPLETED',
+    'ROLLED_BACK',
+    'FAILED'
+);
+
+CREATE TABLE guideline_cascades (
+    id                  UUID PRIMARY KEY,
+    job_type_id         TEXT NOT NULL,
+    old_version_id      TEXT NOT NULL,
+    new_version_id      TEXT NOT NULL,
+    severity            TEXT NOT NULL, -- 'minor' | 'major'
+    state               cascade_state NOT NULL DEFAULT 'PENDING',
+    initiated_by        TEXT NOT NULL,
+    initiated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    failure_reason      TEXT,
+    compensation_actions JSONB NOT NULL DEFAULT '[]' -- tracks what to undo if failed
+);
+
+CREATE TABLE cascade_step_events (
+    id              BIGSERIAL PRIMARY KEY,
+    cascade_id      UUID NOT NULL REFERENCES guideline_cascades(id),
+    step_name       TEXT NOT NULL,
+    status          TEXT NOT NULL, -- 'started', 'succeeded', 'failed'
+    payload         JSONB,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ON cascade_step_events (cascade_id, occurred_at);
+
+-- ==========================================
+-- 4B: BEHAVIORAL OBSERVABILITY
+-- ==========================================
+
+CREATE TABLE behavioral_events (
+    event_id            UUID NOT NULL,
+    event_type          TEXT NOT NULL, -- 'review_completed', 'deck_assigned', 'model_predicted'
+    occurred_at        TIMESTAMPTZ NOT NULL,
+    job_type_id        TEXT,
+    worker_id          TEXT,
+    reviewer_id        TEXT,
+    model_id           TEXT,
+    payload            JSONB
+) PARTITION BY RANGE (occurred_at);
+
+-- TimescaleDB hypertable setup (usually run as a separate migration command)
+-- SELECT create_hypertable('behavioral_events', 'occurred_at', chunk_time_interval => INTERVAL '1 day');
+
+CREATE TABLE behavioral_aggregates (
+    aggregate_id       BIGSERIAL PRIMARY KEY,
+    metric_name        TEXT NOT NULL,
+    job_type_id        TEXT,
+    reviewer_id        TEXT,
+    window_start       TIMESTAMPTZ NOT NULL,
+    window_end         TIMESTAMPTZ NOT NULL,
+    value             DOUBLE PRECISION NOT NULL,
+    sample_count       INTEGER NOT NULL,
+    UNIQUE (metric_name, job_type_id, reviewer_id, window_start)
+);
+
+CREATE INDEX ON behavioral_aggregates (metric_name, window_start DESC);
