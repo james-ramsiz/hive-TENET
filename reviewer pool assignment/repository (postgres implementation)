@@ -1,0 +1,62 @@
+# assignment/repo.py
+from __future__ import annotations
+import abc
+import asyncpg
+from typing import Sequence, Optional
+from uuid import UUID
+from datetime import datetime, timezone
+from .domain import ReviewerProfile, QueuedReview
+
+class AssignmentRepo(abc.ABC):
+    @abc.abstractmethod
+    async def get_profile(self, reviewer_id: str) -> Optional[ReviewerProfile]: ...
+    @abc.abstractmethod
+    async def fetch_candidates(self, job_types: Optional[list[str]], limit: int) -> list[QueuedReview]: ...
+    @abc.abstractmethod
+    async def claim_reviews(self, reviewer_id: str, review_ids: list[UUID]) -> list[UUID]: ...
+
+class PgAssignmentRepo(AssignmentRepo):
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def get_profile(self, reviewer_id: str) -> Optional[ReviewerProfile]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT reviewer_id, seniority_level, quality_score, daily_review_limit, is_active FROM reviewer_profiles WHERE reviewer_id=$1",
+                reviewer_id
+            )
+            if not row: return None
+            return ReviewerProfile(**dict(row))
+
+    async def fetch_candidates(self, job_types: Optional[list[str]], limit: int) -> list[QueuedReview]:
+        async with self._pool.acquire() as conn:
+            # SKIP LOCKED ensures that if another reviewer is requesting work at the exact same millisecond,
+            # they don't pull the same unassigned rows.
+            rows = await conn.fetch(
+                """
+                SELECT review_id, job_type_id, worker_id, is_appeal, difficulty_score, enqueued_at
+                FROM review_queue
+                WHERE assigned_at IS NULL
+                ORDER BY enqueued_at ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+                """,
+                limit
+            )
+            return [QueuedReview(**dict(r)) for r in rows]
+
+    async def claim_reviews(self, reviewer_id: str, review_ids: list[UUID]) -> list[UUID]:
+        if not review_ids:
+            return []
+        async with self._pool.acquire() as conn:
+            # Atomic update to prevent race conditions
+            rows = await conn.fetch(
+                """
+                UPDATE review_queue
+                SET assigned_to = $1, assigned_at = now()
+                WHERE review_id = ANY($2::uuid[]) AND assigned_at IS NULL
+                RETURNING review_id
+                """,
+                reviewer_id, review_ids
+            )
+            return [r["review_id"] for r in rows]
