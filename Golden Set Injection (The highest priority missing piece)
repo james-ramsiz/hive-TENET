@@ -1,0 +1,61 @@
+# fraud/golden_injector.py
+from __future__ import annotations
+import random
+import logging
+from typing import Sequence
+from uuid import uuid4
+from datetime import datetime, timezone
+
+from assignment.repo import AssignmentRepo
+from assignment.domain import QueuedReview
+
+log = logging.getLogger(__name__)
+
+class GoldenInjector:
+    """
+    Intercepts a batch of real candidate reviews and injects known-bad 
+    (or known-good) items to test the reviewer.
+    """
+    def __init__(self, repo: AssignmentRepo, injection_rate: float = 0.05):
+        self._repo = repo
+        self._rate = injection_rate
+
+    async def inject_goldens(self, candidates: list[QueuedReview], reviewer_id: str) -> list[QueuedReview]:
+        if random.random() > self._rate:
+            return candidates
+            
+        # Fetch a known-bad item for the same job type
+        if not candidates:
+            return candidates
+            
+        job_type = candidates[0].job_type_id
+        golden = await self._repo.fetch_golden_item(job_type, is_good=False)
+        if not golden:
+            log.warning(f"No golden items available for job {job_type}")
+            return candidates
+            
+        # Disguise the golden item as a normal queued review
+        # It gets a new review_id so the reviewer doesn't recognize it
+        golden_trap = QueuedReview(
+            review_id=uuid4(),
+            job_type_id=job_type,
+            worker_id="SYSTEM_GOLDEN",
+            is_appeal=False,
+            difficulty_score=0.5,
+            enqueued_at=datetime.now(timezone.utc)
+        )
+        
+        # Insert into the queue and add to candidates
+        await self._repo.insert_golden_into_queue(
+            review_id=golden_trap.review_id, 
+            real_payload_ref=golden.review_id, # Secret mapping
+            job_type_id=job_type
+        )
+        candidates.append(golden_trap)
+        random.shuffle(candidates)
+        
+        log.info(f"Injected golden trap {golden_trap.review_id} for reviewer {reviewer_id}")
+        return candidates
+
+# Evaluation happens later in the observability pipeline:
+# If review_id == SYSTEM_GOLDEN and reviewer_label == 'accepted' -> quality_score -= 0.2
