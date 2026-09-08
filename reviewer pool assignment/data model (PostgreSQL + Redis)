@@ -1,0 +1,28 @@
+-- migrations/0003_reviewer_assignment.sql
+
+CREATE TABLE reviewer_profiles (
+    reviewer_id      TEXT PRIMARY KEY,
+    seniority_level  INT NOT NULL DEFAULT 1, -- 1=Junior, 2=Standard, 3=Senior
+    quality_score    REAL NOT NULL DEFAULT 0.5, -- Rolling 30-day accuracy vs consensus
+    is_active        BOOLEAN NOT NULL DEFAULT true,
+    daily_review_limit INT NOT NULL DEFAULT 200
+);
+
+CREATE TABLE reviewer_skills (
+    reviewer_id      TEXT NOT NULL REFERENCES reviewer_profiles(reviewer_id),
+    job_type_id      TEXT NOT NULL,
+    proficiency      REAL NOT NULL DEFAULT 0.5, -- 0..1 scale
+    PRIMARY KEY (reviewer_id, job_type_id)
+);
+
+CREATE TABLE review_queue (
+    review_id        UUID PRIMARY KEY,
+    job_type_id      TEXT NOT NULL,
+    worker_id        TEXT NOT NULL,
+    is_appeal        BOOLEAN NOT NULL DEFAULT false,
+    difficulty_score REAL NOT NULL DEFAULT 0.5, -- Predicted difficulty 0..1
+    enqueued_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    assigned_at      TIMESTAMPTZ,
+    assigned_to      TEXT
+);
+CREATE INDEX ON review_queue (job_type_id, enqueued_at) WHERE assigned_at IS NULL;
