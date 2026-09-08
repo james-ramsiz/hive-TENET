@@ -1,0 +1,67 @@
+# tests/test_assignment.py
+import pytest
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from assignment.scorer import ReviewScorer
+from assignment.config import AssignmentConfig
+from assignment.domain import ReviewerProfile, QueuedReview, ReviewerState
+
+@pytest.fixture
+def cfg():
+    return AssignmentConfig()
+
+@pytest.fixture
+def scorer(cfg):
+    return ReviewScorer(cfg)
+
+@pytest.fixture
+def reviewer():
+    return ReviewerProfile(reviewer_id="rev1", seniority_level=2, quality_score=0.8, daily_review_limit=100)
+
+@pytest.fixture
+def old_review():
+    return QueuedReview(
+        review_id=uuid4(), job_type_id="jt1", worker_id="w1", is_appeal=False,
+        difficulty_score=0.5, enqueued_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+
+def test_score_filters_on_fatigue(scorer, reviewer, old_review):
+    state = ReviewerState(fatigue_count=99, worker_exposure_count=0) # 99/100 = 99% > 95% threshold
+    assert scorer.score(old_review, reviewer, state) == 0.0
+
+def test_score_filters_on_exposure(scorer, reviewer, old_review):
+    state = ReviewerState(fatigue_count=10, worker_exposure_count=5) # 5 is the hard limit
+    assert scorer.score(old_review, reviewer, state) == 0.0
+
+def test_score_filters_appeals_for_juniors(scorer, old_review):
+    junior = ReviewerProfile(reviewer_id="rev2", seniority_level=1, quality_score=0.5, daily_review_limit=100)
+    state = ReviewerState(fatigue_count=0, worker_exposure_count=0)
+    appeal_review = QueuedReview(**{**old_review.__dict__, "is_appeal": True})
+    assert scorer.score(appeal_review, junior, state) == 0.0
+
+def test_score_penalizes_difficulty_mismatch(scorer, reviewer, cfg):
+    state = ReviewerState(fatigue_count=0, worker_exposure_count=0)
+    easy_review = QueuedReview(
+        review_id=uuid4(), job_type_id="jt1", worker_id="w1", is_appeal=False,
+        difficulty_score=0.1, enqueued_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    hard_review = QueuedReview(
+        review_id=uuid4(), job_type_id="jt1", worker_id="w1", is_appeal=False,
+        difficulty_score=0.9, enqueued_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    
+    # Reviewer quality is 0.8. Hard review (0.9) is closer than easy (0.1).
+    # Therefore, hard review should score higher than easy.
+    score_hard = scorer.score(hard_review, reviewer, state)
+    score_easy = scorer.score(easy_review, reviewer, state)
+    assert score_hard > score_easy
+
+def test_score_prefers_fresh_worker_pairing(scorer, reviewer, old_review):
+    state_fresh = ReviewerState(fatigue_count=0, worker_exposure_count=0)
+    state_exposed = ReviewerState(fatigue_count=0, worker_exposure_count=2)
+    
+    score_fresh = scorer.score(old_review, reviewer, state_fresh)
+    score_exposed = scorer.score(old_review, reviewer, state_exposed)
+    
+    # Heavy penalty for seeing the same worker recently
+    assert score_fresh > score_exposed
