@@ -1,0 +1,88 @@
+# assignment/service.py
+from __future__ import annotations
+import asyncio
+import logging
+from typing import Sequence
+from uuid import UUID
+
+from .config import AssignmentConfig
+from .domain import ReviewerProfile, QueuedReview, ScoredReview, ReviewerState
+from .repo import AssignmentRepo
+from .state_cache import ReviewerStateCache
+from .scorer import ReviewScorer
+
+log = logging.getLogger(__name__)
+
+class AssignmentService:
+    """
+    Orchestrates the fetching, scoring, and assignment of reviews.
+    """
+    def __init__(self, repo: AssignmentRepo, cache: ReviewerStateCache, cfg: AssignmentConfig):
+        self._repo = repo
+        self._cache = cache
+        self._cfg = cfg
+        self._scorer = ReviewScorer(cfg)
+
+    async def get_batch_for_reviewer(self, reviewer_id: str, requested_count: int) -> list[ScoredReview]:
+        # 1. Fetch reviewer profile (contains seniority, daily limit, quality)
+        reviewer = await self._repo.get_profile(reviewer_id)
+        if not reviewer or not reviewer.is_active:
+            return []
+
+        # 2. Fetch a candidate batch from Postgres.
+        # We pull a larger batch than requested to give the scoring algorithm room
+        # to filter out biased/fatigued items.
+        candidates = await self._repo.fetch_candidates(
+            job_types=None, # Assume reviewer can handle any non-appeal unless filtered
+            limit=self._cfg.fetch_batch_size
+        )
+        if not candidates:
+            return []
+
+        # 3. Score candidates in parallel.
+        # State lookups are network calls to Redis, so we run them concurrently.
+        scored = await self._score_candidates(candidates, reviewer)
+        
+        # 4. Sort by score descending, take the top N
+        scored.sort(key=lambda x: x.score, reverse=True)
+        to_assign = scored[:requested_count]
+        
+        if not to_assign or to_assign[0].score == 0.0:
+            return [] # No suitable work available
+
+        # 5. Claim the reviews in Postgres (optimistic locking)
+        assign_ids = [r.review_id for r in to_assign]
+        success_ids = await self._repo.claim_reviews(reviewer_id, assign_ids)
+        
+        if len(success_ids) != len(assign_ids):
+            log.warning("Some reviews were claimed by another reviewer concurrently.")
+            to_assign = [r for r in to_assign if r.review_id in success_ids]
+            
+        # 6. Update Redis state (Fatigue + Exposure)
+        # We only update for successfully claimed reviews
+        if to_assign:
+            worker_ids = [c.worker_id for c in candidates if c.review_id in success_ids]
+            # Aggregate counts per worker to minimize Redis round trips
+            exp_counts = {wid: worker_ids.count(wid) for wid in set(worker_ids)}
+            for wid, count in exp_counts.items():
+                await self._cache.increment_assignment(reviewer_id, wid, count)
+            
+        return to_assign
+
+    async def _score_candidates(self, candidates: Sequence[QueuedReview], reviewer: ReviewerProfile) -> list[ScoredReview]:
+        tasks = []
+        for c in candidates:
+            tasks.append(self._score_one(c, reviewer))
+        return await asyncio.gather(*tasks)
+
+    async def _score_one(self, review: QueuedReview, reviewer: ReviewerProfile) -> ScoredReview:
+        fatigue, exposure = await self._cache.get_state(reviewer.reviewer_id, review.worker_id)
+        state = ReviewerState(fatigue_count=fatigue, worker_exposure_count=exposure)
+        score = self._scorer.score(review, reviewer, state)
+        
+        reason = "assigned" if score > 0 else "filtered"
+        return ScoredReview(
+            review_id=review.review_id,
+            score=score,
+            reason=reason
+        )
