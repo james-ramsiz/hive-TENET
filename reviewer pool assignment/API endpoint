@@ -1,0 +1,32 @@
+# api/assignment_handler.py
+from __future__ import annotations
+from fastapi import APIRouter, Request, HTTPException, Query
+from pydantic import BaseModel
+
+router = APIRouter(prefix="/v1/assignment")
+
+class AssignmentResp(BaseModel):
+    reviews: list[dict]
+
+@router.post("/request", response_model=AssignmentResp)
+async def request_review_batch(req: Request, count: int = Query(default=10, ge=1, le=50)):
+    """
+    Called by the Reviewer Interface when a reviewer hits 'Get Next Batch'.
+    """
+    # In a real system, reviewer_id comes from the JWT/session token
+    reviewer_id = req.headers.get("X-Reviewer-Id")
+    if not reviewer_id:
+        raise HTTPException(status_code=401, detail="Reviewer ID missing")
+        
+    service = req.app.state.assignment_service
+    assigned = await service.get_batch_for_reviewer(reviewer_id, count)
+    
+    return {
+        "reviews": [
+            {
+                "review_id": str(r.review_id),
+                "score": round(r.score, 2),
+                "status": r.reason
+            } for r in assigned
+        ]
+    }
