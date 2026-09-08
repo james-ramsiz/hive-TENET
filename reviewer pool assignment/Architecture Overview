@@ -1,0 +1,17 @@
+graph TD
+    R[Reviewer Requests Batch] --> API[Assignment API]
+    API --> Q[Fetch K Candidate Reviews from Queue]
+    Q --> S[State Cache / Redis]
+    
+    S --> F[Reviewer Fatigue State]
+    S --> B[Reviewer-Worker Exposure Matrix]
+    S --> P[Reviewer Skill & Seniority]
+    
+    Q --> A[Constrained Scorer]
+    P --> A
+    F --> A
+    B --> A
+    
+    A --> O[Select Top N by Score]
+    O --> L[Log Assignment & Update Redis]
+    L --> R
