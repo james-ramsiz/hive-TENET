@@ -1,0 +1,32 @@
+# assignment/state_cache.py
+from __future__ import annotations
+import redis.asyncio as redis
+from datetime import datetime, timezone
+
+class ReviewerStateCache:
+    """
+    Manages ephemeral state for the assignment algorithm to guarantee O(1) lookups
+    during the scoring phase and atomic increments upon assignment.
+    """
+    def __init__(self, client: redis.Redis):
+        self._r = client
+
+    async def get_state(self, reviewer_id: str, worker_id: str) -> tuple[int, int]:
+        # Returns (fatigue_count, exposure_count) in one round-trip via pipeline
+        pipe = self._r.pipeline()
+        pipe.get(f"reviewer:{reviewer_id}:fatigue")
+        pipe.get(f"reviewer:{reviewer_id}:exposure:{worker_id}")
+        results = await pipe.execute()
+        return int(results[0] or 0), int(results[1] or 0)
+
+    async def increment_assignment(self, reviewer_id: str, worker_id: str, review_count: int) -> None:
+        pipe = self._r.pipeline()
+        pipe.incrby(f"reviewer:{reviewer_id}:fatigue", review_count)
+        pipe.incrby(f"reviewer:{reviewer_id}:exposure:{worker_id}", review_count)
+        
+        # Set TTL on fatigue key to expire at end of day (simplified to 24h TTL here)
+        pipe.expire(f"reviewer:{reviewer_id}:fatigue", 86400)
+        # Set TTL on exposure key to 7 days
+        pipe.expire(f"reviewer:{reviewer_id}:exposure:{worker_id}", 604800)
+        
+        await pipe.execute()
