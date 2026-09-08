@@ -1,0 +1,47 @@
+# assignment/config.py
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class AssignmentConfig:
+    fetch_batch_size: int = 50              # How many candidates to pull from Postgres
+    assign_batch_size: int = 10             # How many reviews to give a reviewer at once
+    fatigue_threshold_pct: float = 0.95     # Zero score if fatigue > 95%
+    max_worker_exposure_7d: int = 5         # Max reviews a reviewer can do for 1 worker in 7 days
+    queue_age_lambda: float = 0.05          # Exponential decay factor for queue age
+    difficulty_match_weight: float = 0.3    # Weight for matching reviewer skill to difficulty
+    bias_penalty_weight: float = 2.0       # Heavy penalty for recent exposure
+    base_age_score: float = 100.0           # Max possible score for a perfectly aged, easy review
+
+# assignment/domain.py
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import datetime
+from uuid import UUID
+from typing import Optional
+
+@dataclass(frozen=True)
+class ReviewerProfile:
+    reviewer_id: str
+    seniority_level: int
+    quality_score: float
+    daily_review_limit: int
+
+@dataclass(frozen=True)
+class QueuedReview:
+    review_id: UUID
+    job_type_id: str
+    worker_id: str
+    is_appeal: bool
+    difficulty_score: float
+    enqueued_at: datetime
+
+@dataclass(frozen=True)
+class ReviewerState:
+    fatigue_count: int
+    worker_exposure_count: int  # Specific to the candidate review's worker_id
+
+@dataclass(frozen=True)
+class ScoredReview:
+    review_id: UUID
+    score: float
+    reason: str  # e.g., "assigned", "filtered:fatigue", "filtered:exposure"
