@@ -1,0 +1,11 @@
+.
+├── assignment/
+│   ├── __init__.py
+│   ├── config.py               # Tunable thresholds for constraints
+│   ├── domain.py               # Typed dataclasses
+│   ├── state_cache.py          # Redis interface for fatigue and bias
+│   ├── scorer.py               # The core mathematical scoring function
+│   ├── repo.py                 # Postgres fetching for candidate reviews & profiles
+│   └── service.py              # Orchestrator tying it all together
+├── api/
+│   └── assignment_handler.py   # FastAPI endpoint
