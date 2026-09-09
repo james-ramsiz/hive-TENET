@@ -1,0 +1,124 @@
+<div>
+  <div style="display:flex; align-items:center; gap:12px; margin:0 0 1rem;">
+    <input type="file" id="fileInput" accept="image/*" />
+    <span>Upload a photo to preview</span>
+  </div>
+
+  <div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:1.5rem;">
+    <div>
+      <label>Grain amount</label>
+      <input type="range" id="grain" min="0" max="100" value="40" step="1" />
+    </div>
+    <div>
+      <label>Vignette</label>
+      <input type="range" id="vignette" min="0" max="100" value="55" step="1" />
+    </div>
+    <div>
+      <label>Zoom speed</label>
+      <input type="range" id="zoom" min="0" max="100" value="30" step="1" />
+    </div>
+  </div>
+
+  <div style="position:relative; width:280px; height:420px; margin:0 auto; overflow:hidden; border-radius:12px; background:#222;">
+    <canvas id="base" width="280" height="420" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+    <canvas id="grainCanvas" width="280" height="420" style="position:absolute; top:0; left:0; width:100%; height:100%; mix-blend-mode:overlay; opacity:0.5;"></canvas>
+    <div id="vignetteLayer" style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; box-shadow: inset 0 0 90px 40px rgba(0,0,0,0.55);"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const fileInput = document.getElementById('fileInput');
+  const base = document.getElementById('base');
+  const grainCanvas = document.getElementById('grainCanvas');
+  const vignetteLayer = document.getElementById('vignetteLayer');
+  const grainSlider = document.getElementById('grain');
+  const vignetteSlider = document.getElementById('vignette');
+  const zoomSlider = document.getElementById('zoom');
+  const bctx = base.getContext('2d');
+  const gctx = grainCanvas.getContext('2d');
+  let img = null;
+  let scale = 1;
+  let dir = 1;
+
+  function drawPlaceholder(){
+    bctx.fillStyle = '#3a3a3a';
+    bctx.fillRect(0,0,base.width,base.height);
+    bctx.fillStyle = '#888';
+    bctx.font = '13px sans-serif';
+    bctx.textAlign = 'center';
+    bctx.fillText('Upload a photo above', base.width/2, base.height/2);
+  }
+  drawPlaceholder();
+
+  // Load the chosen file into an Image object
+  fileInput.addEventListener('change', function(e){
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = function(ev){
+      img = new Image();
+      img.onload = function(){ scale = 1; };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  // Draw the photo, grayscale + slight contrast boost, at current zoom level
+  function drawBase(){
+    bctx.clearRect(0,0,base.width,base.height);
+    if(!img){ drawPlaceholder(); return; }
+
+    const zoomAmt = 1 + (scale - 1);
+    const w = base.width * zoomAmt;
+    const h = base.height * zoomAmt;
+    const x = (base.width - w) / 2;
+    const y = (base.height - h) / 2;
+
+    bctx.filter = 'grayscale(1) contrast(1.05) brightness(0.95)';
+
+    // cover-fit math so the image fills the frame without distortion
+    const imgRatio = img.width / img.height;
+    const canvasRatio = base.width / base.height;
+    let dw, dh;
+    if(imgRatio > canvasRatio){ dh = h; dw = h * imgRatio; }
+    else { dw = w; dh = w / imgRatio; }
+
+    bctx.drawImage(img, x + (w-dw)/2, y + (h-dh)/2, dw, dh);
+    bctx.filter = 'none';
+  }
+
+  // Generate a fresh random noise frame every tick — this is the "grain"
+  function drawGrain(){
+    const amt = parseInt(grainSlider.value, 10) / 100;
+    const imgData = gctx.createImageData(grainCanvas.width, grainCanvas.height);
+    const buf = imgData.data;
+    for(let i=0; i<buf.length; i+=4){
+      const v = Math.random()*255;
+      buf[i] = v; buf[i+1] = v; buf[i+2] = v;
+      buf[i+3] = amt * 255; // alpha controls grain intensity
+    }
+    gctx.putImageData(imgData, 0, 0);
+  }
+
+  // Vignette is just a CSS inset box-shadow, driven by the slider
+  function updateVignette(){
+    const amt = parseInt(vignetteSlider.value, 10);
+    vignetteLayer.style.boxShadow =
+      'inset 0 0 ' + (amt*1.4) + 'px ' + (amt*0.6) + 'px rgba(0,0,0,' + (amt/130) + ')';
+  }
+  vignetteSlider.addEventListener('input', updateVignette);
+  updateVignette();
+
+  // Animation loop: bounce the zoom back and forth slowly (Ken Burns), redraw grain each frame
+  function tick(){
+    const speed = parseInt(zoomSlider.value, 10) / 100;
+    scale += dir * speed * 0.0015;
+    if(scale > 1.12){ dir = -1; }
+    if(scale < 1.0){ dir = 1; scale = 1.0; }
+    drawBase();
+    drawGrain();
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
