@@ -1,0 +1,31 @@
+-- migrations/0004_appeals.sql
+
+CREATE TYPE review_state AS ENUM (
+    'PENDING',           -- In queue for first review
+    'IN_REVIEW',         -- Reviewer is looking at it
+    'ACCEPTED',          -- Reviewer accepted (Terminal for non-appeals)
+    'REJECTED',          -- Reviewer rejected
+    'APPEAL_WINDOW',     -- Rejected, waiting to see if worker appeals
+    'APPEALED',          -- Worker filed an appeal
+    'APPEAL_REVIEW',     -- Senior reviewer is looking at the appeal
+    'OVERTURNED',        -- Appeal successful -> becomes Accepted (Terminal)
+    'UPHELD'             -- Appeal failed -> stays Rejected (Terminal)
+);
+
+-- We alter the existing review_queue table to track the state machine
+ALTER TABLE review_queue ADD COLUMN state review_state NOT NULL DEFAULT 'PENDING';
+ALTER TABLE review_queue ADD COLUMN original_reviewer_id TEXT;
+ALTER TABLE review_queue ADD COLUMN appeal_reason TEXT;
+ALTER TABLE review_queue ADD COLUMN appeal_deadline TIMESTAMPTZ;
+
+-- Audit trail for every state transition
+CREATE TABLE review_state_transitions (
+    id              BIGSERIAL PRIMARY KEY,
+    review_id       UUID NOT NULL,
+    from_state      review_state NOT NULL,
+    to_state        review_state NOT NULL,
+    actor_id        TEXT NOT NULL,    -- worker_id or reviewer_id
+    reason          TEXT,
+    occurred_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ON review_state_transitions (review_id, occurred_at);
