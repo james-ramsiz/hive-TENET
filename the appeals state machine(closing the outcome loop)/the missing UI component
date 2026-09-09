@@ -1,0 +1,9 @@
+# domain/review.py
+@dataclass(frozen=True)
+class ReviewContext:
+    review_id: UUID
+    phase: int            # 1 or 2
+    prior_reviewer_label: Optional[str]  # If phase 2, what did phase 1 say?
+    prior_reviewer_notes: Optional[str]
+    is_appeal: bool       # If true, this is phase 3 (appeal review)
+    appeal_reason: Optional[str]
