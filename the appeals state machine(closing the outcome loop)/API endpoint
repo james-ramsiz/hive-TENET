@@ -1,0 +1,21 @@
+# api/appeal_handler.py
+from fastapi import APIRouter, Request, HTTPException
+from pydantic import BaseModel
+from uuid import UUID
+
+router = APIRouter(prefix="/v1/appeals")
+
+class AppealReq(BaseModel):
+    review_id: UUID
+    worker_id: str
+    reason: str
+
+@router.post("/file", status_code=202)
+async def file_appeal(req: Request, body: AppealReq):
+    sm = req.app.state.appeals_sm
+    # Verify the worker actually owns this rejected review
+    # ...
+    success = await sm.transition(body.review_id, body.worker_id, "APPEALED", body.reason)
+    if not success:
+        raise HTTPException(status_code=409, detail="Review is not in an appealable state")
+    return {"status": "appeal_filed"}
