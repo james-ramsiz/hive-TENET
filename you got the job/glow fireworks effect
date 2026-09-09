@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fireworks & Sparkles</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000000; /* Pure black makes the glow pop */
+            cursor: crosshair;
+        }
+        canvas {
+            display: block;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+            pointer-events: none; 
+        }
+        .hint {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ffffff;
+            font-family: 'Segoe UI', sans-serif;
+            font-size: 24px;
+            text-align: center;
+            pointer-events: none;
+            opacity: 0.4;
+            z-index: 2;
+            letter-spacing: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div class="hint">Click to launch</div>
+    <canvas id="fireworksCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('fireworksCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // Bright, neon colors for fireworks
+        const colors = ['#FF4B6E', '#FFD93D', '#6BCB77', '#4D96FF', '#9D4EDD', '#FF9F1C', '#00E5FF', '#FFFFFF'];
+        
+        let particles = [];
+
+        // 1. Main Firework Particle Class
+        class FireworkParticle {
+            constructor(x, y, color) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                
+                // Random radial burst
+                const angle = Math.random() * Math.PI * 2;
+                const speed = Math.random() * 8 + 3; // Fast outward burst
+                
+                this.vx = Math.cos(angle) * speed;
+                this.vy = Math.sin(angle) * speed;
+
+                // Physics
+                this.gravity = 0.08; // Gentle gravity
+                this.friction = 0.96; // Slows down to look like an explosion
+                
+                // Visuals
+                this.size = Math.random() * 3 + 2;
+                this.opacity = 1;
+                this.decay = Math.random() * 0.015 + 0.008; // Fade out speed
+            }
+
+            update() {
+                this.vy += this.gravity;
+                this.vx *= this.friction;
+                this.vy *= this.friction;
+
+                this.x += this.vx;
+                this.y += this.vy;
+
+                this.opacity -= this.decay;
+            }
+
+            draw() {
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, this.opacity);
+                ctx.fillStyle = this.color;
+                
+                // The magic glow
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = this.color;
+                
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+        }
+
+        // 2. Sparkle Particle Class (Smaller, faster, shorter lifespan)
+        class SparkleParticle {
+            constructor(x, y, color) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                
+                const angle = Math.random() * Math.PI * 2;
+                const speed = Math.random() * 12 + 4; // Sparkles fly out faster
+                
+                this.vx = Math.cos(angle) * speed;
+                this.vy = Math.sin(angle) * speed;
+
+                this.gravity = 0.05;
+                this.friction = 0.92; // Slows down very quickly
+                
+                this.size = Math.random() * 1.5 + 0.5; // Tiny size
+                this.opacity = 1;
+                this.decay = Math.random() * 0.04 + 0.03; // Dies out fast
+                
+                // Twinkling effect
+                this.twinkleSpeed = Math.random() * 0.2 + 0.1;
+                this.twinkle = Math.random();
+            }
+
+            update() {
+                this.vy += this.gravity;
+                this.vx *= this.friction;
+                this.vy *= this.friction;
+
+                this.x += this.vx;
+                this.y += this.vy;
+
+                this.opacity -= this.decay;
+                this.twinkle += this.twinkleSpeed; // Update twinkle phase
+            }
+
+            draw() {
+                // Twinkle calculation (makes opacity flicker)
+                const flicker = Math.abs(Math.sin(this.twinkle));
+                const currentOpacity = Math.max(0, this.opacity * flicker);
+                
+                ctx.save();
+                ctx.globalAlpha = currentOpacity;
+                ctx.fillStyle = this.color;
+                
+                // Sharper glow for sparkles
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = this.color;
+                
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+        }
+
+        // Function to trigger the firework
+        function createFirework(x, y) {
+            // Pick one color for the whole firework to look like a real explosion
+            const fireworkColor = colors[Math.floor(Math.random() * colors.length)]; 
+            
+            // Spawn main particles
+            const mainCount = 60;
+            for (let i = 0; i < mainCount; i++) {
+                particles.push(new FireworkParticle(x, y, fireworkColor));
+            }
+
+            // Spawn sparkles
+            const sparkleCount = 40;
+            for (let i = 0; i < sparkleCount; i++) {
+                particles.push(new SparkleParticle(x, y, fireworkColor));
+            }
+        }
+
+        // Animation Loop
+        function animate() {
+            // TRAIL EFFECT: Instead of clearing the canvas, we draw a slightly transparent black box.
+            // This leaves a fading "smoke trail" behind the moving particles.
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Update and draw particles backwards for safe array removal
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.update();
+                p.draw();
+
+                // Remove particle if it's dead
+                if (p.opacity <= 0) {
+                    particles.splice(i, 1);
+                }
+            }
+
+            requestAnimationFrame(animate);
+        }
+
+        // Event Listeners
+        window.addEventListener('click', (e) => {
+            createFirework(e.clientX, e.clientY);
+        });
+
+        window.addEventListener('touchstart', (e) => {
+            e.preventDefault(); 
+            for (let i = 0; i < e.touches.length; i++) {
+                createFirework(e.touches[i].clientX, e.touches[i].clientY);
+            }
+        }, { passive: false });
+
+        // Start loop
+        animate();
+
+        // Auto-launch a few fireworks on load so the user sees it immediately
+        setTimeout(() => { createFirework(window.innerWidth * 0.3, window.innerHeight * 0.4); }, 300);
+        setTimeout(() => { createFirework(window.innerWidth * 0.7, window.innerHeight * 0.5); }, 600);
+        setTimeout(() => { createFirework(window.innerWidth * 0.5, window.innerHeight * 0.3); }, 900);
+
+    </script>
+</body>
+</html>
