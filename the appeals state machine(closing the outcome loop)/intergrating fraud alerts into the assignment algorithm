@@ -1,0 +1,16 @@
+# assignment/service.py (Additions to 4C)
+
+async def get_batch_for_reviewer(self, reviewer_id: str, requested_count: int):
+    # ... fetch candidates ...
+    
+    # NEW: Check fraud blocks
+    blocked_workers = await self._repo.get_fraud_blocked_workers(reviewer_id)
+    if blocked_workers:
+        candidates = [c for c in candidates if c.worker_id not in blocked_workers]
+        log.info("Filtered %d candidates due to fraud blocks for reviewer %s", 
+                 len(candidates), reviewer_id)
+                 
+    if not candidates:
+        return []
+        
+    # ... continue with scoring ...
