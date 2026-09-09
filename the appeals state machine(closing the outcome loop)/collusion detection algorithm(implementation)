@@ -1,0 +1,100 @@
+# fraud/collusion_detector.py
+from __future__ import annotations
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Optional
+import duckdb
+import networkx as nx
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class FraudAlert:
+    reviewer_id: str
+    worker_id: str
+    acceptance_rate: float
+    baseline_rate: float
+    edge_count: int
+    risk_score: float
+
+class CollusionDetector:
+    """
+    Runs nightly to analyze the bipartite graph of reviewers and workers.
+    """
+    def __init__(self, dsn: str, min_interactions: int = 3, anomaly_threshold: float = 0.30):
+        self._dsn = dsn
+        self._min_inter = min_interactions
+        self._threshold = anomaly_threshold
+
+    async def run_analysis(self) -> list[FraudAlert]:
+        # In production, this queries the data warehouse (Snowflake/BigQuery)
+        # or reads Parquet files from S3. Here we query the operational DB.
+        def _analyze():
+            conn = duckdb.connect()
+            # Register postgres as a view
+            conn.execute(f"ATTACH '{self._dsn}' AS db (TYPE postgres, READ_ONLY)")
+            
+            # 1. Get global baseline
+            baseline = conn.execute("""
+                SELECT 
+                    avg(CASE WHEN state = 'ACCEPTED' OR state = 'OVERTURNED' THEN 1.0 ELSE 0.0 END) 
+                FROM db.review_queue
+                WHERE state IN ('ACCEPTED', 'OVERTURNED', 'UPHELD')
+            """).fetchone()[0]
+            
+            # 2. Get edge weights (Reviewer -> Worker acceptance rates)
+            edges = conn.execute(f"""
+                SELECT 
+                    assigned_to as reviewer_id,
+                    worker_id,
+                    count(*) as interactions,
+                    avg(CASE WHEN state = 'ACCEPTED' OR state = 'OVERTURNED' THEN 1.0 ELSE 0.0 END) as acc_rate
+                FROM db.review_queue
+                WHERE assigned_to IS NOT NULL
+                GROUP BY 1, 2
+                HAVING count(*) >= {self._min_inter}
+            """).fetchall()
+            
+            conn.close()
+            
+            if not edges:
+                return []
+                
+            # 3. Build Graph
+            G = nx.Graph()
+            alerts = []
+            
+            for reviewer, worker, interactions, acc_rate in edges:
+                G.add_node(reviewer, type='reviewer')
+                G.add_node(worker, type='worker')
+                
+                # Risk score: how far above baseline is this pairing?
+                delta = acc_rate - baseline
+                if delta > self._threshold:
+                    risk = (acc_rate - baseline) * interactions # weight by volume
+                    alerts.append(FraudAlert(
+                        reviewer_id=reviewer,
+                        worker_id=worker,
+                        acceptance_rate=acc_rate,
+                        baseline_rate=baseline,
+                        edge_count=interactions,
+                        risk_score=risk
+                    ))
+                    G.add_edge(reviewer, worker, weight=delta, fraud=True)
+                else:
+                    G.add_edge(reviewer, worker, weight=delta, fraud=False)
+                    
+            # 4. Find cliques of fraud
+            # If Reviewer A approves Worker 1, 2, 3... and Reviewer B also approves 1, 2, 3...
+            # They are likely the same fraud ring.
+            fraud_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('fraud')]
+            fraud_subgraph = G.edge_subgraph(fraud_edges).copy()
+            
+            # Find connected components (rings)
+            rings = list(nx.connected_components(fraud_subgraph))
+            log.warning(f"Detected {len(rings)} potential collusion rings.")
+            
+            return alerts
+            
+        return await asyncio.to_thread(_analyze)
