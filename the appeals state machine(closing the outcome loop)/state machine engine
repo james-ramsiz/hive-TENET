@@ -1,0 +1,76 @@
+# appeals/state_machine.py
+from __future__ import annotations
+import logging
+from typing import Callable, Awaitable
+from uuid import UUID
+from datetime import datetime, timezone, timedelta
+
+from .repo import AppealRepo
+
+log = logging.getLogger(__name__)
+
+# Define valid transitions: (from_state -> [allowed_next_states])
+VALID_TRANSITIONS = {
+    'PENDING': ['IN_REVIEW'],
+    'IN_REVIEW': ['ACCEPTED', 'REJECTED'],
+    'REJECTED': ['APPEAL_WINDOW'],
+    'APPEAL_WINDOW': ['APPEALED', 'ACCEPTED'], # Can auto-accept if deadline passes
+    'APPEALED': ['APPEAL_REVIEW'],
+    'APPEAL_REVIEW': ['OVERTURNED', 'UPHELD'],
+    'OVERTURNED': [],
+    'UPHELD': [],
+    'ACCEPTED': []
+}
+
+class AppealsStateMachine:
+    """
+    Enforces valid lifecycle transitions and logs the audit trail.
+    """
+    def __init__(self, repo: AppealRepo):
+        self._repo = repo
+
+    async def transition(
+        self, 
+        review_id: UUID, 
+        actor_id: str, 
+        to_state: str, 
+        reason: str = None
+    ) -> bool:
+        current_state = await self._repo.get_state(review_id)
+        
+        if to_state not in VALID_TRANSITIONS.get(current_state, []):
+            log.error("Invalid transition: %s -> %s for review %s", current_state, to_state, review_id)
+            return False
+            
+        async with self._repo.pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Update the review state
+                await conn.execute(
+                    "UPDATE review_queue SET state = $2 WHERE review_id = $1",
+                    review_id, to_state
+                )
+                
+                # 2. Insert audit log
+                await conn.execute(
+                    """
+                    INSERT INTO review_state_transitions (review_id, from_state, to_state, actor_id, reason)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    review_id, current_state, to_state, actor_id, reason
+                )
+                
+                # 3. Handle side effects of specific transitions
+                if to_state == 'REJECTED':
+                    # Set the appeal deadline (e.g., 72 hours)
+                    await conn.execute(
+                        "UPDATE review_queue SET appeal_deadline = now() + interval '72 hours' WHERE review_id = $1",
+                        review_id
+                    )
+                elif to_state == 'OVERTURNED':
+                    # If overturned, the original reviewer's quality score must be penalized
+                    # in the observability pipeline (4B) and Redis state (4C).
+                    # We emit a Kafka event for this.
+                    await self._repo.emit_overturn_event(review_id)
+                    
+        log.info("Transitioned review %s to %s", review_id, to_state)
+        return True
