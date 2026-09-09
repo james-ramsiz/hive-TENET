@@ -1,0 +1,24 @@
+# api/assignment_handler.py (Updated from 4C)
+from experiments.config import ExperimentRouter
+
+@router.post("/v1/assignment/request")
+async def request_review_batch(req: Request, count: int = 10):
+    reviewer_id = req.headers.get("X-Reviewer-Id")
+    router = req.app.state.experiment_router
+    legacy_service = req.app.state.legacy_assignment_service
+    new_service = req.app.state.assignment_service # The 4C service
+    
+    variant = router.get_variant("exp_reviewer_assignment_v2", reviewer_id)
+    
+    if variant and variant.implementation == "4c_constrained_scorer":
+        assigned = await new_service.get_batch_for_reviewer(reviewer_id, count)
+        variant_name = variant.name
+    else:
+        assigned = await legacy_service.get_batch_fifo(reviewer_id, count)
+        variant_name = "control"
+        
+    return {
+        "experiment": "exp_reviewer_assignment_v2",
+        "variant": variant_name,
+        "reviews": [r.dict() for r in assigned]
+    }
