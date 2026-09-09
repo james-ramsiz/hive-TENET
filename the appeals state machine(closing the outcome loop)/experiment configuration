@@ -1,0 +1,39 @@
+# experiments/config.py
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    weight: int       # e.g., 50 for 50% traffic
+    implementation: str  # e.g., "legacy_fifo", "4c_constrained_scorer"
+
+@dataclass(frozen=True)
+class Experiment:
+    id: str               # e.g., "exp_reviewer_assignment_v2"
+    variants: list[Variant]
+    is_active: bool = True
+
+class ExperimentRouter:
+    """
+    Deterministically assigns an entity (reviewer, worker) to a variant.
+    """
+    def __init__(self, experiments: dict[str, Experiment]):
+        self._experiments = experiments
+
+    def get_variant(self, experiment_id: str, entity_id: str) -> Optional[Variant]:
+        exp = self._experiments.get(experiment_id)
+        if not exp or not exp.is_active:
+            return None
+            
+        # Hash the entity_id to get a stable 0-99 bucket
+        import hashlib
+        h = int(hashlib.md5(entity_id.encode()).hexdigest(), 16) % 100
+        
+        # Walk the weighted variants
+        cumulative = 0
+        for v in exp.variants:
+            cumulative += v.weight
+            if h < cumulative:
+                return v
+        return exp.variants[-1] # Fallback
