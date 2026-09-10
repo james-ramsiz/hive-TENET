@@ -1,0 +1,89 @@
+-- migrations/0001_phase1_foundation.sql
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ==========================================
+-- 1. ENUMS & CORE TABLES
+-- ==========================================
+
+CREATE TYPE review_state AS ENUM (
+    'PENDING',           -- Awaiting first review
+    'IN_REVIEW',         -- Claimed by a reviewer
+    'ACCEPTED',          -- Accepted by reviewer (Terminal for non-appeals)
+    'REJECTED',          -- Rejected by reviewer
+    'APPEAL_WINDOW',     -- Rejected, waiting to see if worker appeals (72h)
+    'APPEALED',          -- Worker filed an appeal
+    'APPEAL_REVIEW',     -- Senior reviewer is looking at the appeal
+    'OVERTURNED',        -- Appeal successful -> becomes Accepted (Terminal)
+    'UPHELD'             -- Appeal failed -> stays Rejected (Terminal)
+);
+
+CREATE TABLE reviewer_profiles (
+    reviewer_id      TEXT PRIMARY KEY,
+    seniority_level  INT NOT NULL DEFAULT 1, -- 1=Junior, 2=Standard, 3=Senior
+    is_active        BOOLEAN NOT NULL DEFAULT true,
+    daily_review_limit INT NOT NULL DEFAULT 200
+);
+
+-- The main queue table. In later phases, we add ML model scores and difficulty.
+CREATE TABLE review_queue (
+    review_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_type_id      TEXT NOT NULL,
+    worker_id        TEXT NOT NULL,
+    
+    -- PII boundaries
+    raw_payload_enc  BYTEA NOT NULL,          -- Encrypted raw submission (AES-GCM)
+    scrubbed_payload JSONB NOT NULL,          -- PII stripped, safe for DB queries/indexes
+    display_payload  JSONB NOT NULL,          -- Lightly redacted (pseudonyms) for reviewer UI
+    
+    -- Lifecycle
+    state            review_state NOT NULL DEFAULT 'PENDING',
+    enqueued_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    assigned_to      TEXT REFERENCES reviewer_profiles(reviewer_id),
+    assigned_at      TIMESTAMPTZ,
+    appeal_deadline  TIMESTAMPTZ,
+    appeal_reason    TEXT
+);
+
+CREATE INDEX idx_queue_pending ON review_queue (job_type_id, enqueued_at) 
+    WHERE state = 'PENDING';
+
+CREATE INDEX idx_queue_appeal ON review_queue (job_type_id, enqueued_at) 
+    WHERE state = 'APPEAL_REVIEW';
+
+-- ==========================================
+-- 2. STATE MACHINE AUDIT LOG
+-- ==========================================
+
+CREATE TABLE review_state_transitions (
+    id              BIGSERIAL PRIMARY KEY,
+    review_id       UUID NOT NULL REFERENCES review_queue(review_id),
+    from_state      review_state NOT NULL,
+    to_state        review_state NOT NULL,
+    actor_id        TEXT NOT NULL,    -- worker_id or reviewer_id
+    reason          TEXT,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_transitions_review ON review_state_transitions (review_id, occurred_at);
+
+-- ==========================================
+-- 3. BEHAVIORAL EVENTS (Partitioned for Scale)
+-- ==========================================
+
+CREATE TABLE behavioral_events (
+    event_id            UUID NOT NULL DEFAULT gen_random_uuid(),
+    event_type          TEXT NOT NULL, 
+    occurred_at         TIMESTAMPTZ NOT NULL,
+    job_type_id         TEXT,
+    worker_id           TEXT,
+    reviewer_id         TEXT,
+    payload             JSONB,
+    PRIMARY KEY (event_id, occurred_at)
+) PARTITION BY RANGE (occurred_at);
+
+-- Create default partitions (TimescaleDB will manage these dynamically if enabled)
+CREATE TABLE behavioral_events_y2024m10 PARTITION OF behavioral_events
+    FOR VALUES FROM ('2024-10-01') TO ('2024-11-01');
+CREATE TABLE behavioral_events_y2024m11 PARTITION OF behavioral_events
+    FOR VALUES FROM ('2024-11-01') TO ('2024-12-01');
+CREATE TABLE behavioral_events_default PARTITION OF behavioral_events DEFAULT;
