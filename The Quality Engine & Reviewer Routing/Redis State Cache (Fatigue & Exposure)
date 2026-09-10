@@ -1,0 +1,36 @@
+# phase2/state_cache.py
+from __future__ import annotations
+import redis.asyncio as redis
+
+class ReviewerStateCache:
+    """
+    Manages ephemeral state for the assignment algorithm to guarantee O(1) lookups.
+    """
+    def __init__(self, client: redis.Redis):
+        self._r = client
+
+    async def get_states(self, reviewer_id: str, worker_ids: list[str]) -> dict[str, 'ReviewerState']:
+        """
+        Fetches fatigue and exposure for multiple candidate workers in a single pipeline.
+        """
+        pipe = self._r.pipeline()
+        for wid in worker_ids:
+            pipe.get(f"reviewer:{reviewer_id}:fatigue")
+            pipe.get(f"reviewer:{reviewer_id}:exposure:{wid}")
+        
+        results = await pipe.execute()
+        
+        states = {}
+        for i, wid in enumerate(worker_ids):
+            fatigue = int(results[i*2] or 0)
+            exposure = int(results[i*2 + 1] or 0)
+            states[wid] = ReviewerState(fatigue_count=fatigue, worker_exposure_count=exposure)
+        return states
+
+    async def increment_assignment(self, reviewer_id: str, worker_id: str, review_count: int) -> None:
+        pipe = self._r.pipeline()
+        pipe.incrby(f"reviewer:{reviewer_id}:fatigue", review_count)
+        pipe.incrby(f"reviewer:{reviewer_id}:exposure:{worker_id}", review_count)
+        pipe.expire(f"reviewer:{reviewer_id}:fatigue", 86400)     # 24h TTL
+        pipe.expire(f"reviewer:{reviewer_id}:exposure:{worker_id}", 604800) # 7d TTL
+        await pipe.execute()
