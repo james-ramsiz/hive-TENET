@@ -1,0 +1,72 @@
+# tests/test_phase1.py
+import pytest
+import asyncio
+import asyncpg
+from uuid import uuid4
+from phase1.state_machine import AppealsStateMachine, ReviewState
+
+@pytest.mark.asyncio
+async def test_concurrency_no_duplicate_assignment(test_db_pool):
+    """
+    Simulates 100 reviewers requesting work at the exact same millisecond.
+    Guarantees no two reviewers get the same review_id.
+    """
+    # 1. Seed 100 items in the queue
+    async with test_db_pool.acquire() as conn:
+        for _ in range(100):
+            await conn.execute("INSERT INTO review_queue (job_type_id, worker_id, raw_payload_enc, scrubbed_payload, display_payload) VALUES ('jt1', 'w1', '\\x00', '{}', '{}')")
+            
+    # 2. Spawn 100 concurrent requests
+    assigner = BasicAssignmentService(test_db_pool)
+    tasks = [assigner.get_batch_for_reviewer(f"rev_{i}", batch_size=1) for i in range(100)]
+    results = await asyncio.gather(*tasks)
+    
+    # 3. Assert no duplicates
+    assigned_ids = [r[0].review_id for r in results if r]
+    assert len(assigned_ids) == len(set(assigned_ids)), "Duplicate assignment detected!"
+
+@pytest.mark.asyncio
+async def test_appeal_lifecycle(test_db_pool):
+    sm = AppealsStateMachine(test_db_pool)
+    review_id = uuid4()
+    
+    # Seed a PENDING review
+    async with test_db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO review_queue (review_id, job_type_id, worker_id, state) VALUES ($1, 'jt1', 'w1', 'PENDING')", review_id)
+        
+    # 1. Junior reviewer claims it
+    assert await sm.transition(review_id, "rev1", ReviewState.IN_REVIEW)
+    # 2. Reviewer rejects it
+    assert await sm.transition(review_id, "rev1", ReviewState.REJECTED)
+    # 3. Verify appeal deadline was set
+    async with test_db_pool.acquire() as conn:
+        deadline = await conn.fetchval("SELECT appeal_deadline FROM review_queue WHERE review_id = $1", review_id)
+        assert deadline is not None
+    # 4. Worker appeals
+    assert await sm.transition(review_id, "w1", ReviewState.APPEALED, "I did it right")
+    # 5. Senior reviewer overturns
+    assert await sm.transition(review_id, "rev2", ReviewState.OVERTURNED)
+    
+    # Verify terminal state
+    async with test_db_pool.acquire() as conn:
+        state = await conn.fetchval("SELECT state FROM review_queue WHERE review_id = $1", review_id)
+        assert state == ReviewState.OVERTURNED.value
+
+@pytest.mark.asyncio
+async def test_junior_cannot_see_appeals(test_db_pool):
+    assigner = BasicAssignmentService(test_db_pool)
+    
+    # Seed an APPEAL_REVIEW item
+    async with test_db_pool.acquire() as conn:
+        rid = uuid4()
+        await conn.execute("INSERT INTO review_queue (review_id, job_type_id, worker_id, state) VALUES ($1, 'jt1', 'w1', 'APPEAL_REVIEW')", rid)
+        
+    # Junior reviewer requests work
+    batch = await assigner.get_batch_for_reviewer("junior_rev", 10)
+    
+    # They should not see the appeal
+    assert len(batch) == 0
+    
+    # Senior reviewer requests work
+    batch = await assigner.get_batch_for_reviewer("senior_rev", 10)
+    assert len(batch) == 1
