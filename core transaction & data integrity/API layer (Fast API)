@@ -1,0 +1,109 @@
+# phase1/api.py
+from __future__ import annotations
+import json
+import logging
+from fastapi import FastAPI, Request, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional
+from uuid import UUID
+import asyncpg
+import cryptography.fernet # For AES encryption
+
+from .config import Config
+from .pii_scrubber import TextScrubber
+from .state_machine import AppealsStateMachine
+from .assignment_service import BasicAssignmentService
+
+log = logging.getLogger(__name__)
+app = FastAPI(title="Phase 1 - Core Transaction")
+config = Config()
+
+# In production, use a proper KMS-managed key. Here we use a dummy Fernet key.
+from cryptography.fernet import Fernet
+fernet = Fernet(Fernet.generate_key()) # DEV ONLY
+
+@app.on_event("startup")
+async def startup():
+    app.state.pool = await asyncpg.create_pool(config.db_dsn, min_size=5, max_size=20)
+    app.state.scrubber = TextScrubber(config.pii_hmac_key)
+    app.state.sm = AppealsStateMachine(app.state.pool, config.appeal_window_hours)
+    app.state.assigner = BasicAssignmentService(app.state.pool)
+
+@app.on_event("shutdown")
+async def shutdown():
+    await app.state.pool.close()
+
+# --- MODELS ---
+class IngestReq(BaseModel):
+    job_type_id: str
+    worker_id: str
+    payload: dict
+
+class ReviewActionReq(BaseModel):
+    is_accepted: bool
+    reason: Optional[str] = ""
+
+class AppealReq(BaseModel):
+    worker_id: str
+    reason: str
+
+# --- INGESTION (PII BOUNDARY) ---
+@app.post("/v1/ingest", status_code=201)
+async def ingest_work(req: Request, body: IngestReq):
+    scrubber = req.app.state.scrubber
+    pool = req.app.state.pool
+    
+    # 1. Scrub PII
+    scrub_result = scrubber.scrub_payload(body.payload)
+    
+    # 2. Encrypt raw payload for audit/legal hold (never queried by ML)
+    raw_encrypted = fernet.encrypt(json.dumps(body.payload).encode('utf-8'))
+    
+    # 3. Insert into queue
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO review_queue 
+            (job_type_id, worker_id, raw_payload_enc, scrubbed_payload, display_payload, state)
+            VALUES ($1, $2, $3, $4, $5, 'PENDING')
+            """,
+            body.job_type_id, body.worker_id, raw_encrypted,
+            json.dumps(scrub_result.scrubbed_payload),
+            json.dumps(scrub_result.display_payload)
+        )
+    return {"status": "queued"}
+
+# --- REVIEWER ASSIGNMENT ---
+@app.get("/v1/assignment/request")
+async def request_batch(req: Request, x_reviewer_id: str = Header(...), count: int = 10):
+    assigner = req.app.state.assigner
+    batch = await assigner.get_batch_for_reviewer(x_reviewer_id, count)
+    return {
+        "batch": [
+            {
+                "review_id": str(r.review_id),
+                "job_type_id": r.job_type_id,
+                "is_appeal": r.is_appeal,
+                "appeal_reason": r.appeal_reason,
+                "display_payload": r.display_payload
+            } for r in batch
+        ]
+    }
+
+# --- REVIEW ACTIONS (STATE MACHINE) ---
+@app.post("/v1/review/{review_id}/submit")
+async def submit_review(req: Request, review_id: UUID, body: ReviewActionReq, x_reviewer_id: str = Header(...)):
+    sm = req.app.state.sm
+    success = await sm.submit_review(review_id, x_reviewer_id, body.is_accepted, body.reason)
+    if not success:
+        raise HTTPException(status_code=409, detail="Invalid state transition")
+    return {"status": "review_submitted"}
+
+# --- APPEALS ---
+@app.post("/v1/appeal/{review_id}/file", status_code=202)
+async def file_appeal(req: Request, review_id: UUID, body: AppealReq):
+    sm = req.app.state.sm
+    success = await sm.file_appeal(review_id, body.worker_id, body.reason)
+    if not success:
+        raise HTTPException(status_code=409, detail="Review is not in an appealable state")
+    return {"status": "appeal_filed"}
