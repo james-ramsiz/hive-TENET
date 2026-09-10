@@ -1,0 +1,19 @@
+graph TD
+    R[Reviewer Requests Batch] --> API[Assignment API]
+    API --> AS[AdvancedAssignmentService]
+    
+    AS -->|1. Fetch K Candidates| PG[(PostgreSQL)]
+    PG -->|SKIP LOCKED| AS
+    
+    AS -->|2. Inject Traps| GI[Golden Injector]
+    GI --> PG
+    
+    AS -->|3. Get State| Redis[(Redis)]
+    Redis -->|Fatigue & Exposure| AS
+    
+    AS -->|4. Score & Rank| Scorer[4C Scorer]
+    Scorer -->|Top N| AS
+    
+    AS -->|5. Claim in DB| PG
+    AS -->|6. Increment Redis| Redis
+    AS -->|7. Return Batch| R
