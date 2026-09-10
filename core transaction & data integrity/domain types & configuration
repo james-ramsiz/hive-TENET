@@ -1,0 +1,48 @@
+# phase1/domain.py
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, Any
+from uuid import UUID
+from enum import Enum
+
+class ReviewState(str, Enum):
+    PENDING = "PENDING"
+    IN_REVIEW = "IN_REVIEW"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    APPEAL_WINDOW = "APPEAL_WINDOW"
+    APPEALED = "APPEALED"
+    APPEAL_REVIEW = "APPEAL_REVIEW"
+    OVERTURNED = "OVERTURNED"
+    UPHELD = "UPHELD"
+
+@dataclass(frozen=True)
+class ReviewerProfile:
+    reviewer_id: str
+    seniority_level: int
+    is_active: bool
+    daily_review_limit: int
+
+@dataclass(frozen=True)
+class QueuedReview:
+    review_id: UUID
+    job_type_id: str
+    worker_id: str
+    state: ReviewState
+    display_payload: dict[str, Any]
+    enqueued_at: datetime
+    is_appeal: bool
+    appeal_reason: Optional[str] = None
+
+# phase1/config.py
+from dataclasses import dataclass
+import os
+
+@dataclass(frozen=True)
+class Config:
+    db_dsn: str = os.environ.get("DATABASE_DSN", "postgresql://user:pass@localhost:5432/platform")
+    pii_hmac_key: str = os.environ.get("PII_HMAC_KEY", "super-secret-dev-key-change-in-prod")
+    aes_encryption_key: str = os.environ.get("AES_KEY", "32-byte-long-hex-string-for-aes-gcm")
+    appeal_window_hours: int = 72
+    fetch_batch_size: int = 10
