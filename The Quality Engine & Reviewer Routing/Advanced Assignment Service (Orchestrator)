@@ -1,0 +1,116 @@
+# phase2/assignment_service.py
+from __future__ import annotations
+import asyncio
+import json
+import logging
+from typing import Optional
+from uuid import UUID
+import asyncpg
+from .domain import ReviewerProfile, QueuedReview, ScoredReview, ReviewerState
+from .config import AssignmentConfig
+from .state_cache import ReviewerStateCache
+from .scorer import ReviewScorer
+from .golden_injector import GoldenInjector
+
+log = logging.getLogger(__name__)
+
+class AdvancedAssignmentService:
+    def __init__(self, pool: asyncpg.Pool, cache: ReviewerStateCache, cfg: AssignmentConfig):
+        self._pool = pool
+        self._cache = cache
+        self._cfg = cfg
+        self._scorer = ReviewScorer(cfg)
+        self._injector = GoldenInjector(pool, cfg)
+
+    async def get_profile(self, reviewer_id: str) -> Optional[ReviewerProfile]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT reviewer_id, seniority_level, is_active, daily_review_limit, quality_score 
+                   FROM reviewer_profiles WHERE reviewer_id = $1""",
+                reviewer_id
+            )
+            if not row: return None
+            return ReviewerProfile(**dict(row))
+
+    async def get_batch_for_reviewer(self, reviewer_id: str, batch_size: int = 10) -> list[QueuedReview]:
+        reviewer = await self.get_profile(reviewer_id)
+        if not reviewer or not reviewer.is_active:
+            return []
+
+        # 1. Fetch a larger candidate batch from DB
+        async with self._pool.acquire() as conn:
+            if reviewer.seniority_level >= 3:
+                query = """
+                    SELECT review_id, job_type_id, worker_id, state, display_payload, enqueued_at, 
+                           difficulty_score, is_golden, golden_ref, appeal_reason
+                    FROM review_queue
+                    WHERE state IN ('PENDING', 'APPEAL_REVIEW')
+                    ORDER BY enqueued_at ASC
+                    LIMIT $1 FOR UPDATE SKIP LOCKED
+                """
+            else:
+                query = """
+                    SELECT review_id, job_type_id, worker_id, state, display_payload, enqueued_at, 
+                           difficulty_score, is_golden, golden_ref, appeal_reason
+                    FROM review_queue
+                    WHERE state = 'PENDING'
+                    ORDER BY enqueued_at ASC
+                    LIMIT $1 FOR UPDATE SKIP LOCKED
+                """
+            
+            rows = await conn.fetch(query, self._cfg.fetch_batch_size)
+            candidates = [QueuedReview(**dict(r)) for r in rows]
+
+        if not candidates:
+            return []
+
+        # 2. Inject Golden Item (if applicable)
+        candidates = await self._injector.inject(candidates, reviewer_id)
+
+        # 3. Fetch Redis state concurrently for all candidate workers
+        worker_ids = list(set([c.worker_id for c in candidates]))
+        states_map = await self._cache.get_states(reviewer_id, worker_ids)
+
+        # 4. Score candidates
+        scored = []
+        for c in candidates:
+            state = states_map.get(c.worker_id, ReviewerState(0, 0))
+            score = self._scorer.score(c, reviewer, state)
+            scored.append((score, c))
+            
+        # 5. Sort by score descending, take top N
+        scored.sort(key=lambda x: x[0], reverse=True)
+        to_assign = [c for s, c in scored[:batch_size] if s > 0]
+
+        if not to_assign:
+            # Clean up unclaimed golden traps
+            await self._injector.cleanup_unclaimed_goldens()
+            return []
+
+        # 6. Claim the reviews in Postgres
+        assign_ids = [r.review_id for r in to_assign]
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # Lock and update
+                await conn.executemany(
+                    """UPDATE review_queue 
+                       SET state = 'IN_REVIEW', assigned_to = $2, assigned_at = now() 
+                       WHERE review_id = $1""",
+                    [(rid, reviewer_id) for rid in assign_ids]
+                )
+                # Log behavioral event
+                await conn.executemany(
+                    """INSERT INTO behavioral_events (event_type, occurred_at, reviewer_id, payload)
+                       VALUES ('DECK_ASSIGNED', now(), $1, $2)""",
+                    [(reviewer_id, json.dumps({"review_id": str(rid)})) for rid in assign_ids]
+                )
+
+        # 7. Update Redis state (Fatigue + Exposure)
+        worker_counts = {}
+        for r in to_assign:
+            worker_counts[r.worker_id] = worker_counts.get(r.worker_id, 0) + 1
+            
+        for wid, count in worker_counts.items():
+            await self._cache.increment_assignment(reviewer_id, wid, count)
+
+        return to_assign
