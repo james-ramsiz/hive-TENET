@@ -1,0 +1,75 @@
+# phase2/golden_injector.py
+from __future__ import annotations
+import random
+import logging
+from uuid import uuid4
+from datetime import datetime, timezone
+from typing import Sequence
+import asyncpg
+from .domain import QueuedReview
+from .config import AssignmentConfig
+
+log = logging.getLogger(__name__)
+
+class GoldenInjector:
+    def __init__(self, pool: asyncpg.Pool, cfg: AssignmentConfig):
+        self._pool = pool
+        self._cfg = cfg
+
+    async def inject(self, candidates: list[QueuedReview], reviewer_id: str) -> list[QueuedReview]:
+        if not candidates or random.random() > self._cfg.golden_injection_rate:
+            return candidates
+
+        job_type = candidates[0].job_type_id
+        golden_payload = await self._fetch_golden(job_type)
+        
+        if not golden_payload:
+            return candidates
+
+        golden_id, payload, is_good = golden_payload
+        trap_review_id = uuid4()
+
+        # Insert the trap into the actual queue so it gets claimed like a normal review
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO review_queue 
+                (review_id, job_type_id, worker_id, state, display_payload, difficulty_score, is_golden, golden_ref)
+                VALUES ($1, $2, 'SYSTEM_GOLDEN', 'PENDING', $3, 0.5, true, $4)
+                """,
+                trap_review_id, job_type, payload, golden_id
+            )
+
+        # Add the trap to the candidate list for scoring
+        trap = QueuedReview(
+            review_id=trap_review_id,
+            job_type_id=job_type,
+            worker_id="SYSTEM_GOLDEN",
+            state="PENDING",
+            display_payload=payload,
+            enqueued_at=datetime.now(timezone.utc),
+            difficulty_score=0.5,
+            is_appeal=False,
+            is_golden=True,
+            golden_ref=golden_id
+        )
+        candidates.append(trap)
+        log.info(f"Injected golden trap {trap_review_id} for reviewer {reviewer_id}")
+        return candidates
+
+    async def _fetch_golden(self, job_type: str) -> tuple:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT golden_id, display_payload, is_good FROM golden_items WHERE job_type_id = $1 ORDER BY random() LIMIT 1",
+                job_type
+            )
+            if not row:
+                return None
+            return (row['golden_id'], row['display_payload'], row['is_good'])
+
+    async def cleanup_unclaimed_goldens(self):
+        """Run periodically to delete golden traps that were fetched but not claimed."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM review_queue WHERE is_golden = true AND state = 'PENDING' AND enqueued_at < now() - interval '5 minutes'"
+            )
