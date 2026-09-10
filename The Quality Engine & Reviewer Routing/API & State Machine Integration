@@ -1,0 +1,37 @@
+# phase2/state_machine.py (Additions to Phase 1)
+from .domain import ReviewState
+
+class AppealsStateMachine:
+    # ... previous Phase 1 init ...
+
+    async def submit_review(self, review_id: UUID, reviewer_id: str, is_accepted: bool, reason: str = "") -> bool:
+        # 1. Check if it's a golden item BEFORE transitioning
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT is_golden, golden_ref FROM review_queue WHERE review_id = $1", review_id)
+            if not row: return False
+            
+            if row['is_golden']:
+                # Evaluate the trap
+                golden_truth = await conn.fetchval("SELECT is_good FROM golden_items WHERE golden_id = $1", row['golden_ref'])
+                
+                # If reviewer accepted a known-bad, or rejected a known-good -> they failed the trap
+                trap_failed = (is_accepted and not golden_truth) or (not is_accepted and golden_truth)
+                
+                if trap_failed:
+                    log.warning("Reviewer %s failed golden trap %s", reviewer_id, review_id)
+                    # Decimate their quality score immediately
+                    await conn.execute(
+                        "UPDATE reviewer_profiles SET quality_score = 0.1 WHERE reviewer_id = $1",
+                        reviewer_id
+                    )
+                    # Optionally suspend them: "UPDATE reviewer_profiles SET is_active = false"
+                else:
+                    # Slight boost for passing a trap
+                    await conn.execute(
+                        "UPDATE reviewer_profiles SET quality_score = LEAST(1.0, quality_score + 0.05) WHERE reviewer_id = $1",
+                        reviewer_id
+                    )
+
+        # 2. Proceed with normal transition
+        to_state = ReviewState.ACCEPTED if is_accepted else ReviewState.REJECTED
+        return await self.transition(review_id, reviewer_id, to_state, reason)
