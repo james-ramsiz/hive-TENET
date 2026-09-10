@@ -1,0 +1,53 @@
+# tests/test_phase2.py
+import pytest
+from datetime import datetime, timezone, timedelta
+from phase2.scorer import ReviewScorer
+from phase2.config import AssignmentConfig
+from phase2.domain import ReviewerProfile, QueuedReview, ReviewerState
+
+@pytest.fixture
+def cfg(): return AssignmentConfig()
+@pytest.fixture
+def scorer(cfg): return ReviewScorer(cfg)
+@pytest.fixture
+def reviewer(): return ReviewerProfile("rev1", 2, True, 100, 0.8)
+@pytest.fixture
+def old_review():
+    return QueuedReview(
+        review_id="123", job_type_id="jt1", worker_id="w1", state="PENDING",
+        display_payload={}, enqueued_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        difficulty_score=0.8, is_appeal=False
+    )
+
+def test_hard_constraint_fatigue(scorer, reviewer, old_review):
+    state = ReviewerState(fatigue_count=99, worker_exposure_count=0) # 99/100 = 99% > 95%
+    assert scorer.score(old_review, reviewer, state) == 0.0
+
+def test_hard_constraint_bias(scorer, reviewer, old_review):
+    state = ReviewerState(fatigue_count=10, worker_exposure_count=5) # 5 is the limit
+    assert scorer.score(old_review, reviewer, state) == 0.0
+
+def test_hard_constraint_appeals(scorer, old_review):
+    junior = ReviewerProfile("rev2", 1, True, 100, 0.5)
+    state = ReviewerState(0, 0)
+    appeal = QueuedReview(**{**old_review.__dict__, "is_appeal": True})
+    assert scorer.score(appeal, junior, state) == 0.0
+
+def test_soft_constraint_difficulty_match(scorer, reviewer, cfg):
+    state = ReviewerState(0, 0)
+    easy = QueuedReview(**{**reviewer.__dict__, "difficulty_score": 0.1}) # Wait, need to fix dict
+    # Using explicit objects for clarity
+    easy = QueuedReview("1", "jt", "w", "PENDING", {}, datetime.now(timezone.utc)-timedelta(hours=1), 0.1, False)
+    hard = QueuedReview("2", "jt", "w", "PENDING", {}, datetime.now(timezone.utc)-timedelta(hours=1), 0.9, False)
+    
+    # Reviewer quality is 0.8. Hard (0.9) is closer than Easy (0.1).
+    assert scorer.score(hard, reviewer, state) > scorer.score(easy, reviewer, state)
+
+def test_soft_constraint_bias_penalty(scorer, reviewer, old_review):
+    fresh = ReviewerState(0, 0)
+    exposed = ReviewerState(0, 2)
+    
+    score_fresh = scorer.score(old_review, reviewer, fresh)
+    score_exposed = scorer.score(old_review, reviewer, exposed)
+    
+    assert score_fresh > score_exposed
