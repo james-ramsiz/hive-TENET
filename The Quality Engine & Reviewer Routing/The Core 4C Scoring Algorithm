@@ -1,0 +1,40 @@
+# phase2/scorer.py
+from __future__ import annotations
+import math
+from datetime import datetime, timezone
+from .domain import ReviewerProfile, QueuedReview, ReviewerState
+from .config import AssignmentConfig
+
+class ReviewScorer:
+    def __init__(self, cfg: AssignmentConfig):
+        self._cfg = cfg
+
+    def score(self, review: QueuedReview, reviewer: ReviewerProfile, state: ReviewerState) -> float:
+        # 1. HARD CONSTRAINT: Fatigue Guard
+        if reviewer.daily_review_limit > 0:
+            if state.fatigue_count >= int(reviewer.daily_review_limit * self._cfg.fatigue_threshold_pct):
+                return 0.0
+
+        # 2. HARD CONSTRAINT: Relationship Bias Guard
+        if state.worker_exposure_count >= self._cfg.max_worker_exposure_7d:
+            return 0.0
+
+        # 3. HARD CONSTRAINT: Skill / Seniority Guard (Appeals)
+        if review.is_appeal and reviewer.seniority_level < 3:
+            return 0.0
+
+        # 4. SOFT CONSTRAINT: Queue Age (Exponential decay)
+        age_seconds = (datetime.now(timezone.utc) - review.enqueued_at).total_seconds()
+        age_minutes = age_seconds / 60.0
+        age_score = self._cfg.base_age_score * (1 - math.exp(-self._cfg.queue_age_lambda * age_minutes))
+
+        # 5. SOFT CONSTRAINT: Difficulty Match Penalty
+        difficulty_mismatch = abs(review.difficulty_score - reviewer.quality_score)
+        difficulty_penalty = difficulty_mismatch * self._cfg.difficulty_match_weight * self._cfg.base_age_score
+
+        # 6. SOFT CONSTRAINT: Relationship Bias Penalty
+        exposure_ratio = state.worker_exposure_count / self._cfg.max_worker_exposure_7d
+        exposure_penalty = exposure_ratio * self._cfg.bias_penalty_weight * 10.0
+
+        final_score = age_score - difficulty_penalty - exposure_penalty
+        return max(0.0, final_score)
