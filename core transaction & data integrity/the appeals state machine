@@ -1,0 +1,90 @@
+# phase1/state_machine.py
+from __future__ import annotations
+import logging
+from typing import Optional
+from uuid import UUID
+from datetime import datetime, timezone, timedelta
+import asyncpg
+from .domain import ReviewState
+
+log = logging.getLogger(__name__)
+
+VALID_TRANSITIONS = {
+    ReviewState.PENDING: [ReviewState.IN_REVIEW],
+    ReviewState.IN_REVIEW: [ReviewState.ACCEPTED, ReviewState.REJECTED],
+    ReviewState.REJECTED: [ReviewState.APPEAL_WINDOW],
+    ReviewState.APPEAL_WINDOW: [ReviewState.APPEALED, ReviewState.ACCEPTED], # Auto-accept if deadline passes
+    ReviewState.APPEALED: [ReviewState.APPEAL_REVIEW],
+    ReviewState.APPEAL_REVIEW: [ReviewState.OVERTURNED, ReviewState.UPHELD],
+    ReviewState.OVERTURNED: [],
+    ReviewState.UPHELD: [],
+    ReviewState.ACCEPTED: []
+}
+
+class AppealsStateMachine:
+    def __init__(self, pool: asyncpg.Pool, appeal_window_hours: int = 72):
+        self._pool = pool
+        self._appeal_window = appeal_window_hours
+
+    async def transition(
+        self, 
+        review_id: UUID, 
+        actor_id: str, 
+        to_state: ReviewState, 
+        reason: Optional[str] = None
+    ) -> bool:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Get current state
+                row = await conn.fetchrow(
+                    "SELECT state FROM review_queue WHERE review_id = $1 FOR UPDATE",
+                    review_id
+                )
+                if not row:
+                    log.error("Review %s not found", review_id)
+                    return False
+                    
+                current_state = ReviewState(row['state'])
+                
+                # 2. Check if transition is valid
+                if to_state not in VALID_TRANSITIONS.get(current_state, []):
+                    log.error("Invalid transition: %s -> %s for review %s", current_state, to_state, review_id)
+                    return False
+                
+                # 3. Perform state update
+                await conn.execute(
+                    "UPDATE review_queue SET state = $2 WHERE review_id = $1",
+                    review_id, to_state.value
+                )
+                
+                # 4. Handle side effects
+                if to_state == ReviewState.REJECTED:
+                    deadline = datetime.now(timezone.utc) + timedelta(hours=self._appeal_window)
+                    await conn.execute(
+                        "UPDATE review_queue SET appeal_deadline = $2 WHERE review_id = $1",
+                        review_id, deadline
+                    )
+                elif to_state == ReviewState.IN_REVIEW:
+                    await conn.execute(
+                        "UPDATE review_queue SET assigned_to = $2, assigned_at = now() WHERE review_id = $1",
+                        review_id, actor_id
+                    )
+                
+                # 5. Insert audit log
+                await conn.execute(
+                    """
+                    INSERT INTO review_state_transitions (review_id, from_state, to_state, actor_id, reason)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    review_id, current_state.value, to_state.value, actor_id, reason
+                )
+                
+        log.info("Transitioned review %s to %s by %s", review_id, to_state, actor_id)
+        return True
+
+    async def file_appeal(self, review_id: UUID, worker_id: str, reason: str) -> bool:
+        return await self.transition(review_id, worker_id, ReviewState.APPEALED, reason)
+        
+    async def submit_review(self, review_id: UUID, reviewer_id: str, is_accepted: bool, reason: str = "") -> bool:
+        to_state = ReviewState.ACCEPTED if is_accepted else ReviewState.REJECTED
+        return await self.transition(review_id, reviewer_id, to_state, reason)
