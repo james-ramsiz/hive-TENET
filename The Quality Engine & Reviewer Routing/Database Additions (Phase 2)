@@ -1,0 +1,23 @@
+-- migrations/0002_phase2_quality_engine.sql
+
+-- Add fields to support the 4C algorithm
+ALTER TABLE review_queue 
+    ADD COLUMN difficulty_score REAL NOT NULL DEFAULT 0.5,
+    ADD COLUMN is_golden BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN golden_ref UUID; -- References the golden_items table if is_golden=true
+
+ALTER TABLE reviewer_profiles
+    ADD COLUMN quality_score REAL NOT NULL DEFAULT 0.5; -- Rolling accuracy, updated by observability layer
+
+-- Repository of known-good and known-bad submissions used as traps
+CREATE TABLE golden_items (
+    golden_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_type_id     TEXT NOT NULL,
+    is_good         BOOLEAN NOT NULL, -- True if should be accepted, False if should be rejected
+    display_payload JSONB NOT NULL,   -- The trap content
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Index to quickly find unassigned, non-golden work
+CREATE INDEX idx_queue_pending_nongolden ON review_queue (job_type_id, enqueued_at) 
+    WHERE state = 'PENDING' AND is_golden = false;
