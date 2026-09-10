@@ -1,0 +1,14 @@
+graph TD
+    W[Worker UI] -->|1. Submit Work| IngestAPI[Ingestion API]
+    IngestAPI -->|2. Scrub PII| Scrubber[TextScrubber]
+    Scrubber -->|3. Store Raw + Scrubbed| DB[(PostgreSQL)]
+    
+    R[Reviewer UI] -->|4. Request Batch| AssignAPI[Assignment API]
+    AssignAPI -->|5. Fetch Profile + Queue| DB
+    DB -->|6. SKIP LOCKED Candidates| AssignAPI
+    AssignAPI -->|7. Claim & Transition| SM[Appeals State Machine]
+    SM -->|8. Update State + Audit| DB
+    SM -->|9. Return Batch| R
+    
+    W -->|10. File Appeal| AppealAPI[Appeals API]
+    AppealAPI -->|11. Transition| SM
