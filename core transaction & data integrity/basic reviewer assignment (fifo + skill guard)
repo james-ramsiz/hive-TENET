@@ -1,0 +1,94 @@
+# phase1/assignment_service.py
+from __future__ import annotations
+import asyncio
+import logging
+from typing import Optional
+from uuid import UUID
+import asyncpg
+from .domain import ReviewerProfile, QueuedReview, ReviewState
+
+log = logging.getLogger(__name__)
+
+class BasicAssignmentService:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def get_profile(self, reviewer_id: str) -> Optional[ReviewerProfile]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT reviewer_id, seniority_level, is_active, daily_review_limit FROM reviewer_profiles WHERE reviewer_id = $1",
+                reviewer_id
+            )
+            if not row: return None
+            return ReviewerProfile(**dict(row))
+
+    async def get_batch_for_reviewer(self, reviewer_id: str, batch_size: int = 10) -> list[QueuedReview]:
+        reviewer = await self.get_profile(reviewer_id)
+        if not reviewer or not reviewer.is_active:
+            return []
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # SKILL GUARD: If seniority < 3, they cannot view APPEAL_REVIEW items.
+                # We dynamically build the query based on seniority.
+                if reviewer.seniority_level >= 3:
+                    query = """
+                        SELECT review_id, job_type_id, worker_id, state, display_payload, enqueued_at, appeal_reason
+                        FROM review_queue
+                        WHERE state IN ('PENDING', 'APPEAL_REVIEW')
+                        ORDER BY enqueued_at ASC
+                        LIMIT $1
+                        FOR UPDATE SKIP LOCKED
+                    """
+                else:
+                    query = """
+                        SELECT review_id, job_type_id, worker_id, state, display_payload, enqueued_at, appeal_reason
+                        FROM review_queue
+                        WHERE state = 'PENDING'
+                        ORDER BY enqueued_at ASC
+                        LIMIT $1
+                        FOR UPDATE SKIP LOCKED
+                    """
+                
+                # 1. Fetch and lock candidates
+                rows = await conn.fetch(query, batch_size)
+                if not rows:
+                    return []
+                
+                # 2. Claim them atomically
+                review_ids = [r['review_id'] for r in rows]
+                await conn.executemany(
+                    """
+                    UPDATE review_queue 
+                    SET state = 'IN_REVIEW', assigned_to = $2, assigned_at = now() 
+                    WHERE review_id = $1
+                    """,
+                    [(rid, reviewer_id) for rid in review_ids]
+                )
+                
+                # 3. Log behavioral event
+                await conn.executemany(
+                    """
+                    INSERT INTO behavioral_events (event_type, occurred_at, reviewer_id, payload)
+                    VALUES ('DECK_ASSIGNED', now(), $1, $2)
+                    """,
+                    [(reviewer_id, json.dumps({"review_id": str(rid)})) for rid in review_ids]
+                )
+
+        # Map to domain objects
+        results = []
+        for r in rows:
+            results.append(QueuedReview(
+                review_id=r['review_id'],
+                job_type_id=r['job_type_id'],
+                worker_id=r['worker_id'],
+                state=ReviewState(r['state']),
+                display_payload=r['display_payload'],
+                enqueued_at=r['enqueued_at'],
+                is_appeal=(r['state'] == ReviewState.APPEAL_REVIEW),
+                appeal_reason=r['appeal_reason']
+            ))
+            
+        return results
+
+import json
