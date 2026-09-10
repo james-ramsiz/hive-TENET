@@ -1,0 +1,83 @@
+# phase1/pii_scrubber.py
+from __future__ import annotations
+import re
+import hashlib
+import hmac
+import json
+from dataclasses import dataclass
+
+# Regex patterns for hard PII
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-]?)?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}")
+SSN_RE   = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+CREDIT_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+
+@dataclass
+class ScrubResult:
+    scrubbed_payload: dict   # For DB indexing / ML pipelines
+    display_payload: dict    # For Reviewer UI (pseudonymized)
+    pii_detected: list[str]
+
+class TextScrubber:
+    """
+    Strips PII and generates stable pseudonyms.
+    """
+    def __init__(self, hmac_key: str):
+        self._key = hmac_key.encode('utf-8')
+
+    def _pseudonym(self, value: str) -> str:
+        """Creates a stable, reversible-free token for names/identifiers."""
+        digest = hmac.new(self._key, value.encode('utf-8'), hashlib.sha256).hexdigest()
+        return f"SUBJECT-{digest[:8]}"
+
+    def scrub_text(self, text: str) -> tuple[str, str, list[str]]:
+        """
+        Returns (scrubbed_text, display_text, categories_found)
+        """
+        if not text:
+            return "", "", []
+            
+        scrubbed = text
+        display = text
+        categories = []
+        
+        # Hard block patterns
+        patterns = [
+            ("EMAIL", EMAIL_RE, "[EMAIL]"),
+            ("SSN", SSN_RE, "[SSN]"),
+            ("PHONE", PHONE_RE, "[PHONE]"),
+            ("CREDIT", CREDIT_RE, "[CARD]"),
+        ]
+        
+        for cat, pattern, token in patterns:
+            if pattern.search(scrubbed):
+                categories.append(cat)
+                scrubbed = pattern.sub(token, scrubbed)
+                display = pattern.sub(token, display)
+                
+        # Note: In a real system, you'd run a spaCy/Presidio NER model here 
+        # to find PERSON names and replace them with self._pseudonym(name).
+        # For Phase 1, we rely on regex hard-blocking.
+        
+        return scrubbed, display, categories
+
+    def scrub_payload(self, payload: dict) -> ScrubResult:
+        scrubbed_fields = {}
+        display_fields = {}
+        all_cats = []
+        
+        for key, value in payload.items():
+            if isinstance(value, str):
+                s, d, cats = self.scrub_text(value)
+                scrubbed_fields[key] = s
+                display_fields[key] = d
+                all_cats.extend(cats)
+            else:
+                scrubbed_fields[key] = value
+                display_fields[key] = value
+                
+        return ScrubResult(
+            scrubbed_payload=scrubbed_fields,
+            display_payload=display_fields,
+            pii_detected=list(set(all_cats))
+        )
