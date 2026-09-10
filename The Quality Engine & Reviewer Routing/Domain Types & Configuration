@@ -1,0 +1,47 @@
+# phase2/domain.py
+from dataclasses import dataclass
+from typing import Optional, Any
+from uuid import UUID
+from datetime import datetime
+
+@dataclass(frozen=True)
+class ReviewerProfile:
+    reviewer_id: str
+    seniority_level: int
+    is_active: bool
+    daily_review_limit: int
+    quality_score: float       # NEW
+
+@dataclass(frozen=True)
+class QueuedReview:
+    review_id: UUID
+    job_type_id: str
+    worker_id: str
+    state: str
+    display_payload: dict[str, Any]
+    enqueued_at: datetime
+    difficulty_score: float    # NEW
+    is_appeal: bool
+    appeal_reason: Optional[str] = None
+    is_golden: bool = False   # NEW
+    golden_ref: Optional[UUID] = None # NEW
+
+@dataclass(frozen=True)
+class ReviewerState:
+    fatigue_count: int
+    worker_exposure_count: int
+
+# phase2/config.py
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class AssignmentConfig:
+    fetch_batch_size: int = 50
+    assign_batch_size: int = 10
+    fatigue_threshold_pct: float = 0.95
+    max_worker_exposure_7d: int = 5
+    queue_age_lambda: float = 0.05
+    difficulty_match_weight: float = 0.3
+    bias_penalty_weight: float = 2.0
+    base_age_score: float = 100.0
+    golden_injection_rate: float = 0.05 # 5% of batches get a trap
