@@ -1,0 +1,42 @@
+# tests/test_phase3.py
+import pytest
+import numpy as np
+from unittest.mock import AsyncMock, patch
+from phase3.drift_detector import DriftDetector
+
+@pytest.mark.asyncio
+async def test_drift_detector_enqueues_reembed_on_high_drift():
+    # Mock DB pool and fetches
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    # Simulate 100 vectors of dim 384
+    fake_vectors = [str([0.1]*384)] * 100
+    mock_conn.fetch.return_value = [{"embedding": vec} for vec in fake_vectors]
+    
+    # Simulate a previous centroid that is VERY different (drift = 1.0)
+    mock_conn.fetchrow.return_value = {"centroid": str([0.9]*384)}
+    
+    detector = DriftDetector(mock_pool, drift_threshold=0.3)
+    await detector.detect_drift({"job_type_id": "jt1"})
+    
+    # Verify a re-embed job was enqueued
+    insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO background_jobs" in str(c)]
+    assert len(insert_calls) == 1
+    
+@pytest.mark.asyncio
+async def test_drift_detector_no_enqueue_on_low_drift():
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    fake_vectors = [str([0.5]*384)] * 100
+    mock_conn.fetch.return_value = [{"embedding": vec} for vec in fake_vectors]
+    mock_conn.fetchrow.return_value = {"centroid": str([0.5]*384)} # Identical -> drift = 0
+    
+    detector = DriftDetector(mock_pool, drift_threshold=0.3)
+    await detector.detect_drift({"job_type_id": "jt1"})
+    
+    insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO background_jobs" in str(c)]
+    assert len(insert_calls) == 0
