@@ -1,0 +1,35 @@
+-- migrations/0005_phase5_fraud.sql
+
+-- ==========================================
+-- 1. SYBIL DETECTION (Identity Resolution)
+-- ==========================================
+CREATE TABLE worker_devices (
+    id              BIGSERIAL PRIMARY KEY,
+    worker_id       TEXT NOT NULL,
+    device_hash     TEXT NOT NULL, -- e.g., FingerprintJS hash
+    ip_address      INET,
+    first_seen      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (worker_id, device_hash)
+);
+CREATE INDEX idx_device_hash ON worker_devices (device_hash);
+
+-- ==========================================
+-- 2. FRAUD ALERTS (Graph Analysis Output)
+-- ==========================================
+CREATE TYPE fraud_severity AS ENUM ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL');
+
+CREATE TABLE fraud_alerts (
+    alert_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_type     TEXT NOT NULL, -- 'reviewer' or 'worker'
+    entity_id       TEXT NOT NULL,
+    alert_type      TEXT NOT NULL, -- 'COLLUSION_RING', 'SYBIL_MULTIPLE_ACCOUNTS'
+    severity        fraud_severity NOT NULL,
+    details         JSONB NOT NULL,
+    detected_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at     TIMESTAMPTZ,
+    is_active       BOOLEAN NOT NULL DEFAULT true -- If true, 4C algorithm hard-blocks them
+);
+CREATE INDEX idx_fraud_active ON fraud_alerts (entity_type, entity_id) WHERE is_active = true;
+
+-- Add a device_hash column to the review_queue for boundary tracking
+ALTER TABLE review_queue ADD COLUMN worker_device_hash TEXT;
