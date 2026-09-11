@@ -1,0 +1,112 @@
+# phase5/collusion_analyzer.py
+from __future__ import annotations
+import asyncio
+import logging
+import json
+import networkx as nx
+import asyncpg
+
+log = logging.getLogger(__name__)
+
+class CollusionAnalyzer:
+    def __init__(self, pool: asyncpg.Pool, min_interactions: int = 5, anomaly_threshold: float = 0.30):
+        self._pool = pool
+        self._min_inter = min_interactions
+        self._threshold = anomaly_threshold
+
+    async def analyze(self, payload: dict):
+        """
+        Main entry point from the Phase 3 Job Runner.
+        """
+        log.info("Starting collusion graph analysis...")
+        
+        # 1. Fetch global baseline acceptance rate
+        async with self._pool.acquire() as conn:
+            baseline = await conn.fetchval(
+                """
+                SELECT avg(CASE WHEN state IN ('ACCEPTED', 'OVERTURNED') THEN 1.0 ELSE 0.0 END) 
+                FROM review_queue 
+                WHERE state IN ('ACCEPTED', 'OVERTURNED', 'UPHELD')
+                  AND assigned_at < now() - interval '1 day'
+                """
+            )
+            if not baseline:
+                log.info("Not enough data for baseline.")
+                return
+                
+            # 2. Extract edge weights (Reviewer -> Worker interactions)
+            edges = await conn.fetch(
+                f"""
+                SELECT 
+                    assigned_to as reviewer_id,
+                    worker_id,
+                    count(*) as interactions,
+                    avg(CASE WHEN state IN ('ACCEPTED', 'OVERTURNED') THEN 1.0 ELSE 0.0 END) as acc_rate
+                FROM review_queue
+                WHERE assigned_to IS NOT NULL
+                  AND assigned_at < now() - interval '1 day'
+                GROUP BY 1, 2
+                HAVING count(*) >= {self._min_inter}
+                """
+            )
+            
+        if not edges:
+            return
+            
+        # 3. Build Graph in memory
+        G = nx.Graph()
+        flagged_edges = []
+        
+        for row in edges:
+            rev = row['reviewer_id']
+            wrk = row['worker_id']
+            acc_rate = row['acc_rate']
+            
+            G.add_node(rev, type='reviewer')
+            G.add_node(wrk, type='worker')
+            
+            # Calculate delta from global baseline
+            delta = acc_rate - baseline
+            
+            if delta > self._threshold:
+                # This edge is highly anomalous (e.g., 95% accept rate vs 50% baseline)
+                G.add_edge(rev, wrk, weight=delta, fraud=True)
+                flagged_edges.append((rev, wrk, delta, row['interactions']))
+            else:
+                G.add_edge(rev, wrk, weight=delta, fraud=False)
+                
+        # 4. Find connected components of fraud (Rings)
+        fraud_subgraph = nx.Graph()
+        for u, v, d in G.edges(data=True):
+            if d.get('fraud'):
+                fraud_subgraph.add_edge(u, v)
+                
+        rings = list(nx.connected_components(fraud_subgraph))
+        
+        if not rings:
+            log.info("No collusion rings detected.")
+            return
+            
+        log.warning(f"Detected {len(rings)} potential collusion rings.")
+        
+        # 5. Create Fraud Alerts for the reviewers involved
+        async with self._pool.acquire() as conn:
+            for i, ring in enumerate(rings):
+                reviewers_in_ring = [n for n in ring if G.nodes[n].get('type') == 'reviewer']
+                workers_in_ring = [n for n in ring if G.nodes[n].get('type') == 'worker']
+                
+                for rev_id in reviewers_in_ring:
+                    await conn.execute(
+                        """
+                        INSERT INTO fraud_alerts (entity_type, entity_id, alert_type, severity, details)
+                        VALUES ('reviewer', $1, 'COLLUSION_RING', 'CRITICAL', $2)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        rev_id,
+                        json.dumps({
+                            "ring_id": i,
+                            "workers_in_ring": workers_in_ring,
+                            "baseline_rate": float(baseline)
+                        })
+                    )
+        log.info("Collusion alerts written to DB.")
