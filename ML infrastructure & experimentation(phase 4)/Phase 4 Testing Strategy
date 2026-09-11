@@ -1,0 +1,50 @@
+# tests/test_phase4.py
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from phase4.experiment_router import ExperimentRouter, ExperimentConfig
+from phase4.shadow_router import ShadowModelRouter, DeckRankingRequest
+import asyncio
+
+def test_experiment_router_deterministic_bucketing():
+    mock_pool = MagicMock()
+    router = ExperimentRouter(mock_pool)
+    router._cache = {
+        "exp_1": ExperimentConfig("exp_1", "control", "treatment", 50) # 50/50 split
+    }
+    
+    # Same worker should always get same variant
+    v1 = router.get_variant("exp_1", "worker_A")
+    v2 = router.get_variant("exp_1", "worker_A")
+    assert v1 == v2
+    
+    # Different workers should distribute (statistically)
+    # We can't test full distribution in a unit test, but we can test it doesn't crash
+    v3 = router.get_variant("exp_1", "worker_B")
+    assert v3 in ["control", "treatment"]
+
+@pytest.mark.asyncio
+async def test_shadow_router_does_not_block_on_shadow_failure():
+    mock_pool = AsyncMock()
+    
+    # Prod works, Shadow throws exception
+    prod_model = AsyncMock()
+    prod_model.model_id = "prod"
+    prod_model.score.return_value = [0.9, 0.1]
+    
+    shadow_model = AsyncMock()
+    shadow_model.model_id = "shadow"
+    shadow_model.score.side_effect = Exception("ML Service Down!")
+    
+    router = ShadowModelRouter(mock_pool, prod_model, shadow_model)
+    
+    req = DeckRankingRequest("w1", "jt1", ["job1", "job2"])
+    
+    # This should succeed immediately, without waiting for shadow to fail
+    ranked = await router.rank(req)
+    
+    assert len(ranked) == 2
+    assert ranked[0].job_type_id == "job1"
+    
+    # Give the background task a moment to execute and fail silently
+    await asyncio.sleep(0.1)
+    # No exception should have been raised to the main thread
