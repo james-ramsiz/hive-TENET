@@ -1,0 +1,14 @@
+graph TD
+    W[Worker UI] -->|1. Submit Work + Device Hash| IngestAPI[Ingestion API]
+    IngestAPI -->|2. Check Hash| SS[Sybil Detector]
+    SS -->|Flagged| DB[(Postgres)]
+    
+    JQ[Job Queue] -->|Nightly| CG[Collusion Graph Analyzer]
+    DB -->|3. Extract Edges| CG
+    CG -->|4. Build NetworkX Graph| NXL[In-Memory Graph]
+    NXL -->|5. Find Anomalous Cliques| CG
+    CG -->|6. Write Fraud Alerts| DB
+    
+    R[Reviewer Requests Batch] --> AS[Assignment Service 4C]
+    AS -->|7. Check Fraud Alerts| DB
+    DB -->|8. Hard-Block Colluders| AS
