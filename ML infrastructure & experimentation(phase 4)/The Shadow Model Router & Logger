@@ -1,0 +1,74 @@
+# phase4/shadow_router.py
+from __future__ import annotations
+import asyncio
+import logging
+import uuid
+from typing import Sequence
+import asyncpg
+
+log = logging.getLogger(__name__)
+
+class DeckRankingRequest:
+    def __init__(self, worker_id: str, job_type_id: str, deck: list[str]):
+        self.worker_id = worker_id
+        self.job_type_id = job_type_id
+        self.deck = deck
+
+class RankedDeck:
+    def __init__(self, job_type_id: str, score: float, rank: int):
+        self.job_type_id = job_type_id
+        self.score = score
+        self.rank = rank
+
+class ShadowModelRouter:
+    """
+    Wraps the production model. Executes shadow inference and logging in background.
+    """
+    def __init__(self, pool: asyncpg.Pool, prod_model, shadow_model):
+        self._pool = pool
+        self._prod = prod_model
+        self._shadow = shadow_model
+
+    async def rank(self, req: DeckRankingRequest) -> list[RankedDeck]:
+        # 1. Execute prod model (synchronous, blocking if it fails)
+        prod_scores = await self._prod.score(req)
+        prod_ranked = self._rank(prod_scores, req.deck)
+        
+        # 2. Fire shadow inference (non-blocking, fail-safe)
+        asyncio.create_task(self._run_shadow(req, prod_ranked))
+        
+        return prod_ranked
+
+    async def _run_shadow(self, req: DeckRankingRequest, prod_ranked: list[RankedDeck]):
+        try:
+            shadow_scores = await self._shadow.score(req)
+            shadow_ranked = self._rank(shadow_scores, req.deck)
+            
+            if not prod_ranked or not shadow_ranked:
+                return
+                
+            # Log the top pick difference
+            prod_top = prod_ranked[0]
+            shadow_top = shadow_ranked[0]
+            
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO shadow_predictions 
+                    (decision_id, worker_id, job_type_id, prod_model_id, prod_score, prod_rank, 
+                     shadow_model_id, shadow_score, shadow_rank, rank_delta)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT (decision_id, worker_id) DO NOTHING
+                    """,
+                    str(uuid.uuid4()), req.worker_id, req.job_type_id,
+                    self._prod.model_id, prod_top.score, prod_top.rank,
+                    self._shadow.model_id, shadow_top.score, shadow_top.rank,
+                    shadow_top.rank - prod_top.rank
+                )
+        except Exception as e:
+            log.warning("Shadow inference failed (prod unaffected): %s", e)
+
+    @staticmethod
+    def _rank(scores, deck):
+        ranked = sorted(zip(deck, scores), key=lambda kv: kv[1], reverse=True)
+        return [RankedDeck(jt, s, i) for i, (jt, s) in enumerate(ranked)]
