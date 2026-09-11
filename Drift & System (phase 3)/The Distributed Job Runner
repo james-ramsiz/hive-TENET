@@ -1,0 +1,81 @@
+# phase3/job_runner.py
+from __future__ import annotations
+import asyncio
+import logging
+import json
+from typing import Callable, Awaitable
+import asyncpg
+
+log = logging.getLogger(__name__)
+
+class JobRunner:
+    def __init__(self, pool: asyncpg.Pool, handlers: dict[str, Callable]):
+        self._pool = pool
+        self._handlers = handlers
+        self._stop = asyncio.Event()
+
+    async def run(self, poll_interval: float = 1.0):
+        log.info("Job runner started.")
+        while not self._stop.is_set():
+            job = await self._claim_job()
+            if job:
+                asyncio.create_task(self._execute(job))
+            else:
+                await asyncio.sleep(poll_interval)
+
+    async def _claim_job(self) -> dict | None:
+        async with self._pool.acquire() as conn:
+            # Atomic claim using SKIP LOCKED
+            row = await conn.fetchrow("""
+                WITH next_job AS (
+                    SELECT id FROM background_jobs
+                    WHERE status = 'pending' 
+                      AND (locked_until IS NULL OR locked_until < now())
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    RETURNING id, job_type, payload, attempts, max_attempts
+                )
+                UPDATE background_jobs
+                SET status = 'running', 
+                    locked_by = 'worker-' || substring(md5(random()::text), 1, 8),
+                    locked_until = now() + interval '5 minutes',
+                    attempts = attempts + 1,
+                    updated_at = now()
+                FROM next_job
+                WHERE background_jobs.id = next_job.id
+                RETURNING background_jobs.id, next_job.job_type, next_job.payload, next_job.attempts, next_job.max_attempts
+            """)
+            return dict(row) if row else None
+
+    async def _execute(self, job: dict):
+        job_id = job['id']
+        handler = self._handlers.get(job['job_type'])
+        
+        if not handler:
+            log.error("No handler for job type: %s", job['job_type'])
+            await self._fail_job(job_id, "No handler")
+            return
+
+        try:
+            await handler(job['payload'])
+            await self._complete_job(job_id)
+        except Exception as e:
+            log.exception("Job %s failed", job_id)
+            # If attempts exceeded, mark as failed permanently
+            if job['attempts'] >= job['max_attempts']:
+                await self._fail_job(job_id, str(e))
+            else:
+                await self._retry_job(job_id)
+
+    async def _complete_job(self, job_id: int):
+        async with self._pool.acquire() as conn:
+            await conn.execute("UPDATE background_jobs SET status = 'completed', updated_at = now() WHERE id = $1", job_id)
+
+    async def _fail_job(self, job_id: int, reason: str):
+        async with self._pool.acquire() as conn:
+            await conn.execute("UPDATE background_jobs SET status = 'failed', updated_at = now() WHERE id = $1", job_id)
+
+    async def _retry_job(self, job_id: int):
+        async with self._pool.acquire() as conn:
+            await conn.execute("UPDATE background_jobs SET status = 'pending', locked_until = NULL, updated_at = now() WHERE id = $1", job_id)
