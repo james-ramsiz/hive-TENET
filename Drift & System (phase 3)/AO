@@ -1,0 +1,15 @@
+graph TD
+    API[FastAPI] -->|Enqueue Job| JQ[Postgres Job Queue]
+    JQ -->|SKIP LOCKED| W1[Background Worker Pool]
+    
+    W1 -->|Run| CD[Cascade Orchestrator]
+    CD -->|1. Pause Deck Service| Outbox[Outbox Table]
+    CD -->|2. Supersede Examples| Outbox
+    CD -->|3. Trigger Model Train| Outbox
+    
+    Outbox -->|Poll & Dispatch| W2[Outbox Relayer]
+    W2 -->|gRPC/HTTP| DS[Downstream Services]
+    
+    Cron[Chron Trigger] -->|Nightly| DD[Drift Detector Job]
+    DD -->|Sample Vectors| DB[(Postgres + pgvector)]
+    DD -->|If Drift > Threshold| JQ
