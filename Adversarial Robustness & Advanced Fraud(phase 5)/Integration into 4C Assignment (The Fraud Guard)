@@ -1,0 +1,58 @@
+# phase5/fraud_guard.py
+from __future__ import annotations
+import logging
+import asyncpg
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+class FraudGuard:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def check_reviewer(self, reviewer_id: str) -> bool:
+        """
+        Returns True if reviewer is clear to work.
+        Returns False if they have an active, critical fraud alert.
+        """
+        async with self._pool.acquire() as conn:
+            alert = await conn.fetchval(
+                """
+                SELECT 1 FROM fraud_alerts 
+                WHERE entity_type = 'reviewer' 
+                  AND entity_id = $1 
+                  AND severity = 'CRITICAL' 
+                  AND is_active = true
+                LIMIT 1
+                """,
+                reviewer_id
+            )
+            
+            if alert:
+                log.error("Blocked CRITICAL fraud reviewer %s from claiming work", reviewer_id)
+                return False
+                
+        return True
+
+    async def get_blocked_workers_for_reviewer(self, reviewer_id: str) -> list[str]:
+        """
+        If a reviewer is under investigation (MEDIUM severity) but not yet blocked,
+        we can still prevent them from reviewing workers they are linked to.
+        """
+        async with self._pool.acquire() as conn:
+            # This is a simplified query; in reality, you'd parse the JSONB 'details'
+            # from the alerts table to find the specific workers in the ring.
+            rows = await conn.fetch(
+                """
+                SELECT details->>'workers_in_ring' as workers
+                FROM fraud_alerts
+                WHERE entity_type = 'reviewer' AND entity_id = $1 AND is_active = true
+                """,
+                reviewer_id
+            )
+            blocked = []
+            for r in rows:
+                # workers_in_ring is stored as a JSON array string
+                import json
+                blocked.extend(json.loads(r['workers']))
+            return list(set(blocked))
