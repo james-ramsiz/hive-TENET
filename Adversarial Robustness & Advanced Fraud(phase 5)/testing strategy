@@ -1,0 +1,50 @@
+# tests/test_phase5.py
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from phase5.sybil_detector import SybilDetector
+from phase5.collusion_analyzer import CollusionAnalyzer
+
+@pytest.mark.asyncio
+async def test_sybil_detector_flags_multiple_accounts():
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    # Simulate DB returning count of 3 accounts for 1 device
+    mock_conn.fetchval.return_value = 3
+    
+    detector = SybilDetector(mock_pool, max_accounts_per_device=2)
+    alert_id = await detector.check_device("worker_1", "device_hash_123", "192.168.1.1")
+    
+    assert alert_id is not None
+    # Verify an alert was inserted
+    insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO fraud_alerts" in str(c)]
+    assert len(insert_calls) == 1
+
+@pytest.mark.asyncio
+async def test_collusion_analyzer_finds_ring():
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    # 1. Mock global baseline (50% acceptance)
+    # 2. Mock edges: Reviewer A -> Worker 1, 2, 3 (100% acceptance, 5 interactions each)
+    mock_conn.fetchval.return_value = 0.5
+    mock_conn.fetch.return_value = [
+        {"reviewer_id": "rev_A", "worker_id": "w_1", "interactions": 5, "acc_rate": 1.0},
+        {"reviewer_id": "rev_A", "worker_id": "w_2", "interactions": 5, "acc_rate": 1.0},
+        {"reviewer_id": "rev_A", "worker_id": "w_3", "interactions": 5, "acc_rate": 1.0},
+        {"reviewer_id": "rev_B", "worker_id": "w_4", "interactions": 5, "acc_rate": 0.5} # Normal
+    ]
+    
+    analyzer = CollusionAnalyzer(mock_pool, min_interactions=3, anomaly_threshold=0.3)
+    await analyzer.analyze({})
+    
+    # Verify alerts were written for rev_A, but not rev_B
+    insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO fraud_alerts" in str(c)]
+    assert len(insert_calls) == 1 # Only rev_A
+    
+    # Verify the alert was for rev_A
+    args = insert_calls[0].args
+    assert "rev_A" in args
+    assert "COLLUSION_RING" in args
