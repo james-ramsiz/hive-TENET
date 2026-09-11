@@ -1,0 +1,52 @@
+# phase3/cascade_orchestrator.py
+from __future__ import annotations
+import asyncio
+import logging
+from uuid import UUID
+import asyncpg
+
+log = logging.getLogger(__name__)
+
+class CascadeOrchestrator:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def run_cascade(self, payload: dict):
+        cascade_id = UUID(payload['cascade_id'])
+        job_type_id = payload['job_type_id']
+        
+        await self._update_state(cascade_id, 'PAUSING_ASSIGNMENTS')
+        await self._execute_step(cascade_id, 'pause_deck_service', job_type_id)
+        
+        await self._update_state(cascade_id, 'UPDATING_MODEL')
+        await self._execute_step(cascade_id, 'trigger_model_train', job_type_id)
+        
+        await self._update_state(cascade_id, 'SUPERSEDING_EXAMPLES')
+        await self._execute_step(cascade_id, 'supersede_examples', job_type_id)
+        
+        await self._update_state(cascade_id, 'CALIBRATING_REVIEWERS')
+        await self._execute_step(cascade_id, 'push_calibration', job_type_id)
+        
+        await self._update_state(cascade_id, 'COMPLETED')
+
+    async def _execute_step(self, cascade_id: UUID, event_type: str, job_type_id: str):
+        """
+        Writes an event to the Outbox. A separate Relayer worker will pick this up
+        and make the actual gRPC/HTTP call to the downstream service.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+                VALUES ('guideline', $1, $2, $3)
+                """,
+                str(cascade_id), event_type, 
+                asyncio.get_event_loop().run_in_executor(None, lambda: __import__('json').dumps({"job_type_id": job_type_id}))
+            )
+
+    async def _update_state(self, cascade_id: UUID, new_state: str):
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE guideline_cascades SET state = $2, updated_at = now() WHERE id = $1",
+                cascade_id, new_state
+            )
