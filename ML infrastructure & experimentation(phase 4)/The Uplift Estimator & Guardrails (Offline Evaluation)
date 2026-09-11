@@ -1,0 +1,73 @@
+# phase4/uplift_estimator.py
+from __future__ import annotations
+import logging
+from collections import Counter
+import asyncpg
+
+log = logging.getLogger(__name__)
+
+class UpliftEstimator:
+    def __init__(self, pool: asyncpg.Pool, max_avg_rank_delta=2.0, max_worker_concentration=0.25):
+        self._pool = pool
+        self._max_delta = max_avg_rank_delta
+        self._max_conc = max_worker_concentration
+
+    async def evaluate(self, payload: dict):
+        shadow_model_id = payload['shadow_model_id']
+        experiment_id = payload['experiment_id']
+        
+        async with self._pool.acquire() as conn:
+            # Fetch predictions and their realized outcomes (from behavioral_events)
+            rows = await conn.fetch(
+                """
+                SELECT sp.worker_id, sp.rank_delta, be.payload->>'outcome_label' as outcome
+                FROM shadow_predictions sp
+                LEFT JOIN behavioral_events be 
+                  ON be.payload->>'decision_id' = sp.decision_id::text
+                WHERE sp.shadow_model_id = $1
+                  AND sp.predicted_at >= now() - interval '24 hours'
+                """,
+                shadow_model_id
+            )
+            
+            if not rows:
+                log.info("No shadow predictions to evaluate.")
+                return
+
+            n = len(rows)
+            disagreements = [r for r in rows if r['rank_delta'] != 0]
+            disagreement_rate = len(disagreements) / n
+            avg_delta = sum(r['rank_delta'] for r in rows) / n
+            
+            # --- COUNTERFACTUAL UPLIFT ESTIMATION ---
+            # Did the prod model's top pick get accepted?
+            # If prod pick = accepted, and shadow pick was different, did shadow pick have a higher historical acceptance rate?
+            # (Simplified: we look at the overall acceptance rate of the shadow model's preferred job types)
+            uplift = 0.0 # Placeholder for complex cohort matching logic
+            
+            # --- GUARDRAILS ---
+            trip_reasons = []
+            
+            if abs(avg_delta) > self._max_delta:
+                trip_reasons.append(f"avg_rank_delta={avg_delta:.2f} > {self._max_delta}")
+                
+            worker_counts = Counter(r['worker_id'] for r in rows)
+            top_worker_share = max(worker_counts.values()) / n
+            if top_worker_share > self._max_conc:
+                trip_reasons.append(f"worker_concentration={top_worker_share:.2f} > {self._max_conc}")
+                
+            safety_tripped = bool(trip_reasons)
+            
+            if safety_tripped:
+                log.warning("Guardrail tripped for %s: %s", shadow_model_id, trip_reasons)
+                # In a real system, this would emit an event to turn off the experiment
+                # await conn.execute("UPDATE experiments SET is_active = false WHERE id = $1", experiment_id)
+
+            await conn.execute(
+                """
+                INSERT INTO shadow_evaluations 
+                (experiment_id, decisions_compared, disagreement_rate, avg_rank_delta, estimated_uplift, safety_tripped, trip_reasons)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                experiment_id, n, disagreement_rate, avg_delta, uplift, safety_tripped, trip_reasons
+            )
