@@ -1,0 +1,56 @@
+# phase5/sybil_detector.py
+from __future__ import annotations
+import logging
+import asyncpg
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+class SybilDetector:
+    """
+    Evaluates incoming work submissions for device-sharing.
+    """
+    def __init__(self, pool: asyncpg.Pool, max_accounts_per_device: int = 2):
+        self._pool = pool
+        self._max_accounts = max_accounts_per_device
+
+    async def check_device(self, worker_id: str, device_hash: str, ip_address: str) -> Optional[str]:
+        """
+        Returns an alert ID if fraud is detected, None otherwise.
+        """
+        async with self._pool.acquire() as conn:
+            # 1. Record this device mapping (idempotent)
+            await conn.execute(
+                """
+                INSERT INTO worker_devices (worker_id, device_hash, ip_address)
+                VALUES ($1, $2, $3::inet)
+                ON CONFLICT (worker_id, device_hash) DO NOTHING
+                """,
+                worker_id, device_hash, ip_address
+            )
+            
+            # 2. Count how many other worker accounts have used this exact device
+            shared_accounts = await conn.fetchval(
+                """
+                SELECT count(DISTINCT worker_id) FROM worker_devices 
+                WHERE device_hash = $1
+                """,
+                device_hash
+            )
+            
+            if shared_accounts > self._max_accounts:
+                log.warning("Sybil detected: Device %s associated with %d accounts", device_hash, shared_accounts)
+                
+                # 3. Create a critical fraud alert
+                alert_id = await conn.fetchval(
+                    """
+                    INSERT INTO fraud_alerts (entity_type, entity_id, alert_type, severity, details)
+                    VALUES ('worker', $1, 'SYBIL_MULTIPLE_ACCOUNTS', 'CRITICAL', $2)
+                    RETURNING alert_id
+                    """,
+                    worker_id,
+                    __import__('json').dumps({"device_hash": device_hash, "shared_count": int(shared_accounts)})
+                )
+                return str(alert_id)
+                
+        return None
