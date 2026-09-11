@@ -1,0 +1,81 @@
+# phase3/drift_detector.py
+from __future__ import annotations
+import asyncio
+import logging
+import json
+import numpy as np
+import asyncpg
+
+log = logging.getLogger(__name__)
+
+class DriftDetector:
+    def __init__(self, pool: asyncpg.Pool, drift_threshold: float = 0.35):
+        self._pool = pool
+        self._threshold = drift_threshold
+
+    async def detect_drift(self, payload: dict):
+        job_type_id = payload['job_type_id']
+        
+        # 1. Sample recent embeddings
+        async with self._pool.acquire() as conn:
+            # Assuming 'examples' table from 3A with 'embedding' column (vector type)
+            rows = await conn.fetch(
+                """
+                SELECT embedding::text FROM examples 
+                WHERE job_type_id = $1 AND is_superseded = false
+                ORDER BY random() LIMIT 1000
+                """,
+                job_type_id
+            )
+            
+            if len(rows) < 100:
+                log.info("Not enough samples for drift detection (%d)", len(rows))
+                return
+
+            # Parse pgvector text format '[1,2,3]' into numpy array
+            vectors = []
+            for r in rows:
+                vec_str = r['embedding'].strip('[]')
+                vectors.append([float(x) for x in vec_str.split(',')])
+            
+            mat = np.array(vectors)
+            
+            # 2. Calculate current centroid and mean pairwise distance
+            current_centroid = np.mean(mat, axis=0)
+            mean_pairwise_dist = np.mean(np.std(mat, axis=0)) # Simplified variance metric
+            
+            # 3. Fetch previous centroid
+            prev = await conn.fetchrow(
+                "SELECT centroid::text FROM drift_snapshots WHERE job_type_id = $1 ORDER BY snapshot_at DESC LIMIT 1",
+                job_type_id
+            )
+            
+            drift_score = 0.0
+            if prev:
+                prev_str = prev['centroid'].strip('[]')
+                prev_centroid = np.array([float(x) for x in prev_str.split(',')])
+                # Cosine distance (1 - similarity)
+                drift_score = 1 - np.dot(current_centroid, prev_centroid) / (
+                    np.linalg.norm(current_centroid) * np.linalg.norm(prev_centroid)
+                )
+            
+            # 4. Save snapshot
+            centroid_str = str(list(current_centroid))
+            await conn.execute(
+                """
+                INSERT INTO drift_snapshots (job_type_id, centroid, mean_pairwise_dist, drift_score)
+                VALUES ($1, $2, $3, $4)
+                """,
+                job_type_id, centroid_str, float(mean_pairwise_dist), float(drift_score)
+            )
+            
+            # 5. Enqueue Re-Embedding Job if drift exceeded
+            if drift_score >= self._threshold:
+                log.warning("Drift detected for job %s: score %.3f. Enqueuing re-embed.", job_type_id, drift_score)
+                await conn.execute(
+                    """
+                    INSERT INTO background_jobs (job_type, payload)
+                    VALUES ('reembed_examples', $1)
+                    """,
+                    json.dumps({"job_type_id": job_type_id})
+                )
