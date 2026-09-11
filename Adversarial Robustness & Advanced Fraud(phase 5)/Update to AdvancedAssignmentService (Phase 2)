@@ -1,0 +1,24 @@
+# phase2/assignment_service.py (Modifications)
+
+from phase5.fraud_guard import FraudGuard
+
+class AdvancedAssignmentService:
+    def __init__(self, pool, cache, cfg):
+        # ... previous init ...
+        self._fraud_guard = FraudGuard(pool)
+
+    async def get_batch_for_reviewer(self, reviewer_id: str, batch_size: int = 10) -> list[QueuedReview]:
+        # 0. FRAUD GUARD: Hard block critical reviewers
+        is_clear = await self._fraud_guard.check_reviewer(reviewer_id)
+        if not is_clear:
+            return []
+            
+        # 1. Fetch candidates...
+        # ... existing logic ...
+        
+        # 2. FRAUD GUARD: Filter out workers this reviewer is linked to
+        blocked_workers = await self._fraud_guard.get_blocked_workers_for_reviewer(reviewer_id)
+        if blocked_workers:
+            candidates = [c for c in candidates if c.worker_id not in blocked_workers]
+            
+        # 3. Continue with 4C Scoring...
