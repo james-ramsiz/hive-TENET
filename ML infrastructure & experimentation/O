@@ -1,0 +1,18 @@
+graph TD
+    Req[Deck Ranking Request] --> AR[Experiment Router]
+    AR -->|Control 90%| PM[Prod Model v1]
+    AR -->|Treatment 10%| PM
+    
+    PM -->|Score| DR[Deck Router]
+    DR -->|Log Decision| DB[(Postgres)]
+    
+    %% Shadow Path
+    DR -->|Async Fire-and-Forget| SM[Shadow Model v2]
+    SM -->|Shadow Score| SL[Shadow Logger]
+    SL -->|Insert Prediction| DB
+    
+    %% Offline Evaluation
+    JQ[Job Queue] -->|Nightly| UE[Uplift Estimator]
+    UE -->|Read Predictions + Outcomes| DB
+    UE -->|Check Guardrails| GR[Guardrails]
+    GR -->|Trip -> Abort| AR
