@@ -1,0 +1,65 @@
+-- migrations/0003_phase3_scale.sql
+
+-- ==========================================
+-- 1. DISTRIBUTED JOB QUEUE
+-- ==========================================
+CREATE TABLE background_jobs (
+    id              BIGSERIAL PRIMARY KEY,
+    job_type        TEXT NOT NULL, -- 'guideline_cascade', 'drift_detection'
+    payload         JSONB NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending', -- pending, running, completed, failed
+    attempts        INT NOT NULL DEFAULT 0,
+    max_attempts    INT NOT NULL DEFAULT 3,
+    locked_by       TEXT,
+    locked_until    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_jobs_pending ON background_jobs (created_at) 
+    WHERE status = 'pending' AND (locked_until IS NULL OR locked_until < now());
+
+-- ==========================================
+-- 2. TRANSACTIONAL OUTBOX
+-- ==========================================
+CREATE TABLE outbox_events (
+    id              BIGSERIAL PRIMARY KEY,
+    aggregate_type  TEXT NOT NULL, -- 'guideline', 'review'
+    aggregate_id    TEXT NOT NULL,
+    event_type      TEXT NOT NULL, -- 'GuidelinePaused', 'ExamplesSuperseded'
+    payload         JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published       BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX idx_outbox_unpublished ON outbox_events (created_at) WHERE published = false;
+
+-- ==========================================
+-- 3. CASCADE STATE (From 3B)
+-- ==========================================
+CREATE TYPE cascade_state AS ENUM (
+    'PENDING', 'PAUSING_ASSIGNMENTS', 'UPDATING_MODEL', 
+    'SUPERSEDING_EXAMPLES', 'CALIBRATING_REVIEWERS', 
+    'NOTIFYING_WORKERS', 'COMPLETED', 'FAILED'
+);
+
+CREATE TABLE guideline_cascades (
+    id              UUID PRIMARY KEY,
+    job_type_id     TEXT NOT NULL,
+    old_version_id  TEXT NOT NULL,
+    new_version_id  TEXT NOT NULL,
+    state           cascade_state NOT NULL DEFAULT 'PENDING',
+    initiated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ==========================================
+-- 4. DRIFT TRACKING (From 3A)
+-- ==========================================
+CREATE TABLE drift_snapshots (
+    id                BIGSERIAL PRIMARY KEY,
+    job_type_id       TEXT NOT NULL,
+    snapshot_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    centroid          vector(384) NOT NULL, -- Requires pgvector
+    mean_pairwise_dist REAL NOT NULL,
+    drift_score       REAL NOT NULL,
+    UNIQUE (job_type_id, snapshot_at)
+);
