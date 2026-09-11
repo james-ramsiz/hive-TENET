@@ -1,0 +1,45 @@
+-- migrations/0004_phase4_ml_infra.sql
+
+-- ==========================================
+-- 1. EXPERIMENT CONFIG (A/B FRAMEWORK)
+-- ==========================================
+CREATE TABLE experiments (
+    id              TEXT PRIMARY KEY, -- e.g., "exp_deck_ranking_v2"
+    name            TEXT NOT NULL,
+    is_active        BOOLEAN NOT NULL DEFAULT true,
+    control_implementation TEXT NOT NULL, -- e.g., "DeckRankerV1"
+    treatment_implementation TEXT NOT NULL, -- e.g., "DeckRankerV2"
+    traffic_split   INT NOT NULL, -- 0 to 100 (percentage to treatment)
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ==========================================
+-- 2. SHADOW PREDICTIONS & OUTCOMES
+-- ==========================================
+CREATE TABLE shadow_predictions (
+    decision_id      UUID NOT NULL, -- The prod decision ID
+    worker_id        TEXT NOT NULL,
+    job_type_id      TEXT NOT NULL,
+    prod_model_id    TEXT NOT NULL,
+    prod_score       REAL NOT NULL,
+    prod_rank        INT NOT NULL,
+    shadow_model_id  TEXT NOT NULL,
+    shadow_score     REAL NOT NULL,
+    shadow_rank      INT NOT NULL,
+    rank_delta       INT NOT NULL, -- shadow_rank - prod_rank
+    predicted_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (decision_id, worker_id)
+);
+CREATE INDEX ON shadow_predictions (predicted_at DESC);
+
+CREATE TABLE shadow_evaluations (
+    id               BIGSERIAL PRIMARY KEY,
+    experiment_id    TEXT NOT NULL,
+    evaluated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decisions_compared INT NOT NULL,
+    disagreement_rate REAL NOT NULL,
+    avg_rank_delta   REAL NOT NULL,
+    estimated_uplift REAL NOT NULL,
+    safety_tripped   BOOLEAN NOT NULL,
+    trip_reasons     TEXT[]
+);
