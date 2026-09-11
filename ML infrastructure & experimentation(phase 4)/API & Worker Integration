@@ -1,0 +1,67 @@
+# phase4/api.py
+from __future__ import annotations
+import json
+import asyncio
+from fastapi import FastAPI, Request, HTTPException, Header
+from pydantic import BaseModel
+import asyncpg
+
+from phase3.job_runner import JobRunner
+from phase4.experiment_router import ExperimentRouter
+from phase4.shadow_router import ShadowModelRouter, DeckRankingRequest
+from phase4.uplift_estimator import UpliftEstimator
+
+# Mock Models
+class ProdModel:
+    model_id = "prod_v1"
+    async def score(self, req): return [0.9, 0.1]
+
+class ShadowModel:
+    model_id = "shadow_v2"
+    async def score(self, req): return [0.8, 0.2]
+
+app = FastAPI(title="Phase 4 - ML Experimentation")
+
+@app.on_event("startup")
+async def startup():
+    app.state.pool = await asyncpg.create_pool("postgresql://user:pass@localhost:5432/platform", min_size=10, max_size=20)
+    
+    app.state.router = ExperimentRouter(app.state.pool)
+    await app.state.router.load_experiments()
+    
+    app.state.shadow_ranker = ShadowModelRouter(app.state.pool, ProdModel(), ShadowModel())
+    
+    # Register nightly evaluation job
+    handlers = {
+        'evaluate_shadow': UpliftEstimator(app.state.pool).evaluate
+    }
+    app.state.runner = JobRunner(app.state.pool, handlers)
+    asyncio.create_task(app.state.runner.run())
+
+@app.post("/v1/decks/rank")
+async def rank_deck(req: Request, body: dict, x_worker_id: str = Header(...)):
+    """
+    The main endpoint used by the Deck Assignment Service.
+    """
+    router = req.app.state.router
+    shadow_ranker = req.app.state.shadow_ranker
+    
+    # 1. Check if worker is in experiment
+    variant = router.get_variant("exp_deck_ranking_v2", x_worker_id)
+    
+    # 2. Create ranking request
+    rank_req = DeckRankingRequest(
+        worker_id=x_worker_id,
+        job_type_id=body['job_type_id'],
+        deck=body['available_decks']
+    )
+    
+    # 3. Execute ranking (Shadow model runs automatically in background if configured)
+    # In a real system, if variant == treatment, we'd use the new model as prod.
+    ranked = await shadow_ranker.rank(rank_req)
+    
+    return {
+        "experiment": "exp_deck_ranking_v2",
+        "variant": variant,
+        "ranked_decks": [{"job_type_id": r.job_type_id, "score": r.score} for r in ranked]
+    }
