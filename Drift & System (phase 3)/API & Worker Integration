@@ -1,0 +1,69 @@
+# phase3/api.py
+from __future__ import annotations
+import json
+import asyncio
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
+from uuid import uuid4
+import asyncpg
+
+from phase3.job_runner import JobRunner
+from phase3.cascade_orchestrator import CascadeOrchestrator
+from phase3.drift_detector import DriftDetector
+
+app = FastAPI(title="Phase 3 - Scale & Drift")
+
+class GuidelineChangeReq(BaseModel):
+    job_type_id: str
+    old_version_id: str
+    new_version_id: str
+
+@app.on_event("startup")
+async def startup():
+    app.state.pool = await asyncpg.create_pool("postgresql://user:pass@localhost:5432/platform", min_size=10, max_size=20)
+    
+    # Wire up handlers for the Job Runner
+    cascade = CascadeOrchestrator(app.state.pool)
+    drift = DriftDetector(app.state.pool)
+    
+    handlers = {
+        'guideline_cascade': cascade.run_cascade,
+        'drift_detection': drift.detect_drift
+    }
+    
+    app.state.runner = JobRunner(app.state.pool, handlers)
+    # Start the runner in the background
+    asyncio.create_task(app.state.runner.run())
+
+@app.on_event("shutdown")
+async def shutdown():
+    app.state.runner._stop.set()
+    await app.state.pool.close()
+
+@app.post("/v1/guidelines/cascade", status_code=202)
+async def trigger_cascade(req: Request, body: GuidelineChangeReq):
+    cascade_id = str(uuid4())
+    
+    async with req.app.state.pool.acquire() as conn:
+        # 1. Create Cascade Record
+        await conn.execute(
+            """
+            INSERT INTO guideline_cascades (id, job_type_id, old_version_id, new_version_id)
+            VALUES ($1, $2, $3, $4)
+            """,
+            cascade_id, body.job_type_id, body.old_version_id, body.new_version_id
+        )
+        
+        # 2. Enqueue Background Job
+        await conn.execute(
+            """
+            INSERT INTO background_jobs (job_type, payload)
+            VALUES ('guideline_cascade', $1)
+            """,
+            json.dumps({
+                "cascade_id": cascade_id,
+                "job_type_id": body.job_type_id
+            })
+        )
+        
+    return {"cascade_id": cascade_id, "status": "cascade_initiated"}
