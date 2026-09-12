@@ -1,0 +1,105 @@
+# phase6/payout_engine.py
+from __future__ import annotations
+import logging
+import asyncpg
+from uuid import UUID
+
+log = logging.getLogger(__name__)
+
+class PayoutEngine:
+    def __init__(self, pool: asyncpg.Pool, holding_period_hours: int = 72):
+        self._pool = pool
+        self._holding_period = holding_period_hours
+
+    async def process_review_outcome(self, worker_id: str, review_id: UUID, state: str, amount_cents: int):
+        """
+        Called when a review reaches a terminal state.
+        """
+        idem_key = f"payout:{review_id}"
+        
+        async with self._pool.acquire() as conn:
+            # 1. Idempotency check
+            existing = await conn.fetchval(
+                "SELECT 1 FROM ledger_entries WHERE idempotency_key = $1", idem_key
+            )
+            if existing:
+                log.debug("Payout for review %s already processed. Skipping.", review_id)
+                return
+
+            # 2. Determine entry type
+            if state == 'ACCEPTED' or state == 'OVERTURNED':
+                entry_type = 'WORK_PAYOUT' if state == 'ACCEPTED' else 'APPEAL_OVERTURN_BONUS'
+                # 3. Insert ledger entry in PENDING state (held for fraud review)
+                await conn.execute(
+                    """
+                    INSERT INTO ledger_entries 
+                    (worker_id, amount, entry_type, reference_type, reference_id, idempotency_key, status)
+                    VALUES ($1, $2, $3, 'REVIEW_QUEUE', $4, $5, 'PENDING')
+                    """,
+                    worker_id, amount_cents, entry_type, review_id, idem_key
+                )
+                
+                # 4. Update wallet balance immediately, but actual payout is delayed
+                await conn.execute(
+                    "UPDATE worker_wallets SET current_balance = current_balance + $2, updated_at = now() WHERE worker_id = $1",
+                    worker_id, amount_cents
+                )
+                log.info("Credited %d cents to worker %s for review %s (PENDING)", amount_cents, worker_id, review_id)
+                
+    async def freeze_account(self, worker_id: str, alert_id: UUID):
+        """
+        Called when Phase 5 Fraud Alert is triggered.
+        """
+        async with self._pool.acquire() as conn:
+            # Freeze the wallet
+            await conn.execute(
+                "UPDATE worker_wallets SET is_frozen = true WHERE worker_id = $1",
+                worker_id
+            )
+            # Reverse any PENDING ledger entries
+            await conn.execute(
+                """
+                INSERT INTO ledger_entries (worker_id, amount, entry_type, reference_type, reference_id, idempotency_key, status)
+                VALUES ($1, 0, 'FRAUD_FREEZE', 'FRAUD_ALERT', $2, $3, 'FROZEN')
+                """,
+                worker_id, alert_id, f"freeze:{alert_id}"
+            )
+            # Update pending entries to reversed
+            await conn.execute(
+                """
+                UPDATE ledger_entries 
+                SET status = 'REVERSED' 
+                WHERE worker_id = $1 AND status = 'PENDING'
+                """,
+                worker_id
+            )
+            # Deduct the reversed amounts from the wallet balance
+            await conn.execute(
+                """
+                UPDATE worker_wallets 
+                SET current_balance = current_balance - (
+                    SELECT COALESCE(SUM(amount), 0) FROM ledger_entries 
+                    WHERE worker_id = $1 AND status = 'REVERSED'
+                )
+                WHERE worker_id = $1
+                """,
+                worker_id
+            )
+            log.warning("Froze wallet and reversed pending funds for fraud worker %s", worker_id)
+
+    async def settle_pending_payouts(self):
+        """
+        Runs nightly via the Phase 3 Job Queue. 
+        Moves funds from PENDING to SETTLED after the holding period expires.
+        """
+        async with self._pool.acquire() as conn:
+            results = await conn.execute(
+                """
+                UPDATE ledger_entries 
+                SET status = 'SETTLED' 
+                WHERE status = 'PENDING' 
+                  AND created_at < now() - ($1 || ' hours')::interval
+                """,
+                str(self._holding_period)
+            )
+            log.info("Settled %d pending payouts.", results.split()[-1])
