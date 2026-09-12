@@ -1,0 +1,42 @@
+# tests/test_phase6.py
+import pytest
+from unittest.mock import AsyncMock
+from phase6.payout_engine import PayoutEngine
+import asyncpg
+
+@pytest.mark.asyncio
+async def test_idempotency_prevents_double_payout():
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    # Simulate the payout already existing
+    mock_conn.fetchval.return_value = 1 # Returns 1 -> means idempotency key exists
+    
+    engine = PayoutEngine(mock_pool)
+    
+    # First call
+    await engine.process_review_outcome("worker_1", "review_1", "ACCEPTED", 150)
+    # Second call (e.g., event replayed by Kafka)
+    await engine.process_review_outcome("worker_1", "review_1", "ACCEPTED", 150)
+    
+    # Verify INSERT was NEVER called because it was short-circuited
+    insert_calls = [c for c in mock_conn.execute.call_args_list if "INSERT INTO ledger_entries" in str(c)]
+    assert len(insert_calls) == 0
+
+@pytest.mark.asyncio
+async def test_freeze_account_reverses_pending_funds():
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    engine = PayoutEngine(mock_pool)
+    await engine.freeze_account("worker_1", "alert_123")
+    
+    # Verify wallet was frozen
+    freeze_calls = [c for c in mock_conn.execute.call_args_list if "is_frozen = true" in str(c)]
+    assert len(freeze_calls) == 1
+    
+    # Verify pending entries were reversed
+    reverse_calls = [c for c in mock_conn.execute.call_args_list if "status = 'REVERSED'" in str(c)]
+    assert len(reverse_calls) == 1
