@@ -1,0 +1,9 @@
+graph TD
+    SM[State Machine / Phase 1] -->|Terminal State| OL[Outbox Table / Phase 3]
+    FA[Fraud Alerts / Phase 5] -->|Block Flag| PG[Payout Gateway]
+    
+    OL -->|Relayer| PE[Payout Engine]
+    PE -->|Idempotency Check| DB[(Postgres)]
+    PE -->|Insert Ledger Entry| DB
+    DB -->|Freeze Funds| PG
+    PG -->|Webhook| Stripe/ACH
