@@ -1,0 +1,24 @@
+# phase1/state_machine.py (Modifications)
+
+class AppealsStateMachine:
+    # ... previous init ...
+    
+    async def transition(self, review_id: UUID, actor_id: str, to_state: ReviewState, reason: str = None) -> bool:
+        # ... previous transition logic ...
+        
+        # NEW: If terminal state, emit to outbox for PayoutEngine
+        if to_state in [ReviewState.ACCEPTED, ReviewState.OVERTURNED, ReviewState.UPHELD]:
+            await self._pool.execute(
+                """
+                INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+                VALUES ('review', $1, 'REVIEW_TERMINAL', $2)
+                """,
+                str(review_id),
+                json.dumps({
+                    "review_id": str(review_id),
+                    "worker_id": worker_id, # assumed fetched earlier
+                    "state": to_state.value,
+                    "amount_cents": 150 # Payout amount, fetched from job_type config
+                })
+            )
+        return True
