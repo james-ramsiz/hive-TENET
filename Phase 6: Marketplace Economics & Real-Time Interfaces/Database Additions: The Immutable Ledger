@@ -1,0 +1,23 @@
+-- migrations/0006_phase6_economics.sql
+
+CREATE TABLE worker_wallets (
+    worker_id       TEXT PRIMARY KEY,
+    current_balance INTEGER NOT NULL DEFAULT 0, -- Stored in cents to avoid float errors
+    currency       TEXT NOT NULL DEFAULT 'USD',
+    is_frozen      BOOLEAN NOT NULL DEFAULT false,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE ledger_entries (
+    id              BIGSERIAL PRIMARY KEY,
+    worker_id       TEXT NOT NULL REFERENCES worker_wallets(worker_id),
+    amount          INTEGER NOT NULL, -- Positive for credit, negative for debit
+    entry_type      TEXT NOT NULL, -- 'WORK_PAYOUT', 'APPEAL_OVERTURN_BONUS', 'FRAUD_FREEZE', 'PAYOUT_TO_BANK'
+    reference_type  TEXT NOT NULL, -- 'REVIEW_QUEUE', 'FRAUD_ALERT'
+    reference_id    UUID NOT NULL, -- review_id or alert_id
+    idempotency_key TEXT NOT NULL UNIQUE, -- Prevents double-counting
+    status          TEXT NOT NULL DEFAULT 'SETTLED', -- 'PENDING', 'SETTLED', 'FROZEN', 'REVERSED'
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_ledger_worker ON ledger_entries (worker_id, created_at DESC);
+CREATE INDEX idx_ledger_pending ON ledger_entries (worker_id) WHERE status = 'PENDING';
