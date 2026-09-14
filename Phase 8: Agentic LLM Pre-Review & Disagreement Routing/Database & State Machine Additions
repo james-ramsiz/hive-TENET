@@ -1,0 +1,19 @@
+-- migrations/0008_phase8_llm_prereview.sql
+
+-- Extend the state enum
+ALTER TYPE review_state ADD VALUE IF NOT EXISTS 'PENDING_LLM';
+ALTER TYPE review_state ADD VALUE IF NOT EXISTS 'AUTO_ACCEPTED';
+ALTER TYPE review_state ADD VALUE IF NOT EXISTS 'AUTO_REJECTED';
+
+-- Add LLM specific tracking
+ALTER TABLE review_queue 
+    ADD COLUMN llm_model_id TEXT,
+    ADD COLUMN llm_reasoning TEXT,       -- The LLM's chain of thought
+    ADD COLUMN is_disagreement BOOLEAN DEFAULT false;
+
+-- Job type configuration for stake levels
+CREATE TABLE job_type_configs (
+    job_type_id TEXT PRIMARY KEY,
+    stake_level TEXT NOT NULL, -- 'LOW', 'MEDIUM', 'HIGH'
+    enable_llm_auto_accept BOOLEAN NOT NULL DEFAULT true
+);
