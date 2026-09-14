@@ -1,0 +1,102 @@
+# phase8/llm_worker.py
+from __future__ import annotations
+import asyncio
+import logging
+import json
+import asyncpg
+from typing import List
+
+log = logging.getLogger(__name__)
+
+class LLMIngestionWorker:
+    """
+    Polls the queue for PENDING_LLM items, runs the LLM, and routes traffic.
+    """
+    def __init__(self, pool: asyncpg.Pool, llm_client, batch_size: int = 20):
+        self._pool = pool
+        self._llm = llm_client
+        self._batch_size = batch_size
+        self._stop = asyncio.Event()
+
+    async def run(self):
+        log.info("LLM Ingestion Worker started.")
+        while not self._stop.is_set():
+            processed = await self._process_batch()
+            if processed == 0:
+                await asyncio.sleep(2)
+
+    async def _process_batch(self) -> int:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Claim PENDING_LLM items
+                rows = await conn.fetch(
+                    """
+                    SELECT rq.review_id, rq.scrubbed_payload, jtc.stake_level, jtc.enable_llm_auto_accept
+                    FROM review_queue rq
+                    JOIN job_type_configs jtc ON rq.job_type_id = jtc.job_type_id
+                    WHERE rq.state = 'PENDING_LLM'
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    self._batch_size
+                )
+                
+                if not rows:
+                    return 0
+
+                # 2. Run LLM batch inference
+                review_ids = [r['review_id'] for r in rows]
+                payloads = [r['scrubbed_payload'] for r in rows]
+                
+                # llm_client.batch_predict returns list of (prediction, confidence, reasoning)
+                llm_results = await self._llm.batch_predict(payloads)
+                
+                # 3. Route based on confidence and stake level
+                for row, (pred, conf, reason) in zip(rows, llm_results):
+                    stake = row['stake_level']
+                    auto_accept_enabled = row['enable_llm_auto_accept']
+                    
+                    # Update the queue with LLM data
+                    await conn.execute(
+                        """
+                        UPDATE review_queue 
+                        SET ml_prediction = $2, ml_confidence = $3, llm_reasoning = $4, llm_model_id = $5
+                        WHERE review_id = $1
+                        """,
+                        row['review_id'], pred, float(conf), reason, self._llm.model_id
+                    )
+                    
+                    # Routing logic
+                    if auto_accept_enabled and stake == 'LOW' and conf > 0.99:
+                        # Auto-process
+                        new_state = 'AUTO_ACCEPTED' if pred == 'ACCEPTED' else 'AUTO_REJECTED'
+                        await conn.execute(
+                            "UPDATE review_queue SET state = $2 WHERE review_id = $1",
+                            row['review_id'], new_state
+                        )
+                        
+                        # If auto-accepted, credit wallet (Phase 6)
+                        if new_state == 'AUTO_ACCEPTED':
+                            await conn.execute(
+                                """
+                                INSERT INTO ledger_entries (worker_id, amount, entry_type, reference_type, reference_id, idempotency_key, status)
+                                SELECT worker_id, 150, 'WORK_PAYOUT', 'REVIEW_QUEUE', review_id, 'payout:' || review_id::text, 'PENDING'
+                                FROM review_queue WHERE review_id = $1
+                                """,
+                                row['review_id']
+                            )
+                        # Auto-rejected goes to appeal window automatically
+                        else:
+                            await conn.execute(
+                                "UPDATE review_queue SET appeal_deadline = now() + interval '72 hours' WHERE review_id = $1",
+                                row['review_id']
+                            )
+                            
+                    else:
+                        # Route to human queue
+                        await conn.execute(
+                            "UPDATE review_queue SET state = 'PENDING' WHERE review_id = $1",
+                            row['review_id']
+                        )
+
+                return len(rows)
