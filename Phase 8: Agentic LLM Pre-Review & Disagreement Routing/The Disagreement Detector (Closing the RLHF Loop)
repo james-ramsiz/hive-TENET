@@ -1,0 +1,53 @@
+# phase1/state_machine.py (Modifications)
+
+from phase7.active_learning import is_active_learning_item # Mock import for flow
+
+class AppealsStateMachine:
+    # ... previous init ...
+    
+    async def submit_review(self, review_id: UUID, reviewer_id: str, is_accepted: bool, reason: str = "") -> bool:
+        async with self._pool.acquire() as conn:
+            # 1. Fetch LLM prediction if it exists
+            row = await conn.fetchrow(
+                "SELECT ml_prediction, ml_confidence FROM review_queue WHERE review_id = $1", 
+                review_id
+            )
+            
+            human_label = "ACCEPTED" if is_accepted else "REJECTED"
+            
+            # 2. DISAGREEMENT DETECTION
+            if row and row['ml_prediction']:
+                if row['ml_prediction'] != human_label:
+                    # Flag as disagreement!
+                    await conn.execute(
+                        "UPDATE review_queue SET is_disagreement = true WHERE review_id = $1",
+                        review_id
+                    )
+                    log.warning("Disagreement detected on review %s. LLM: %s, Human: %s", 
+                                review_id, row['ml_prediction'], human_label)
+                    
+                    # Insert into high-value RLHF corpus
+                    await conn.execute(
+                        """
+                        INSERT INTO model_training_corpus 
+                        (review_id, human_label, ml_prediction, ml_confidence, human_reviewer_id)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (review_id) DO NOTHING
+                        """,
+                        review_id, human_label, row['ml_prediction'], float(row['ml_confidence']), reviewer_id
+                    )
+                    
+                    # OPTIONAL: Trigger a fraud alert if human disagrees with a 99% confident LLM
+                    if float(row['ml_confidence']) > 0.99:
+                        await conn.execute(
+                            """
+                            INSERT INTO fraud_alerts (entity_type, entity_id, alert_type, severity, details)
+                            VALUES ('reviewer', $1, 'LLM_DISAGREEMENT_ANOMALY', 'MEDIUM', $2)
+                            """,
+                            reviewer_id,
+                            json.dumps({"review_id": str(review_id), "llm_conf": float(row['ml_confidence'])})
+                        )
+
+        # 3. Proceed with normal state transition
+        to_state = ReviewState.ACCEPTED if is_accepted else ReviewState.REJECTED
+        return await self.transition(review_id, reviewer_id, to_state, reason)
