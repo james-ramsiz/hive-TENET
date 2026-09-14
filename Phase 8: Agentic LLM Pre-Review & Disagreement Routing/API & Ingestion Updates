@@ -1,0 +1,35 @@
+# phase1/api.py (Modifications)
+
+@app.post("/v1/ingest", status_code=201)
+async def ingest_work(req: Request, body: IngestReq):
+    scrubber = req.app.state.scrubber
+    pool = req.app.state.pool
+    
+    # 1. Scrub PII
+    scrub_result = scrubber.scrub_payload(body.payload)
+    raw_encrypted = fernet.encrypt(json.dumps(body.payload).encode('utf-8'))
+    
+    # 2. Determine initial state
+    async with pool.acquire() as conn:
+        # Check if job type supports LLM pre-review
+        llm_enabled = await conn.fetchval(
+            "SELECT enable_llm_auto_accept FROM job_type_configs WHERE job_type_id = $1",
+            body.job_type_id
+        )
+        
+        initial_state = 'PENDING_LLM' if llm_enabled else 'PENDING'
+        
+        # 3. Insert into queue
+        await conn.execute(
+            """
+            INSERT INTO review_queue 
+            (job_type_id, worker_id, raw_payload_enc, scrubbed_payload, display_payload, state)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            body.job_type_id, body.worker_id, raw_encrypted,
+            json.dumps(scrub_result.scrubbed_payload),
+            json.dumps(scrub_result.display_payload),
+            initial_state
+        )
+        
+    return {"status": "queued", "initial_state": initial_state}
