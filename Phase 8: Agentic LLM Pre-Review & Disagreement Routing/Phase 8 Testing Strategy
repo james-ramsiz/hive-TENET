@@ -1,0 +1,62 @@
+# tests/test_phase8.py
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from phase8.llm_worker import LLMIngestionWorker
+import asyncpg
+
+@pytest.mark.asyncio
+async def test_llm_worker_auto_accepts_low_stake_confident():
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    # Simulate 1 item in queue
+    mock_conn.fetch.return_value = [{
+        "review_id": "r1", 
+        "scrubbed_payload": {}, 
+        "stake_level": "LOW", 
+        "enable_llm_auto_accept": True
+    }]
+    
+    # Mock LLM: 99.5% confident ACCEPTED
+    mock_llm = AsyncMock()
+    mock_llm.batch_predict.return_value = [("ACCEPTED", 0.995, "Looks good")]
+    
+    worker = LLMIngestionWorker(mock_pool, mock_llm, batch_size=10)
+    processed = await worker._process_batch()
+    
+    assert processed == 1
+    
+    # Verify the state was updated to AUTO_ACCEPTED
+    state_update_call = [c for c in mock_conn.execute.call_args_list if "state = $2" in str(c)]
+    assert len(state_update_call) > 0
+    assert "AUTO_ACCEPTED" in str(state_update_call[0])
+    
+    # Verify the wallet was credited
+    ledger_call = [c for c in mock_conn.execute.call_args_list if "INSERT INTO ledger_entries" in str(c)]
+    assert len(ledger_call) == 1
+
+@pytest.mark.asyncio
+async def test_llm_worker_routes_high_stake_to_human():
+    mock_pool = AsyncMock()
+    mock_conn = AsyncMock()
+    mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+    
+    mock_conn.fetch.return_value = [{
+        "review_id": "r2", 
+        "scrubbed_payload": {}, 
+        "stake_level": "HIGH",  # High stake
+        "enable_llm_auto_accept": True
+    }]
+    
+    # LLM is 99.9% confident
+    mock_llm = AsyncMock()
+    mock_llm.batch_predict.return_value = [("ACCEPTED", 0.999, "Looks good")]
+    
+    worker = LLMIngestionWorker(mock_pool, mock_llm, batch_size=10)
+    processed = await worker._process_batch()
+    
+    # Verify it was routed to PENDING (human queue), not AUTO_ACCEPTED
+    state_update_call = [c for c in mock_conn.execute.call_args_list if "state = $2" in str(c)]
+    assert "AUTO_ACCEPTED" not in str(state_update_call[0])
+    assert "PENDING" in str(state_update_call[0])
