@@ -1,0 +1,15 @@
+graph TD
+    Ingest[Ingestion API] -->|State: PENDING_LLM| DB[(Postgres)]
+    JQ[Job Queue / Phase 3] -->|Pull PENDING_LLM| LW[LLM Ingestion Worker]
+    LW -->|Prompt| LLM[Llama-3 / GPT-4o]
+    LLM -->|Score & Conf| LW
+    
+    LW -->|Conf > 99% & Low Stake?| AA[Auto-Accept / Auto-Reject]
+    AA -->|Insert Ledger / Set Appeal Window| DB
+    
+    LW -->|Uncertain or High Stake?| H[State: PENDING Human Review]
+    H --> 4C[4C Algorithm / Phase 2]
+    
+    4C -->|Human Reviews| SM[State Machine]
+    SM -->|Compare to LLM Pred| DD[Disagreement Detector]
+    DD -->|Flag for RLHF| DB
