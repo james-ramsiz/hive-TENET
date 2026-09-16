@@ -1,0 +1,27 @@
+async submitRating(jobId: string, reviewerId: string, payload: RatingPayload) {
+  return await prisma.$transaction(async (tx) => {
+    // 1. Insert the rating
+    const rating = await tx.jobRating.upsert({
+      where: { job_id_reviewer_role: { jobId, reviewerRole: payload.role } },
+      create: { ...payload, status: 'BLIND' },
+      update: { ...payload }
+    });
+
+    // 2. Check if partner has submitted
+    const partnerRole = payload.role === 'CLIENT' ? 'PROFESSIONAL' : 'CLIENT';
+    const partnerRating = await tx.jobRating.findUnique({
+      where: { job_id_reviewer_role: { jobId, reviewerRole: partnerRole } }
+    });
+
+    if (partnerRating && partnerRating.status === 'BLIND') {
+      // 3. Transition both to PUBLISHED
+      await tx.jobRating.update({ where: { id: rating.id }, data: { status: 'PUBLISHED', published_at: new Date() } });
+      await tx.jobRating.update({ where: { id: partnerRating.id }, data: { status: 'PUBLISHED', published_at: new Date() } });
+      
+      // 4. Calculate new scores and emit events
+      await this.updateReputation(tx, reviewerId);
+      await this.updateReputation(tx, partnerRating.reviewerId);
+    }
+    return rating;
+  });
+}
