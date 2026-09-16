@@ -1,0 +1,19 @@
+/packages/
+  /rating-service/
+    /src/
+      /api/
+        routes.rating.ts      # REST/gRPC endpoints
+        controllers/
+      /services/
+        rating.service.ts     # Core business logic (blind review, score calc)
+        dispute.service.ts   # Handles review disputes
+      /db/
+        repositories/         # Postgres data access
+      /events/
+        producers/            # Kafka event emitters
+        consumers/            # Kafka event listeners (e.g., Job.Completed)
+      /utils/
+        score.calculator.ts  # Weighted average logic
+      app.ts                  # Express/Fastify entry point
+  /search-indexer/
+  /booking-service/
