@@ -1,0 +1,16 @@
+graph TD
+    Client[Client App] --> APIGW[API Gateway / BFF]
+    APIGW --> RatingService[Rating Service]
+    RatingService --> DB[(PostgreSQL: ratings_db)]
+    RatingService --> Cache[(Redis: Rating Cache)]
+    RatingService --> EventBus[Kafka Event Bus]
+    
+    EventBus --> SearchSvc[Search Indexer Service]
+    EventBus --> BookingSvc[Booking Restriction Service]
+    EventBus --> NotifSvc[Notification Service]
+    
+    SearchSvc --> ES[(Elasticsearch)]
+    BookingSvc --> BookingDB[(Booking Rules DB)]
+    
+    JobSvc[Job Service] --> EventBus
+    NotifSvc --> Client
