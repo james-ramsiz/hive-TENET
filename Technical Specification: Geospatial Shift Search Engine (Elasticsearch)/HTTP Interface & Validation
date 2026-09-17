@@ -1,0 +1,66 @@
+// /packages/search-api/src/api/routes.search.ts
+import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { z } from 'zod';
+import { shiftSearchService } from '../services/shift-search.service';
+import { logger } from '../utils/logger';
+
+// Zod schema for strict input validation
+const GeoSearchQuerySchema = z.object({
+  lat: z.coerce.number().min(-90).max(90),
+  lon: z.coerce.number().min(-180).max(180),
+  radius: z.coerce.number().min(1).max(100).default(50), // Default 50mi, hard cap 100mi
+  size: z.coerce.number().int().min(1).max(100).default(20),
+  cursor: z.string().optional(), // Base64 encoded cursor in production
+});
+
+export async function registerSearchRoutes(app: FastifyInstance) {
+  
+  /**
+   * GET /api/v1/shifts/near-me
+   * Finds shifts near a worker.
+   */
+  app.get('/api/v1/shifts/near-me', async (request: FastifyRequest, reply: FastifyReply) => {
+    
+    // 1. Validate Input
+    const parsed = GeoSearchQuerySchema.safeParse(request.query);
+    
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: 'INVALID_COORDINATES',
+        message: 'Latitude must be -90 to 90, Longitude must be -180 to 180.',
+        details: parsed.error.issues,
+      });
+    }
+
+    const { lat, lon, radius, size, cursor } = parsed.data;
+
+    // NOTE: In production, cursor would be decoded from Base64 here.
+    // ASSUMPTION: passing raw string array for simplicity in this example.
+    const cursorArray = cursor ? [cursor] : undefined;
+
+    try {
+      // 2. Execute Service Call
+      const { results, nextCursor } = await shiftSearchService.findShiftsNearWorker({
+        lat,
+        lon,
+        radiusMiles: radius,
+        size,
+        cursor: cursorArray,
+      });
+
+      // 3. Format Response
+      return reply.status(200).send({
+        total_results: results.length,
+        next_cursor: nextCursor ? nextCursor[0] : null,
+        shifts: results,
+      });
+
+    } catch (error) {
+      logger.error(`Route /shifts/near-me failed: ${error.message}`);
+      return reply.status(503).send({
+        error: 'SERVICE_UNAVAILABLE',
+        message: 'Unable to process search requests at this time.',
+      });
+    }
+  });
+}
