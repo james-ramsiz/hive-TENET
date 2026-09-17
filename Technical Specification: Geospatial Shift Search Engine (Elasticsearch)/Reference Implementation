@@ -1,0 +1,52 @@
+import { Client } from '@elastic/elasticsearch';
+
+export class ShiftSearchService {
+  constructor(private esClient: Client) {}
+
+  async findShiftsNearWorker(lat: number, lon: number, radiusMiles: number = 50, size: number = 20) {
+    const esQuery = {
+      index: 'shifts_index',
+      body: {
+        query: {
+          bool: {
+            filter: [
+              { term: { status: 'OPEN' } },
+              {
+                geo_distance: {
+                  distance: `${radiusMiles}mi`,
+                  distance_type: 'arc',
+                  location: { lat, lon }
+                }
+              }
+            ]
+          }
+        },
+        sort: [
+          {
+            _geo_distance: {
+              location: [lon, lat], // Note: GeoJSON [lon, lat] order in sort
+              order: 'asc',
+              unit: 'mi',
+              distance_type: 'arc'
+            }
+          }
+        ],
+        size: size
+      }
+    };
+
+    try {
+      const result = await this.esClient.search(esQuery);
+      return result.hits.hits.map(hit => ({
+        id: hit._source.shift_id,
+        lat: hit._source.location.lat,
+        lon: hit._source.location.lon,
+        distance_miles: hit.sort[0], // ES attaches the calculated distance to the sort array
+        pay_rate: hit._source.pay_rate
+      }));
+    } catch (error) {
+      // Implement robust logging here
+      throw new Error('Geospatial search failed');
+    }
+  }
+}
