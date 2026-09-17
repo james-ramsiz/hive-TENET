@@ -1,0 +1,10 @@
+graph TD
+    ClientApp[Client App] --> APIGW[API Gateway]
+    APIGW --> ShiftSvc[Shift Service / Postgres]
+    ShiftSvc --> EventBus[Kafka: shift_events]
+    EventBus --> Indexer[Search Indexer Service]
+    Indexer --> ES[(Elasticsearch: shifts_index)]
+    
+    WorkerApp[Worker App] --> APIGW
+    APIGW --> SearchAPI[Search API / BFF]
+    SearchAPI --> ES
