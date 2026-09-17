@@ -1,0 +1,45 @@
+// /packages/search-api/src/clients/es.client.ts
+import { Client } from '@elastic/elasticsearch';
+import { logger } from '../utils/logger'; // Assume Pino logger
+
+// ASSUMPTION: Credentials are provided via environment variables
+const esNode = process.env.ES_NODE || 'http://localhost:9200';
+const esApiKey = process.env.ES_API_KEY;
+const esUsername = process.env.ES_USERNAME;
+const esPassword = process.env.ES_PASSWORD;
+
+const authConfig = esApiKey 
+  ? { apiKey: esApiKey } 
+  : esUsername && esPassword 
+    ? { username: esUsername, password: esPassword } 
+    : undefined;
+
+if (!authConfig) {
+  logger.warn('Elasticsearch authentication not configured. Proceeding without auth.');
+}
+
+export const esClient = new Client({
+  node: esNode,
+  auth: authConfig,
+  tls: {
+    // ASSUMPTION: In production, rejectUnauthorized should be true with valid certs.
+    // Set to false only for local dev with self-signed certs.
+    rejectUnauthorized: process.env.NODE_ENV === 'production' 
+  },
+  // Operational safety: Prevent memory leaks by capping connections
+  maxRetries: 5,
+  requestTimeout: 10000, // 10s timeout for ES queries
+  sniffOnStart: process.env.NODE_ENV === 'production', 
+});
+
+// Health check utility
+export async function checkEsConnection(): Promise<boolean> {
+  try {
+    const health = await esClient.cluster.health();
+    logger.info(`Elasticsearch connected. Status: ${health.status}`);
+    return health.status !== 'red';
+  } catch (error) {
+    logger.error(`Elasticsearch connection failed: ${error.message}`);
+    return false;
+  }
+}
