@@ -1,0 +1,30 @@
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "status": "OPEN" } },
+        {
+          "geo_distance": {
+            "distance": "50mi", 
+            "distance_type": "arc", 
+            "location": {
+              "lat": 40.7128,
+              "lon": -74.0060
+            }
+          }
+        }
+      ]
+    }
+  },
+  "sort": [
+    {
+      "_geo_distance": {
+        "location": [ -74.0060, 40.7128 ],
+        "order": "asc",
+        "unit": "mi",
+        "distance_type": "arc"
+      }
+    }
+  ],
+  "size": 20
+}
