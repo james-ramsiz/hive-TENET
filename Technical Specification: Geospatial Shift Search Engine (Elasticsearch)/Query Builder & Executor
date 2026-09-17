@@ -1,0 +1,109 @@
+// /packages/search-api/src/services/shift-search.service.ts
+import { esClient } from '../clients/es.client';
+import { logger } from '../utils/logger';
+import { ResponseError } from '@elastic/elasticsearch';
+
+// Domain Models
+export interface ShiftSearchInput {
+  lat: number;
+  lon: number;
+  radiusMiles: number;
+  size?: number;
+  cursor?: string[] | undefined; // For search_after pagination
+}
+
+export interface ShiftSearchResult {
+  id: string;
+  lat: number;
+  lon: number;
+  distance_miles: number;
+  pay_rate: number;
+  start_time: string;
+}
+
+const INDEX_NAME = 'shifts_index';
+
+export class ShiftSearchService {
+  /**
+   * Finds open shifts near a worker's location, sorted by distance.
+   */
+  public async findShiftsNearWorker(input: ShiftSearchInput): Promise<{ results: ShiftSearchResult[]; nextCursor?: string[] }> {
+    const { lat, lon, radiusMiles, size = 20, cursor } = input;
+
+    // FACT: ES sort array for geo_points requires [lon, lat] order (GeoJSON standard)
+    // while the geo_distance filter accepts { lat, lon }. 
+    const esQuery = {
+      index: INDEX_NAME,
+      body: {
+        size: size,
+        query: {
+          bool: {
+            filter: [
+              { term: { status: 'OPEN' } },
+              {
+                range: {
+                  start_time: {
+                    // INFERRED: Only show shifts starting in the future
+                    gte: 'now',
+                  },
+                },
+              },
+              {
+                geo_distance: {
+                  distance: `${radiusMiles}mi`,
+                  distance_type: 'arc', // Haversine for accuracy
+                  location: { lat, lon },
+                },
+              },
+            ],
+          },
+        },
+        sort: [
+          {
+            _geo_distance: {
+              location: [lon, lat], // MUST BE [lon, lat]
+              order: 'asc',
+              unit: 'mi',
+              distance_type: 'arc',
+            },
+          },
+        ],
+        // search_after is the safest, most performant way to paginate deep results
+        search_after: cursor, 
+      },
+    };
+
+    try {
+      logger.debug(`Executing ES geo-search for lat: ${lat}, lon: ${lon}`);
+      const response = await esClient.search<unknown, { hits: { hits: any[] } }>(esQuery);
+
+      const results: ShiftSearchResult[] = response.hits.hits.map((hit) => ({
+        id: hit._source.shift_id,
+        lat: hit._source.location.lat,
+        lon: hit._source.location.lon,
+        pay_rate: hit._source.pay_rate,
+        start_time: hit._source.start_time,
+        // FACT: ES attaches the calculated sort value to the `hit.sort` array
+        distance_miles: hit.sort ? Math.round(hit.sort[0] * 100) / 100 : 0, 
+      }));
+
+      // Get the last sort array to use as the cursor for the next page
+      const nextCursor = results.length > 0 
+        ? response.hits.hits[response.hits.hits.length - 1].sort 
+        : undefined;
+
+      return { results, nextCursor };
+    } catch (error) {
+      if (error instanceof ResponseError) {
+        logger.error(`ES Query Error: ${error.statusCode} - ${error.message}`);
+        // TODO: Implement alerting on specific ES 4xx/5xx errors
+      } else {
+        logger.error(`Unexpected ES transport error: ${error.message}`);
+      }
+      // Fail gracefully - throw a domain-specific error to be handled by the route layer
+      throw new Error('Search service temporarily unavailable.');
+    }
+  }
+}
+
+export const shiftSearchService = new ShiftSearchService();
