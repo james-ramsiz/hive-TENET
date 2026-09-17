@@ -1,0 +1,16 @@
+{
+  "mappings": {
+    "properties": {
+      "shift_id": { "type": "keyword" },
+      "client_id": { "type": "keyword" },
+      "status": { "type": "keyword" }, 
+      "start_time": { "type": "date" },
+      "pay_rate": { "type": "float" },
+      "skills_required": { "type": "keyword" },
+      "location": {
+        "type": "geo_point"
+      },
+      "max_travel_distance_miles": { "type": "float" }
+    }
+  }
+}
