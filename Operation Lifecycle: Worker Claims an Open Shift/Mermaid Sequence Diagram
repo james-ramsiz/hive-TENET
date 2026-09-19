@@ -1,0 +1,38 @@
+sequenceDiagram
+    participant App as Worker Mobile App
+    participant Gateway as API Gateway
+    participant Auth as Auth Middleware
+    participant ShiftAPI as Shift Service (API)
+    participant Redis as Redis (Distributed Lock)
+    participant DB as PostgreSQL
+    participant Outbox as Outbox Relay Worker
+    participant MQ as Kafka (shift.claimed)
+    participant Pay as Payment Service
+
+    App->>Gateway: POST /api/v1/shifts/{id}/claim
+    Gateway->>Auth: Validate JWT
+    Auth-->>Gateway: 200 OK (worker_id extracted)
+    Gateway->>ShiftAPI: Forward request
+    ShiftAPI->>Redis: SETNX shift:lock:{id} (TTL 5s)
+    alt Lock Failed
+        Redis-->>ShiftAPI: Null (already locked)
+        ShiftAPI-->>App: 409 Conflict (Try again shortly)
+    else Lock Success
+        Redis-->>ShiftAPI: OK
+        ShiftAPI->>DB: BEGIN; SELECT * FROM shifts WHERE id=$1 FOR UPDATE;
+        DB-->>ShiftAPI: Shift data
+        ShiftAPI->>ShiftAPI: Validate status == 'OPEN'
+        ShiftAPI->>DB: UPDATE shifts SET status='CLAIMED', worker_id=$2; INSERT INTO outbox...
+        DB-->>ShiftAPI: COMMIT
+        ShiftAPI->>Redis: DEL shift:lock:{id}
+        ShiftAPI-->>App: 200 OK (Shift Claimed)
+        
+        loop Async Polling
+            Outbox->>DB: SELECT * FROM outbox WHERE status='PENDING'
+            Outbox->>MQ: Publish 'shift.claimed'
+            Outbox->>DB: UPDATE outbox SET status='PROCESSED'
+        end
+        
+        MQ->>Pay: Consume 'shift.claimed'
+        Pay->>Pay: Capture pre-auth on Business card
+    end
