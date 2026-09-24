@@ -1,0 +1,10 @@
+const span = tracer.startSpan('getNearbyShifts');
+const redisSearchSpan = tracer.startSpan('redis.geosearch', { childOf: span });
+const nearbyShiftIds = await redis.geoSearch(...);
+redisSearchSpan.finish();
+
+const redisHydrateSpan = tracer.startSpan('redis.hyrdate_pipeline', { childOf: span });
+const shiftMetadata = await pipeline.exec();
+redisHydrateSpan.finish();
+
+span.finish();
