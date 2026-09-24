@@ -1,0 +1,39 @@
+import prometheusClient, { Histogram, Counter } from 'prom-client';
+
+// 1. Define the HTTP latency histogram
+// Buckets are tailored for API endpoints targeting <200ms p99
+const httpRequestDurationMicroseconds = new Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.125, 
+    0.15, 0.175, 0.2, 0.25, 0.3, 0.5, 1, 2.5 // Focus is around the 0.2s mark
+  ]
+});
+
+// 2. Define a counter for cache hits/misses (vital for the Redis architecture)
+const cacheHitsTotal = new Counter({
+  name: 'shift_search_cache_hits_total',
+  help: 'Total number of Redis cache hits vs fallbacks',
+  labelNames: ['source'] // 'redis' or 'postgres'
+});
+
+// 3. Express Middleware to automatically record duration
+export function metricsMiddleware(req, res, next) {
+  const start = process.hrtime.bigint(); // High-resolution timer
+
+  res.on('finish', () => {
+    const end = process.hrtime.bigint();
+    const durationSeconds = Number(end - start) / 1e9; // Convert ns to s
+    
+    // Normalize route to prevent high cardinality (e.g., /shifts/123 -> /shifts/:id)
+    const route = req.route ? req.route.path : req.path;
+
+    httpRequestDurationMicroseconds
+      .labels(req.method, route, res.statusCode.toString())
+      .observe(durationSeconds);
+  });
+
+  next();
+}
