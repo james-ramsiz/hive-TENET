@@ -1,0 +1,23 @@
+async function getNearbyShifts(workerLat: number, workerLng: number, radiusMiles: number) {
+  // 1. Convert miles to meters for Redis
+  const radiusMeters = radiusMiles * 1609.34;
+
+  // 2. Query Redis GEOSEARCH (returns IDs + distances, sorted by distance)
+  // Performance: ~1-3ms p99 latency
+  const nearbyShiftIds = await redis.geoSearch(
+    'open_shifts:geo',
+    { longitude: workerLng, latitude: workerLat },
+    { radius: radiusMeters, unit: 'm', COUNT: 50, SORT: 'ASC' }
+  );
+
+  if (nearbyShiftIds.length === 0) return [];
+
+  // 3. Hydrate metadata (Pipeline Redis call to fetch 50 hashes at once)
+  // Performance: ~2-5ms p99 latency
+  const pipeline = redis.pipeline();
+  nearbyShiftIds.forEach(id => pipeline.hgetall(`shift:meta:${id}`));
+  const shiftMetadata = await pipeline.exec();
+
+  // 4. Return formatted payload
+  return shiftMetadata;
+}
