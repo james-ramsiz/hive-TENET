@@ -1,0 +1,16 @@
+async function getShifts(req: Request, res: Response) {
+  const { lat, lng, radius } = req.query;
+  const page = parseInt(req.query.page as string) || 1;
+  const limit = 50;
+
+  if (page === 1) {
+    // Fast path: Redis
+    const shifts = await shiftService.getNearbyShifts(lat, lng, radius);
+    return res.json({ shifts, nextPage: shifts.length === limit ? 2 : null });
+  } else {
+    // Slow path: PostGIS (Acceptable for pagination)
+    const offset = (page - 1) * limit;
+    const shifts = await shiftService.getShiftsFromPostgres(lat, lng, radius, limit, offset);
+    return res.json({ shifts, nextPage: shifts.length === limit ? page + 1 : null });
+  }
+}
