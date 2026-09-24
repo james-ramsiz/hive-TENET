@@ -1,0 +1,2 @@
+# Calculate the 99th percentile latency over the last 5 minutes for GET /shifts
+histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{route="/api/v1/shifts", method="GET"}[5m])) by (le))
