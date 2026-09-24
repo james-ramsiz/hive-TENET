@@ -1,0 +1,11 @@
+-- Assuming $1=lat, $2=lng, $3=radius_meters, $4=limit, $5=offset
+SELECT *, 
+  ST_Distance(location_geom, ST_MakePoint($1, $2)::geography) as distance
+FROM shifts
+WHERE status = 'OPEN'
+  -- Step 1: Fast bounding box filter (Uses GiST Index)
+  AND location_geom && ST_Expand(ST_MakePoint($1, $2)::geography, $3)
+  -- Step 2: Exact circular distance filter
+  AND ST_DWithin(location_geom, ST_MakePoint($1, $2)::geography, $3)
+ORDER BY distance ASC
+LIMIT $4 OFFSET $5;
