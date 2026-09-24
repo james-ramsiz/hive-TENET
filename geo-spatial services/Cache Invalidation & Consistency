@@ -1,0 +1,3 @@
+// On consuming 'shift.claimed'
+await redis.zRem('open_shifts:geo', shiftId);
+await redis.del(`shift:meta:${shiftId}`);
