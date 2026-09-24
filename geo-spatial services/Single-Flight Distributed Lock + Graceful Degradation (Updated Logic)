@@ -1,0 +1,18 @@
+async function getNearbyShifts(lat, lng, radiusMeters) {
+  const results = await redis.geoSearch('open_shifts:geo', ...);
+  
+  if (results.length === 0) {
+    // CACHE MISS - but is it a cold start or are there genuinely no shifts?
+    
+    // Trigger rebuild in the background (non-blocking)
+    rebuildGeospatialCache().catch(console.error); 
+
+    // Do NOT fall back to Postgres here to protect the DB.
+    // Return empty array. The mobile app will display "No shifts nearby."
+    // The next time the user pulls to refresh (in ~2 seconds), the cache will be warm.
+    
+    return []; 
+  }
+  
+  return hydrate(results);
+}
