@@ -1,0 +1,33 @@
+import Redlock from 'redlock';
+
+const redlock = new Redlock([redisClient]);
+
+async function rebuildGeospatialCache(): Promise<void> {
+  // Acquire a distributed lock across all Shift Service instances
+  // TTL: 30 seconds (ensures if this worker crashes, another can try later)
+  let lock;
+  try {
+    lock = await redlock.acquire(['lock:rebuild:geocache'], 30000);
+  } catch (err) {
+    // Another instance is already rebuilding. 
+    // Wait a short period and return (the caller will return empty/stale data)
+    await new Promise(resolve => setTimeout(resolve, 500));
+    return;
+  }
+
+  try {
+    // 1. Fetch all OPEN shifts from DB
+    const openShifts = await db.query('SELECT id, lng, lat FROM shifts WHERE status = $1', ['OPEN']);
+    
+    // 2. Use a Pipeline to bulk-insert into Redis Geoset
+    const pipeline = redisClient.pipeline();
+    openShifts.forEach(shift => {
+      pipeline.geoAdd('open_shifts:geo', { longitude: shift.lng, latitude: shift.lat, member: shift.id });
+    });
+    await pipeline.exec();
+
+  } finally {
+    // 3. Release the lock so normal operations resume
+    await lock.release();
+  }
+}
