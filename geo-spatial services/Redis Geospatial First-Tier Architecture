@@ -1,0 +1,7 @@
+// Add shift to the Redis GeoSet named 'open_shifts:geo'
+// Syntax: GEOADD key longitude latitude member
+await redis.geoAdd('open_shifts:geo', {
+  longitude: shift.lng,
+  latitude: shift.lat,
+  member: shift.id
+});
