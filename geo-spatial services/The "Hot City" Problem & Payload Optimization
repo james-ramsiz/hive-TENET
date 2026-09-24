@@ -1,0 +1,24 @@
+async function getNearbyShifts(lat: number, lng: number, radiusMeters: number) {
+  // 1. Limit to 50 results, sorted by distance
+  const results = await redis.geoSearch('open_shifts:geo', 
+    { latitude: lat, longitude: lng, radius: radiusMeters, unit: 'm' },
+    { COUNT: 50, SORT: 'ASC', WITHDIST: true } // WITHDIST returns the distance
+  );
+
+  if (results.length === 0) return [];
+
+  // 2. Use a Redis Pipeline to fetch ONLY the fields required for the list view
+  // Do not fetch full descriptions or business PII.
+  const pipeline = redis.pipeline();
+  results.forEach(res => {
+    pipeline.hmget(`shift:meta:${res.member}`, 'id', 'role', 'pay_rate', 'start_time');
+  });
+  
+  const metaData = await pipeline.exec();
+
+  // 3. Map distances back to the hydrated objects
+  return results.map((res, i) => ({
+    ...metaData[i],
+    distance_meters: res.distance
+  }));
+}
