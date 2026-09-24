@@ -1,0 +1,28 @@
+sequenceDiagram
+    participant App as Worker App (1,000 concurrent users)
+    participant API as Shift Service
+    participant Redis as Redis
+    participant DB as PostgreSQL
+    
+    Note over Redis: Redis is empty (Cold Start)
+    
+    App->>API: GET /shifts (User 1)
+    API->>Redis: GEOSEARCH
+    Redis-->>API: Empty []
+    API->>API: Trigger rebuildGeospatialCache()
+    Note over API: Acquires Redlock. Queries DB. Bulk inserts to Redis.
+    API-->>App: 200 OK [] (Empty list)
+    
+    App->>API: GET /shifts (Users 2-1000)
+    API->>Redis: GEOSEARCH
+    Redis-->>API: Empty []
+    API->>API: Trigger rebuildGeospatialCache()
+    Note over API: Redlock Acquisition Fails. Waits 500ms.
+    API-->>App: 200 OK [] (Empty list)
+    
+    Note over API: Cache rebuild finishes successfully. Redis is warm.
+    
+    App->>API: GET /shifts (User 1001)
+    API->>Redis: GEOSEARCH
+    Redis-->>API: [Shift1, Shift2... Shift50]
+    API-->>App: 200 OK [Shifts]
