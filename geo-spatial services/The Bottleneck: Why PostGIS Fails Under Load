@@ -1,0 +1,4 @@
+SELECT * FROM shifts 
+WHERE status = 'OPEN' 
+AND ST_DWithin(location_geom, ST_MakePoint($1, $2)::geography, $3) -- radius in meters
+ORDER BY start_time ASC;
