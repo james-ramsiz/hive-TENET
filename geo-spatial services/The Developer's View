@@ -1,0 +1,53 @@
+import { trace, context, SpanStatusCode } from '@opentelemetry/api';
+
+const tracer = trace.getTracer('shift-service-tracer');
+
+async function getNearbyShifts(lat: number, lng: number, radiusMeters: number) {
+  // Start a manual span for the business logic block
+  const span = tracer.startSpan('getNearbyShifts_business_logic');
+  
+  try {
+    // Link this execution to the incoming HTTP trace
+    return await context.with(trace.setSpan(context.active(), span), async () => {
+      
+      // 1. Redis GEOSEARCH Span
+      const redisSearchSpan = tracer.startSpan('redis.geosearch');
+      let results;
+      try {
+        results = await redis.geoSearch('open_shifts:geo', 
+          { latitude: lat, longitude: lng, radius: radiusMeters, unit: 'm' },
+          { COUNT: 50, SORT: 'ASC', WITHDIST: true }
+        );
+        // Add custom metadata to the span for debugging
+        redisSearchSpan.setAttribute('db.system', 'redis');
+        redisSearchSpan.setAttribute('result.count', results.length);
+      } catch (err) {
+        redisSearchSpan.recordException(err);
+        redisSearchSpan.setStatus({ code: SpanStatusCode.ERROR });
+        throw err;
+      } finally {
+        redisSearchSpan.end();
+      }
+
+      if (results.length === 0) {
+        cacheHitsTotal.inc({ source: 'postgres' }); // Metric update
+        return [];
+      }
+      
+      cacheHitsTotal.inc({ source: 'redis' }); // Metric update
+
+      // 2. Redis Pipeline Hydrate Span
+      const redisHydrateSpan = tracer.startSpan('redis.hydrate_pipeline');
+      const pipeline = redis.pipeline();
+      results.forEach(res => pipeline.hmget(`shift:meta:${res.member}`, 'id', 'role', 'pay_rate'));
+      
+      const metaData = await pipeline.exec();
+      redisHydrateSpan.setAttribute('pipeline.size', results.length);
+      redisHydrateSpan.end();
+
+      return results.map((res, i) => ({ ...metaData[i], distance_meters: res.distance }));
+    });
+  } finally {
+    span.end();
+  }
+}
