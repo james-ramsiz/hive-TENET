@@ -1,0 +1,17 @@
+POST /shifts_index/_update/shift_12345?retry_on_conflict=3
+{
+  "script": {
+    "source": """
+      if (ctx._source.status == 'open') {
+        ctx._source.status = 'claimed'; 
+        ctx._source.claimed_by = params.dasher_id;
+      } else {
+        ctx.op = 'noop';
+      }
+    """,
+    "lang": "painless",
+    "params": {
+      "dasher_id": "dasher_987"
+    }
+  }
+}
