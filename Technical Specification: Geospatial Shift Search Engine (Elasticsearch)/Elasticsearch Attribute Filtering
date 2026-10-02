@@ -1,0 +1,13 @@
+POST /dashers_index/_search
+{
+  "size": 20,
+  "query": {
+    "bool": {
+      "filter": [
+        { "terms": { "dasher_id": ["dasher_987", "dasher_123", "...50 IDs..."] }},
+        { "term": { "vehicle_type": "car" }},
+        { "range": { "rating": { "gte": 4.8 }}}
+      ]
+    }
+  }
+}
