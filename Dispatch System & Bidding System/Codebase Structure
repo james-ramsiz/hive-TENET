@@ -1,0 +1,24 @@
+geospatial-shift-engine/
+├── cmd/
+│   └── api/main.go              # Entry point for the Ingestion API Gateway
+├── internal/
+│   ├── api/
+│   │   ├── handlers.go          # REST/gRPC handlers for pings and search
+│   │   └── middleware.go        # Auth, RateLimiting, Tracing
+│   ├── config/
+│   │   └── config.go            # Environment variables, ES/Redis endpoints
+│   ├── pipeline/
+│   │   ├── flink/               # Flink jobs (Java/Scala) for debounce/filter
+│   │   └── kafka/               # Kafka producer/consumer wrappers
+│   ├── repository/
+│   │   ├── elastic/             # ES client, query builders, mapping init
+│   │   └── redis/               # Redis client, GEOSEARCH wrappers
+│   └── domain/
+│       ├── shift.go             # Shift entity definitions
+│       └── dasher.go            # Dasher entity definitions
+├── deployments/
+│   ├── docker-compose.yml       # Local dev environment
+│   └── helm/                    # K8s deployment charts
+├── scripts/
+│   └── es_mappings.json         # Elasticsearch index initialization
+└── go.mod                       # Dependency manager
