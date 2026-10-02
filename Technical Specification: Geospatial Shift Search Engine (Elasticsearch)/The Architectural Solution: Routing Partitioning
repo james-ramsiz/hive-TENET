@@ -1,0 +1,8 @@
+PUT /shifts_index
+{
+  "settings": {
+    "number_of_shards": 30,
+    "number_of_replicas": 2,
+    "index.routing_partition_size": 3 
+  }
+}
