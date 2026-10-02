@@ -1,0 +1,11 @@
+POST /shifts_index/_search?routing=9q8yy // Coarse Geohash for the stadium
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "status": "open" } },
+        { "geo_distance": { "distance": "2km", "location": {"lat": 37.78, "lon": -122.41} }}
+      ]
+    }
+  }
+}
