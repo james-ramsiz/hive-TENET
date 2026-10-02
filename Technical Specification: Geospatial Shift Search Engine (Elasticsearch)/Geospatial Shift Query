@@ -1,0 +1,42 @@
+POST /shifts_index/_search
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "status": "open" } },
+        { "term": { "required_vehicle_type": "car" } },
+        {
+          "range": {
+            "start_time": {
+              "gte": "now",
+              "lte": "now+15m"
+            }
+          }
+        },
+        {
+          "range": {
+            "min_dasher_rating": { "lte": 4.8 } 
+          }
+        },
+        {
+          "geo_distance": {
+            "distance": "5km",
+            "location": { "lat": 37.7749, "lon": -122.4194 },
+            "validation_method": "strict"
+          }
+        }
+      ]
+    }
+  },
+  "sort": [
+    {
+      "_geo_distance": {
+        "location": { "lat": 37.7749, "lon": -122.4194 },
+        "order": "asc",
+        "unit": "km"
+      }
+    },
+    { "payout": { "order": "desc" } }
+  ],
+  "size": 20
+}
