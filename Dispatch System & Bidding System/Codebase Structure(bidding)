@@ -1,0 +1,20 @@
+auction-shift-engine/
+├── cmd/
+│   ├── api/main.go              # REST API for search & initialization
+│   └── websocket/main.go        # WebSocket hub for real-time bidding
+├── internal/
+│   ├── api/
+│   │   ├── search_handler.go    # ES query handlers for auction discovery
+│   │   └── bid_handler.go       # WebSocket message handlers for bids
+│   ├── repository/
+│   │   ├── elastic/             # ES client, auction mapping management
+│   │   └── redis/               # Redis ZSET operations (ZADD, ZRANGE)
+│   ├── service/
+│   │   └── auction_state.go     # Business logic for auction transitions
+│   └── domain/
+│       ├── auction.go           # Auction entity
+│       └── bid.go               # Bid entity
+├── deployments/
+│   └── docker-compose.yml       # Local dev environment
+└── scripts/
+    └── es_auction_mappings.json # ES index initialization
