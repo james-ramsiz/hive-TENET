@@ -1,0 +1,22 @@
+PUT /shifts_index
+{
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "shift_id": { "type": "keyword" },
+      "start_time": { "type": "date" },
+      "end_time": { "type": "date" },
+      "location": { "type": "geo_point" },
+      "radius_meters": { "type": "integer" },
+      "required_vehicle_type": { "type": "keyword" },
+      "min_dasher_rating": { "type": "float" },
+      "payout": { "type": "double" },
+      "status": { "type": "keyword" }
+    }
+  },
+  "settings": {
+    "number_of_shards": 10,
+    "number_of_replicas": 1,
+    "refresh_interval": "1s"
+  }
+}
