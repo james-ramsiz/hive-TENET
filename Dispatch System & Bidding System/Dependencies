@@ -1,0 +1,8 @@
+| Dependency | Version Constraint | Purpose | Failure Impact |
+| :--- | :--- | :--- | :--- |
+| **Redis** | 6.x+ (Cluster) | Real-time bid sorting (ZSET). | Complete auction failure; no new bids can be processed. |
+| **Elasticsearch** | 8.x+ | Geospatial auction search. | Dashers cannot discover new auctions. |
+| **PostgreSQL** | 14+ | Persistent bid ledger. | No immediate user impact, but loss of audit trail. |
+| **Apache Flink** | 1.17+ | Auction TTL management & settlement. | Auctions never close; shifts go unfulfilled. |
+| **WebSocket Library** | N/A | Real-time push to clients. | Users not notified of outbids. |
+
