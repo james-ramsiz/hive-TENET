@@ -1,0 +1,7 @@
+{
+  "range": {
+    "last_seen": {
+      "gte": "now-30s/s" 
+    }
+  }
+}
