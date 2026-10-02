@@ -1,0 +1,13 @@
+// Inside Flink KeyedProcessFunction
+ValueState<DasherState> state = ...;
+
+public void processElement(DasherPing ping, Context ctx, Collector<UpdateAction> out) {
+    DasherState prev = state.value();
+    if (prev == null || haversineDistance(prev.lat, prev.lon, ping.lat, ping.lon) > 10) {
+        // Dasher moved > 10m. Emit update to ES.
+        out.collect(new EsUpdateAction(ping.dasher_id, ping.lat, ping.lon, ping.timestamp));
+        state.update(new DasherState(ping.lat, ping.lon, ping.timestamp));
+    }
+    // Reset the heartbeat timer
+    ctx.timerService().registerProcessingTimeTimer(currentTime + 60000);
+}
