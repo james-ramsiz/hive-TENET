@@ -1,0 +1,17 @@
+func TestConcurrentBids(t *testing.T) {
+    shiftID := createAuctionInES()
+    
+    var wg sync.WaitGroup
+    for i := 0; i < 1000; i++ {
+        wg.Add(1)
+        go func(dasherID string, amount float64) {
+            defer wg.Done()
+            submitWebSocketBid(shiftID, dasherID, amount)
+        }(fmt.Sprintf("dasher_%d", i), 10.00 + float64(i)/100.00)
+    }
+    wg.Wait()
+    
+    // Verify Redis ZSET has exactly 1000 entries
+    count := redis.ZCard(ctx, fmt.Sprintf("auction_bids:%s", shiftID))
+    assert.Equal(t, 1000, count)
+}
