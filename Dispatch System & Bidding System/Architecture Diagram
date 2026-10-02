@@ -1,0 +1,40 @@
+graph TD
+    subgraph Mobile Clients
+        DasherApp[Dasher Mobile App]
+    end
+
+    subgraph Ingestion Layer
+        IngestAPI[Ingestion API Gateway]
+        Kafka[(Kafka: dasher-locations)]
+    end
+
+    subgraph Stream Processing
+        Flink[Apache Flink Cluster]
+    end
+
+    subgraph Search & State Layer
+        Redis[(Redis: Geo ZSET)]
+        ES[(Elasticsearch: shifts_index)]
+    end
+
+    subgraph Upstream/Downstream
+        Dispatch[Dispatch Engine]
+        AssignService[Assignment Service]
+    end
+
+    DasherApp --|gRPC/REST Heartbeat| IngestAPI
+    IngestAPI --|Publish Ping| Kafka
+    Kafka --|Consume| Flink
+    Flink --|Filter/Debounce| Kafka
+    Flink --|Update Presence| Redis
+    Dispatch --|Create Shift| ES
+    
+    DasherApp --|1. Search Shifts| IngestAPI
+    IngestAPI --|2. GEOSEARCH| Redis
+    Redis --|3. Return Dasher IDs| IngestAPI
+    IngestAPI --|4. Multi-Get Attributes| ES
+    ES --|5. Return Metadata| IngestAPI
+    IngestAPI --|6. Return Shifts| DasherApp
+
+    DasherApp --|Claim Shift| ES
+    ES --|Update Status| AssignService
