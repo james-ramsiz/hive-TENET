@@ -1,0 +1,43 @@
+graph TD
+    subgraph Mobile Clients
+        DasherApp[Dasher Mobile App]
+    end
+
+    subgraph Gateway & Realtime Layer
+        APIGW[API Gateway / WebSocket Hub]
+    end
+
+    subgraph Search & Auction Layer
+        ES[(Elasticsearch: Auctions Index)]
+        Redis[(Redis: Bid Leaderboards ZSET)]
+    end
+
+    subgraph Event Processing
+        Kafka[(Kafka: bid-events)]
+        Flink[Apache Flink: Auction Workers]
+    end
+
+    subgraph Upstream/Downstream
+        Market[Marketplace Engine]
+        Settle[Settlement Service]
+    end
+
+    Market --|1. Create Shift Auction| ES
+    Market --|Notify| APIGW
+    
+    DasherApp --|2. Search Nearby Auctions| APIGW
+    APIGW --|3. Query ES| ES
+    ES --|4. Return Auctions| APIGW
+    APIGW --|Return Results| DasherApp
+
+    DasherApp --|5. Submit Bid (WebSocket)| APIGW
+    APIGW --|ZADD Bid| Redis
+    Redis --|Pub/Sub Bid Update| APIGW
+    APIGW --|Push Outbid Notice| DasherApp
+
+    APIGW --|Log Bid| Kafka
+    Flink --|Auction TTL Expires| Kafka
+    
+    Flink --|Fetch Winner| Redis
+    Flink --|Update Auction Status| ES
+    Flink --|Trigger Payout| Settle
