@@ -1,0 +1,23 @@
+// internal/domain/dasher.go
+package domain
+
+import "time"
+
+// DasherPII represents the highly sensitive data stored in PostgreSQL.
+// NEVER serialized to JSON or sent to the bidding service.
+type DasherPII struct {
+    DasherPublicID    string    `json:"dasher_public_id"`
+    SSNCiphertext     []byte    `json:"ssn_ciphertext"`      // Encrypted via KMS
+    DLCiphertext      []byte    `json:"dl_ciphertext"`       // Encrypted via KMS
+    BackgroundStatus  string    `json:"background_status"`   // "pending", "clear", "suspended"
+    CheckExpiresAt    time.Time `json:"check_expires_at"`
+    CreatedAt         time.Time `json:"created_at"`
+}
+
+// DasherPublic represents the safe, non-PII data sent to Elasticsearch.
+type DasherPublic struct {
+    DasherPublicID string  `json:"dasher_public_id"`
+    VehicleType    string  `json:"vehicle_type"`
+    Rating         float64 `json:"rating"`
+    // Location is transient, stored in Redis, not in ES.
+}
