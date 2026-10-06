@@ -1,0 +1,47 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_DB: identity_db
+      POSTGRES_USER: identity_user
+      POSTGRES_PASSWORD: local_secret
+    ports:
+      - "5432:5432"
+  
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+  
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+
+  identity-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.identity
+    depends_on: [postgres]
+    ports:
+      - "8081:8081"
+    environment:
+      - DB_HOST=postgres
+      - KMS_KEY_ID=local_mock_key
+
+  bidding-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.bidding
+    depends_on: [redis, elasticsearch]
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_HOST=redis
+      - ES_HOST=elasticsearch
