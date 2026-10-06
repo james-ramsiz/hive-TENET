@@ -1,0 +1,98 @@
+// internal/bidding/service.go
+package bidding
+
+import (
+    "context"
+    "encoding/json"
+    "log/slog"
+    "net/http"
+    "sync"
+    "time"
+)
+
+type Service struct {
+    repo Repository
+    hub  *Hub
+}
+
+type Hub struct {
+    // Map of auction_id to connected Dashers
+    rooms map[string]map[string]*websocket.Conn
+    mu    sync.RWMutex
+}
+
+func NewService(repo Repository) *Service {
+    return &Service{
+        repo: repo,
+        hub: &Hub{
+            rooms: make(map[string]map[string]*websocket.Conn),
+        },
+    }
+}
+
+type BidEvent struct {
+    Action string  `json:"action"` // "BID", "OUTBID", "WON"
+    Amount float64 `json:"amount"`
+}
+
+func (s *Service) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+    // 1. Extract dasher_id and auction_id from URL params / JWT
+    dasherID := r.URL.Query().Get("dasher_id")
+    auctionID := r.URL.Query().Get("auction_id")
+
+    // 2. Upgrade to WebSocket
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        slog.Error("WS upgrade failed", "err", err)
+        return
+    }
+    defer conn.Close()
+
+    // 3. Register connection in Hub
+    s.hub.mu.Lock()
+    if s.hub.rooms[auctionID] == nil {
+        s.hub.rooms[auctionID] = make(map[string]*websocket.Conn)
+    }
+    s.hub.rooms[auctionID][dasherID] = conn
+    s.hub.mu.Unlock()
+
+    // 4. Read loop
+    for {
+        _, msg, err := conn.ReadMessage()
+        if err != nil {
+            break // Disconnect
+        }
+
+        var event BidEvent
+        json.Unmarshal(msg, &event)
+
+        if event.Action == "BID" {
+            s.processBid(context.Background(), auctionID, dasherID, event.Amount)
+        }
+    }
+}
+
+func (s *Service) processBid(ctx context.Context, auctionID, dasherID string, amount float64) {
+    // Save to Redis
+    err := s.repo.SubmitBid(ctx, auctionID, dasherID, amount)
+    if err != nil {
+        slog.Error("Failed to submit bid", "err", err)
+        return
+    }
+
+    // Notify all connected dashers of the new highest bid
+    s.hub.mu.RLock()
+    room := s.hub.rooms[auctionID]
+    for id, conn := range room {
+        if id != dasherID {
+            notifyEvent := BidEvent{Action: "OUTBID", Amount: amount}
+            payload, _ := json.Marshal(notifyEvent)
+            conn.WriteMessage(1, payload)
+        } else {
+            confirmEvent := BidEvent{Action: "BID_ACCEPTED", Amount: amount}
+            payload, _ := json.Marshal(confirmEvent)
+            conn.WriteMessage(1, payload)
+        }
+    }
+    s.hub.mu.RUnlock()
+}
