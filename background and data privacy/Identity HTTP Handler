@@ -1,0 +1,29 @@
+// internal/identity/handlers.go
+package identity
+
+import (
+    "encoding/json"
+    "net/http"
+)
+
+type Handler struct {
+    svc *Service
+}
+
+func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+    mux.HandleFunc("/internal/v1/background-check/webhook", h.handleCheckrWebhook)
+}
+
+func (h *Handler) handleCheckrWebhook(w http.ResponseWriter, r *http.Request) {
+    var payload CheckrWebhookPayload
+    if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+        http.Error(w, "Invalid payload", http.StatusBadRequest)
+        return
+    }
+
+    if err := h.svc.HandleCheckrWebhook(r.Context(), payload); err != nil {
+        http.Error(w, "Internal error", http.StatusInternalServerError)
+        return
+    }
+    w.WriteHeader(http.StatusOK)
+}
