@@ -1,0 +1,35 @@
+geospatial-auction-engine/
+├── cmd/
+│   ├── identity-service/      # Entrypoint for PII & Background Checks
+│   │   └── main.go
+│   └── bidding-service/       # Entrypoint for WebSocket Bidding & Search
+│       └── main.go
+├── internal/
+│   ├── identity/              # Identity domain logic (KMS, Checkr, JWT)
+│   │   ├── handlers.go
+│   │   ├── repository.go
+│   │   └── service.go
+│   ├── bidding/               # Bidding domain logic (WS, Redis, ES)
+│   │   ├── handlers.go
+│   │   ├── repository.go
+│   │   └── service.go
+│   └── domain/                # Shared entities & DTOs
+│       ├── auction.go
+│       └── dasher.go
+├── pkg/                       # Shared utilities (Logger, KMS Wrapper)
+│   ├── crypto/
+│   │   └── kms.go
+│   └── middleware/
+│       └── auth.go
+├── flink-jobs/                # Java/Scala project for Auction Workers
+│   ├── src/main/java/com/doordash/auction/
+│   │   ├── AuctionTTLJob.java
+│   │   └── AuctionSettlement.java
+│   └── pom.xml
+├── deployments/
+│   ├── docker-compose.yml     # Local dev environment (ES, Redis, Postgres)
+│   └── k8s/                   # Helm charts / K8s manifests for Prod
+├── scripts/
+│   └── es_mappings.json       # ES index initialization
+├── go.mod
+└── Makefile
