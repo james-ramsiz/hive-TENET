@@ -1,0 +1,18 @@
+{
+  "name": "dasher-app",
+  "version": "1.4.2",
+  "scripts": {
+    "start": "react-native start",
+    "android": "react-native run-android",
+    "ios": "react-native run-ios",
+    "build:ios": "cd ios && fastlane build_prod",
+    "build:android": "cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@reduxjs/toolkit": "^1.9.5",
+    "@rnmapbox/maps": "^10.0.0",
+    "react-native": "^0.72.0",
+    "react": "^18.2.0",
+    "react-redux": "^8.1.0"
+  }
+}
