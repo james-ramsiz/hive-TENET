@@ -1,0 +1,47 @@
+// internal/bidding/repository.go
+package bidding
+
+import (
+    "context"
+    "fmt"
+    "github.com/redis/go-redis/v9"
+)
+
+type Repository interface {
+    SubmitBid(ctx context.Context, auctionID, dasherID string, amount float64) error
+    GetTopBid(ctx context.Context, auctionID string) (string, float64, error)
+}
+
+type redisRepo struct {
+    rdb *redis.Client
+}
+
+func NewRedisRepo(rdb *redis.Client) Repository {
+    return &redisRepo{rdb: rdb}
+}
+
+// SubmitBid adds the dasher to the ZSET.
+// Score is the bid amount. In a forward auction, higher is better.
+func (r *redisRepo) SubmitBid(ctx context.Context, auctionID, dasherID string, amount float64) error {
+    key := fmt.Sprintf("auction_bids:%s", auctionID)
+    // ZADD key score member
+    _, err := r.rdb.ZAdd(ctx, key, redis.Z{
+        Score:  amount,
+        Member: dasherID,
+    }).Result()
+    return err
+}
+
+// GetTopBid returns the highest bidder.
+func (r *redisRepo) GetTopBid(ctx context.Context, auctionID string) (string, float64, error) {
+    key := fmt.Sprintf("auction_bids:%s", auctionID)
+    // ZRANGE key 0 0 REV WITHSCORES -> Gets the highest score
+    res, err := r.rdb.ZRevRangeWithScores(ctx, key, 0, 0).Result()
+    if err != nil {
+        return "", 0, err
+    }
+    if len(res) == 0 {
+        return "", 0, nil // No bids yet
+    }
+    return res[0].Member.(string), res[0].Score, nil
+}
