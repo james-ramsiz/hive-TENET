@@ -1,0 +1,61 @@
+// src/features/navigation/AuctionScreen.tsx
+import React, { useState } from 'react';
+import { View, Text, Button, StyleSheet } from 'react-native';
+import MapboxGL from '@rnmapbox/maps';
+import { useGetNearbyAuctionsQuery } from '../../api/dasherApi';
+import { useAuctionSocket } from './useAuctionSocket';
+import { startBackgroundTracking } from '../../native/BackgroundLocation';
+
+MapboxGL.setAccessToken('pk.eyJ1IjoiZG9vcmRhc2gi...');
+
+export const AuctionScreen = () => {
+  const [userLocation, setUserLocation] = useState([37.7749, -122.4194]);
+  const { data: auctions, isLoading } = useGetNearbyAuctionsQuery({
+    lat: userLocation[0],
+    lon: userLocation[1],
+    radius_km: 5,
+  });
+
+  // Connect to the first auction's WebSocket
+  const { lastEvent, isConnected, sendBid } = useAuctionSocket(
+    auctions?.[0]?.auction_id || 'fallback',
+    'dasher_987'
+  );
+
+  React.useEffect(() => {
+    // Start native background tracking when Dasher goes online
+    startBackgroundTracking();
+  }, []);
+
+  return (
+    <View style={styles.container}>
+      <MapboxGL.MapView style={styles.map}>
+        <MapboxGL.Camera
+          zoomLevel={12}
+          centerCoordinate={[userLocation[1], userLocation[0]]} // Mapbox uses [Lon, Lat]
+        />
+        <MapboxGL.UserLocation />
+        
+        {/* Render Auction Pins */}
+        {auctions?.map(auc => (
+          <MapboxGL.PointAnnotation key={auc.auction_id} id={auc.auction_id} coordinate={[auc.pickup_location.lon, auc.pickup_location.lat]}>
+            <View style={styles.pin} />
+          </MapboxGL.PointAnnotation>
+        ))}
+      </MapboxGL.MapView>
+
+      <View style={styles.bottomSheet}>
+        <Text>Status: {isConnected ? 'Connected' : 'Reconnecting...'}</Text>
+        <Text>Current High Bid: ${lastEvent?.amount || auctions?.[0]?.current_highest_bid}</Text>
+        <Button title="Bid $15.00" onPress={() => sendBid(15.00)} />
+      </View>
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  map: { flex: 1 },
+  pin: { height: 20, width: 20, backgroundColor: 'red', borderRadius: 10 },
+  bottomSheet: { padding: 20, backgroundColor: 'white' }
+});
