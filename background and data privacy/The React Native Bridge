@@ -1,0 +1,25 @@
+// src/native/BackgroundLocation.ts
+import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
+
+const { BackgroundLocationModule } = NativeModules;
+
+export const startBackgroundTracking = async () => {
+  if (Platform.OS === 'android') {
+    // Android requires a Foreground Service with a persistent notification
+    await BackgroundLocationModule.startForegroundService();
+  } else {
+    // iOS requires Background Modes capability (Location Updates)
+    await BackgroundLocationModule.startLocationUpdates();
+  }
+};
+
+export const stopBackgroundTracking = async () => {
+  await BackgroundLocationModule.stopLocationUpdates();
+};
+
+// Listen to native pings to trigger UI updates if needed
+const locationEmitter = new NativeEventEmitter(BackgroundLocationModule);
+export const subscribeToLocationUpdates = (callback: (lat: number, lon: number) => void) => {
+  const subscription = locationEmitter.addListener('onLocationUpdate', callback);
+  return () => subscription.remove();
+};
