@@ -1,0 +1,61 @@
+// flink-jobs/src/main/java/com/doordash/auction/AuctionSettlement.java
+package com.doordash.auction;
+
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+import redis.clients.jedis.Jedis;
+
+public class AuctionSettlementJob {
+
+    public static void main(String[] args) throws Exception {
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // 1. Consume auction expiration events from Kafka
+        DataStream<AuctionExpiredEvent> expiredAuctions = env
+            .addSource(new FlinkKafkaConsumer<>("auction-expirations", new AuctionEventDeserializer(), kafkaProps));
+
+        // 2. Process each expired auction to find the winner
+        expiredAuctions
+            .keyBy(AuctionExpiredEvent::getAuctionId)
+            .process(new SettleAuctionFunction())
+            .addSink(new ElasticsearchSink<>()); // Pushes final state to ES
+
+        env.execute("Auction Settlement Job");
+    }
+
+    public static class SettleAuctionFunction extends KeyedProcessFunction<String, AuctionExpiredEvent, ShiftAssignment> {
+        private transient Jedis redis;
+
+        @Override
+        public void open(Configuration parameters) {
+            redis = new Jedis("redis-cluster-master", 6379);
+        }
+
+        @Override
+        public void processElement(AuctionExpiredEvent event, Context ctx, Collector<ShiftAssignment> out) {
+            String auctionId = event.getAuctionId();
+            String redisKey = "auction_bids:" + auctionId;
+            
+            // Get highest bidder from Redis ZSET
+            // ZREVRANGE key 0 0 WITHSCORES
+            Tuple<String, Double> winner = redis.zrevrangeWithScores(redisKey, 0, 0).get(0);
+            
+            if (winner != null) {
+                String dasherId = winner.f0;
+                Double finalPayout = winner.f1;
+
+                // Emit assignment to be indexed in Elasticsearch
+                out.collect(new ShiftAssignment(auctionId, dasherId, finalPayout, "ASSIGNED"));
+            } else {
+                // No bids placed
+                out.collect(new ShiftAssignment(auctionId, null, 0.0, "EXPIRED_UNFULFILLED"));
+            }
+            
+            // Clean up Redis
+            redis.del(redisKey);
+        }
+    }
+}
