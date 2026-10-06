@@ -1,0 +1,32 @@
+// pkg/crypto/kms.go
+package crypto
+
+import (
+    "context"
+    "github.com/aws/aws-sdk-go-v2/service/kms"
+)
+
+type KMSClient interface {
+    Encrypt(ctx context.Context, plaintext []byte) ([]byte, error)
+    Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error)
+}
+
+type awsKMSClient struct {
+    client *kms.Client
+    keyID  string
+}
+
+func NewAWSKMSClient(client *kms.Client, keyID string) KMSClient {
+    return &awsKMSClient{client: client, keyID: keyID}
+}
+
+func (a *awsKMSClient) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) {
+    out, err := a.client.Encrypt(ctx, &kms.EncryptInput{
+        KeyId:     &a.keyID,
+        Plaintext: plaintext,
+    })
+    if err != nil {
+        return nil, err
+    }
+    return out.CiphertextBlob, nil
+}
