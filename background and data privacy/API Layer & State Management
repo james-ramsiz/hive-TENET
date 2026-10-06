@@ -1,0 +1,42 @@
+// src/api/dasherApi.ts
+import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+
+export interface Auction {
+  auction_id: string;
+  pickup_location: { lat: number; lon: number };
+  reserve_price: number;
+  current_highest_bid: number;
+  end_time: string;
+  status: 'open' | 'closing' | 'assigned';
+}
+
+export const dasherApi = createApi({
+  reducerPath: 'dasherApi',
+  baseQuery: fetchBaseQuery({ 
+    baseUrl: 'https://api-bff.doordash.com/v1',
+    prepareHeaders: (headers, { getState }) => {
+      // Inject JWT token from secure storage
+      const token = (getState() as any).auth.token;
+      if (token) headers.set('authorization', `Bearer ${token}`);
+      return headers;
+    },
+  }),
+  tagTypes: ['Auctions'],
+  endpoints: (builder) => ({
+    getNearbyAuctions: builder.query<Auction[], { lat: number; lon: number; radius_km: number }>({
+      query: (params) => `/auctions/search?lat=${params.lat}&lon=${params.lon}&radius_km=${params.radius_km}`,
+      providesTags: ['Auctions'],
+      // Poll every 10 seconds if WS fails
+      keepUnusedDataFor: 10, 
+    }),
+    submitBid: builder.mutation<{ success: boolean }, { auctionId: string; amount: number }>({
+      query: (body) => ({
+        url: '/auctions/bid',
+        method: 'POST',
+        body,
+      }),
+    })
+  }),
+});
+
+export const { useGetNearbyAuctionsQuery, useSubmitBidMutation } = dasherApi;
