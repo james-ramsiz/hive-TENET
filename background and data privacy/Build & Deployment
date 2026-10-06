@@ -1,0 +1,16 @@
+.PHONY: build test dockerize
+
+build:
+    go build -o bin/identity-service ./cmd/identity-service
+    go build -o bin/bidding-service ./cmd/bidding-service
+
+test:
+    go test -v -race ./internal/...
+
+dockerize:
+    docker build -t geospatial-auction/identity:latest -f deployments/Dockerfile.identity .
+    docker build -t geospatial-auction/bidding:latest -f deployments/Dockerfile.bidding .
+
+run-local:
+    docker-compose -f deployments/docker-compose.yml up -d
+    go run cmd/bidding-service/main.go
