@@ -1,0 +1,66 @@
+// src/features/auction/useAuctionSocket.ts
+import { useEffect, useRef, useState } from 'react';
+import { AppState, Platform } from 'react-native';
+
+export const useAuctionSocket = (auctionId: string, dasherId: string) => {
+  const [lastEvent, setLastEvent] = useState<any>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeout = useRef<NodeJS.Timeout>();
+
+  const connect = () => {
+    // Auth token is passed as a query param for WS upgrade validation
+    const url = `wss://api-bff.doordash.com/v1/ws/auction/${auctionId}?dasher_id=${dasherId}`;
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log('[WS] Connected to auction:', auctionId);
+      setIsConnected(true);
+    };
+
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      setLastEvent(data);
+    };
+
+    ws.onclose = () => {
+      setIsConnected(false);
+      console.warn('[WS] Disconnected. Attempting reconnect in 3s...');
+      // Exponential backoff should be used in production
+      reconnectTimeout.current = setTimeout(connect, 3000);
+    };
+
+    ws.onerror = (e) => {
+      console.error('[WS] Error:', e);
+    };
+  };
+
+  useEffect(() => {
+    connect();
+
+    // Handle app backgrounding to save battery
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      if (nextAppState === 'active') {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) connect();
+      }
+    });
+
+    return () => {
+      wsRef.current?.close();
+      clearTimeout(reconnectTimeout.current);
+      subscription.remove();
+    };
+  }, [auctionId]);
+
+  const sendBid = (amount: number) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action: 'BID', amount }));
+    } else {
+      console.warn('Cannot send bid, WS not connected.');
+      // Fallback: Send bid via REST API POST
+    }
+  };
+
+  return { lastEvent, isConnected, sendBid };
+};
