@@ -1,0 +1,19 @@
+{
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "auction_id": { "type": "keyword" },
+      "shift_metadata": { "type": "object", "enabled": false },
+      "pickup_location": { "type": "geo_point" },
+      "reserve_price": { "type": "double" },
+      "current_highest_bid": { "type": "double" },
+      "status": { "type": "keyword" },
+      "end_time": { "type": "date" }
+    }
+  },
+  "settings": {
+    "number_of_shards": 10,
+    "number_of_replicas": 2,
+    "index.routing_partition_size": 3
+  }
+}
