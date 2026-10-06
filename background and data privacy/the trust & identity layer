@@ -1,0 +1,37 @@
+graph TD
+    subgraph Mobile Clients
+        DasherApp[Dasher Mobile App]
+    end
+
+    subgraph Public Facing Layer
+        APIGW[API Gateway / WS Hub]
+        BiddingEngine[Bidding & Search Service]
+    end
+
+    subgraph Trust & Identity Layer
+        IdentitySvc[Identity & Onboarding Service]
+        KMS[(AWS KMS / Vault)]
+        SecureDB[(PostgreSQL: Encrypted PII Vault)]
+    end
+
+    subgraph Third-Party Vendors
+        Checkr[Background Check API - e.g., Checkr]
+        DMV[DMV Record API]
+    end
+
+    subgraph Search & Auction Layer
+        ES[(Elasticsearch: Public Shift Data)]
+        Redis[(Redis: Bids)]
+    end
+
+    DasherApp --|1. Submit SSN / DL| IdentitySvc
+    IdentitySvc --|2. Encrypt PII| KMS
+    IdentitySvc --|3. Store Ciphertext| SecureDB
+    IdentitySvc --|4. Send Public ID to Checkr| Checkr
+    Checkr --|5. Webhook: Status PASS/FAIL| IdentitySvc
+    
+    IdentitySvc --|6. Issue Scoped JWT| DasherApp
+    DasherApp --|7. Connect & Bid| APIGW
+    APIGW --|Validate JWT 'eligible' claim| BiddingEngine
+    BiddingEngine --|Search/Bid| ES
+    BiddingEngine --|Search/Bid| Redis
