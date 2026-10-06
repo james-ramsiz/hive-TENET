@@ -1,0 +1,45 @@
+// src/native/android/LocationService.kt
+package com.doordash.dasher;
+
+import android.app.Service;
+import android.content.Intent;
+import android.os.IBinder;
+import android.os.Looper;
+import android.location.Location;
+import com.google.android.gms.location.*;
+
+class LocationService : Service() {
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var locationCallback: LocationCallback
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Start Foreground Notification here (Ongoing notification)
+        startForeground(NOTIFICATION_ID, buildNotification())
+
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        
+        val locationRequest = LocationRequest.create().apply {
+            interval = 5000 // 5 seconds
+            fastestInterval = 3000
+            priority = LocationRequest.PRIORITY_HIGH_ACCURACY
+        }
+
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                result.lastLocation?.let { location ->
+                    sendLocationToBackend(location.latitude, location.longitude)
+                    // Emit to React Native JS bridge
+                    sendEvent("onLocationUpdate", mapOf("lat" to location.latitude, "lon" to location.longitude))
+                }
+            }
+        }
+
+        fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
+        return START_STICKY // Restart if killed by OS
+    }
+    
+    private fun sendLocationToBackend(lat: Double, lon: Double) {
+        // Use an offline queue (e.g., Room DB / WorkManager) to store pings
+        // if the network is offline, and flush them when network returns.
+    }
+}
