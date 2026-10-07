@@ -1,0 +1,91 @@
+// internal/bidding/hub.go
+package bidding
+
+import (
+    "context"
+    "encoding/json"
+    "log/slog"
+    "sync"
+
+    "github.com/redis/go-redis/v9"
+    "github.com/gorilla/websocket"
+)
+
+// Hub manages local WebSocket connections on THIS specific pod/instance.
+// It does NOT know about connections on other pods.
+type Hub struct {
+    localConns map[string]map[string]*websocket.Conn // auctionID -> dasherID -> conn
+    mu         sync.RWMutex
+    rdb        *redis.Client
+}
+
+func NewHub(rdb *redis.Client) *Hub {
+    return &Hub{
+        localConns: make(map[string]map[string]*websocket.Conn),
+        rdb:        rdb,
+    }
+}
+
+// Register handles a new WebSocket connection and subscribes the pod to Redis updates.
+func (h *Hub) Register(ctx context.Context, auctionID, dasherID string, conn *websocket.Conn) {
+    h.mu.Lock()
+    if h.localConns[auctionID] == nil {
+        h.localConns[auctionID] = make(map[string]*websocket.Conn)
+    }
+    h.localConns[auctionID][dasherID] = conn
+    h.mu.Unlock()
+
+    // Ensure this pod is subscribed to this auction's Redis Pub/Sub channel
+    // In production, use a pool of goroutines listening to these channels.
+    go h.subscribeToAuction(ctx, auctionID)
+}
+
+// Unregister removes a connection when a Dasher disconnects or the app backgrounds.
+func (h *Hub) Unregister(auctionID, dasherID string) {
+    h.mu.Lock()
+    if conns, ok := h.localConns[auctionID]; ok {
+        delete(conns, dasherID)
+        if len(conns) == 0 {
+            delete(h.localConns, auctionID)
+        }
+    }
+    h.mu.Unlock()
+}
+
+// Broadcast publishes a bid event to Redis, so ALL pods receive it.
+func (h *Hub) Broadcast(ctx context.Context, auctionID string, event BidEvent) error {
+    channel := "auction_updates:" + auctionID
+    payload, err := json.Marshal(event)
+    if err != nil {
+        return err
+    }
+    // Publish to Redis. All pods listening to this auction will receive it.
+    return h.rdb.Publish(ctx, channel, payload).Err()
+}
+
+// subscribeToAuction listens to Redis for updates and pushes them to local WebSockets.
+func (h *Hub) subscribeToAuction(ctx context.Context, auctionID string) {
+    pubsub := h.rdb.Subscribe(ctx, "auction_updates:"+auctionID)
+    defer pubsub.Close()
+
+    for msg := range pubsub.Channel() {
+        var event BidEvent
+        if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
+            continue
+        }
+
+        // Push to all local Dashers watching this auction
+        h.mu.RLock()
+        conns := h.localConns[auctionID]
+        for dasherID, conn := range conns {
+            // Only notify the dasher if they were outbid, or confirm to the bidder
+            // (Logic omitted for brevity, but here we just push to all)
+            err := conn.WriteJSON(event)
+            if err != nil {
+                slog.Warn("Failed to write to WebSocket", "dasher", dasherID, "err", err)
+                // Trigger Unregister in a real system to clean up dead sockets
+            }
+        }
+        h.mu.RUnlock()
+    }
+}
