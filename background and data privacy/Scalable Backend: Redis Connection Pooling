@@ -1,0 +1,62 @@
+// cmd/bidding-service/main.go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+
+    "github.com/redis/go-redis/v9"
+)
+
+func main() {
+    // 1. Configure Redis Cluster with Connection Pooling
+    rdb := redis.NewClient(&redis.Options{
+        Addr:         os.Getenv("REDIS_HOST"), // e.g., "redis-cluster:6379"
+        PoolSize:     1000,                    // Max connections per pod
+        MinIdleConns: 100,                     // Keep warm connections ready
+        DialTimeout:  5 * time.Second,
+        ReadTimeout:  3 * time.Second,
+        WriteTimeout: 3 * time.Second,
+    })
+
+    // Test connection
+    if err := rdb.Ping(context.Background()).Err(); err != nil {
+        log.Fatalf("Failed to connect to Redis: %v", err)
+    }
+
+    hub := NewHub(rdb)
+    svc := NewService(rdb, hub)
+    
+    mux := http.NewServeMux()
+    // In production, use a robust router like chi or gin
+    mux.HandleFunc("/ws/auction/", svc.HandleWebSocket) 
+
+    srv := &http.Server{
+        Addr:         ":8080",
+        Handler:      mux,
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 10 * time.Second,
+        IdleTimeout:  120 * time.Second, // Keep-alive for WebSockets
+    }
+
+    // Graceful shutdown to ensure no dropped bids during K8s deployments
+    go func() {
+        log.Println("Starting Bidding Service on :8080")
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Server failed: %v", err)
+        }
+    }()
+
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+    log.Println("Shutting down gracefully...")
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    srv.Shutdown(ctx)
+}
