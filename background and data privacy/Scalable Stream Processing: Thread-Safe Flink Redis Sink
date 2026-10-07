@@ -1,0 +1,59 @@
+// flink-jobs/src/main/java/com/doordash/auction/AuctionSettlementJob.java
+package com.doordash.auction;
+
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+
+public class SettleAuctionFunction extends KeyedProcessFunction<String, AuctionExpiredEvent, ShiftAssignment> {
+    
+    private transient JedisPool jedisPool;
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        super.open(parameters);
+        
+        // Initialize the connection pool ONCE per parallel slot.
+        JedisPoolConfig poolConfig = new JedisPoolConfig();
+        poolConfig.setMaxTotal(50); // Max connections per slot
+        poolConfig.setMaxIdle(10);
+        poolConfig.setMinIdle(2);
+        
+        // Use Redis Cluster mode in production
+        jedisPool = new JedisPool(poolConfig, "redis-cluster-master", 6379, 2000);
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (jedisPool != null) {
+            jedisPool.close(); // Clean up pool when Flink job stops
+        }
+        super.close();
+    }
+
+    @Override
+    public void processElement(AuctionExpiredEvent event, Context ctx, Collector<ShiftAssignment> out) throws Exception {
+        String auctionId = event.getAuctionId();
+        String redisKey = "auction_bids:" + auctionId;
+        
+        // Borrow a connection from the pool, use it, and return it automatically (try-with-resources)
+        try (Jedis jedis = jedisPool.getResource()) {
+            // ZREVRANGE key 0 0 WITHSCORES
+            var result = jedis.zrevrangeWithScores(redisKey, 0, 0);
+            
+            if (result != null && !result.isEmpty()) {
+                Tuple<String, Double> winner = result.get(0);
+                out.collect(new ShiftAssignment(auctionId, winner.f0, winner.f1, "ASSIGNED"));
+            } else {
+                out.collect(new ShiftAssignment(auctionId, null, 0.0, "EXPIRED_UNFULFILLED"));
+            }
+            
+            jedis.del(redisKey); // Clean up Redis memory
+        } catch (Exception e) {
+            // Flink will handle retries and checkpointing based on this exception
+            throw new RuntimeException("Failed to settle auction: " + auctionId, e);
+        }
+    }
+}
