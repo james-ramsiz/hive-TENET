@@ -1,0 +1,86 @@
+// src/features/auction/useAuctionSocket.ts
+import { useEffect, useRef, useState } from 'react';
+import { AppState, NetInfo } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const BID_QUEUE_KEY = 'offline_bid_queue';
+
+export const useScalableAuctionSocket = (auctionId: string, dasherId: string) => {
+  const [lastEvent, setLastEvent] = useState<any>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // 1. Function to flush queued bids when network restores
+  const flushOfflineBids = async () => {
+    const queueStr = await AsyncStorage.getItem(BID_QUEUE_KEY);
+    if (!queueStr) return;
+
+    const queue: { auctionId: string, amount: number }[] = JSON.parse(queueStr);
+    if (queue.length === 0) return;
+
+    // Only flush if WS is connected
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+
+    for (const bid of queue) {
+      wsRef.current.send(JSON.stringify({ action: 'BID', amount: bid.amount }));
+      // In production, wait for server ACK before removing from queue.
+      // For brevity, we just clear it.
+    }
+    await AsyncStorage.removeItem(BID_QUEUE_KEY);
+    console.log('[OfflineQueue] Flushed pending bids.');
+  };
+
+  const connect = () => {
+    const url = `wss://api-bff.doordash.com/v1/ws/auction/${auctionId}?dasher_id=${dasherId}`;
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setIsConnected(true);
+      // Immediately attempt to flush any bids made while offline
+      flushOfflineBids();
+    };
+
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      setLastEvent(data);
+    };
+
+    ws.onclose = () => {
+      setIsConnected(false);
+      setTimeout(connect, 3000); // Reconnect with backoff
+    };
+  };
+
+  // 2. The Send Bid function now handles offline state
+  const sendBid = async (amount: number) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action: 'BID', amount }));
+    } else {
+      // WS is down! Save to disk so we don't lose the Dasher's intent.
+      console.warn('[OfflineQueue] WS down. Saving bid to disk.');
+      const queueStr = await AsyncStorage.getItem(BID_QUEUE_KEY);
+      const queue = queueStr ? JSON.parse(queueStr) : [];
+      queue.push({ auctionId, amount });
+      await AsyncStorage.setItem(BID_QUEUE_KEY, JSON.stringify(queue));
+    }
+  };
+
+  // 3. Listen to network changes to trigger flush
+  useEffect(() => {
+    connect();
+    
+    const netInfoUnsub = NetInfo.addEventListener(state => {
+      if (state.isConnected && wsRef.current?.readyState === WebSocket.OPEN) {
+        flushOfflineBids();
+      }
+    });
+
+    return () => {
+      wsRef.current?.close();
+      netInfoUnsub();
+    };
+  }, [auctionId]);
+
+  return { lastEvent, isConnected, sendBid };
+};
