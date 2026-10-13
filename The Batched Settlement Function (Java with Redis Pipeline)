@@ -1,0 +1,69 @@
+// flink-jobs/src/main/java/com/doordash/auction/BatchSettlementFunction.java
+package com.doordash.auction;
+
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.util.Collector;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
+import java.util.ArrayList;
+import java.util.List;
+
+public class BatchSettlementFunction extends ProcessWindowFunction<AuctionExpiredEvent, ShiftAssignment, String, TimeWindow> {
+    
+    private transient Jedis jedis;
+
+    @Override
+    public void open(Configuration parameters) {
+        jedis = new Jedis("redis-cluster-master", 6379);
+    }
+
+    @Override
+    public void process(String key, Context ctx, Iterable<AuctionExpiredEvent> events, Collector<ShiftAssignment> out) throws Exception {
+        List<String> auctionIds = new ArrayList<>();
+        for (AuctionExpiredEvent event : events) {
+            auctionIds.add(event.getAuctionId());
+        }
+
+        if (auctionIds.isEmpty()) return;
+
+        // 1. Start Redis Pipeline
+        Pipeline pipe = jedis.pipelined();
+        
+        // Queue ZREVRANGE commands to get winners for all expired auctions
+        for (String auctionId : auctionIds) {
+            pipe.zrevrangeWithScores("auction_bids:" + auctionId, 0, 0);
+        }
+        
+        // Sync and get responses in a single network RTT
+        List<Object> responses = pipe.syncAndReturnAll();
+
+        // 2. Process responses and prepare ES Bulk Update
+        List<ShiftAssignment> assignments = new ArrayList<>();
+        Pipeline cleanupPipe = jedis.pipelined(); // Pipeline for deleting used keys
+
+        for (int i = 0; i < auctionIds.size(); i++) {
+            String auctionId = auctionIds.get(i);
+            var result = (List<Tuple<String, Double>>) responses.get(i);
+            
+            if (result != null && !result.isEmpty()) {
+                String winnerId = result.get(0).f0;
+                Double winningBid = result.get(0).f1;
+                assignments.add(new ShiftAssignment(auctionId, winnerId, winningBid, "ASSIGNED"));
+            } else {
+                assignments.add(new ShiftAssignment(auctionId, null, 0.0, "EXPIRED_UNFULFILLED"));
+            }
+            
+            // Queue cleanup commands (delete ZSET and end_time key)
+            cleanupPipe.del("auction_bids:" + auctionId);
+            cleanupPipe.del("auction_end_time:" + auctionId);
+        }
+        
+        cleanupPipe.syncAndReturnAll(); // Execute cleanup in bulk
+
+        // 3. Emit assignments to be indexed in Elasticsearch via Bulk API
+        for (ShiftAssignment assignment : assignments) {
+            out.collect(assignment);
+        }
+    }
+}
