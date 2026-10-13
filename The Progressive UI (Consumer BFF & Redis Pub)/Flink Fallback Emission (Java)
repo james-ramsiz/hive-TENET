@@ -1,0 +1,23 @@
+// flink-jobs/src/main/java/com/doordash/auction/AuctionSettlement.java
+@Override
+public void processElement(AuctionExpiredEvent event, Context ctx, Collector<ShiftAssignment> out) throws Exception {
+    String auctionId = event.getAuctionId();
+    String redisKey = "auction_bids:" + auctionId;
+    
+    try (Jedis jedis = jedisPool.getResource()) {
+        var result = jedis.zrevrangeWithScores(redisKey, 0, 0);
+        
+        if (result != null && !result.isEmpty()) {
+            // AUCTION WON: Emit standard assignment
+            String winnerId = result.get(0).f0;
+            Double winningBid = result.get(0).f1;
+            out.collect(new ShiftAssignment(auctionId, winnerId, winningBid, "ASSIGNED"));
+        } else {
+            // AUCTION FAILED: Emit Fallback Event
+            // We do NOT collect a ShiftAssignment. We emit a completely different event type
+            // to a different Kafka topic to trigger the legacy DeepRed engine.
+            ctx.output(fallbackOutputTag, new FallbackDispatchEvent(auctionId, "NO_BIDS_RECEIVED"));
+        }
+        jedis.del(redisKey);
+    }
+}
