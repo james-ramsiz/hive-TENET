@@ -1,0 +1,44 @@
+-- submit_bid.lua
+-- KEYS[1] = auction_bids:{auction_id} (ZSET)
+-- KEYS[2] = auction_end_time:{auction_id} (STRING)
+-- ARGV[1] = dasher_id
+-- ARGV[2] = bid_amount
+-- ARGV[3] = snipe_window_ms (e.g., 2000 ms)
+-- ARGV[4] = extension_ms (e.g., 5000 ms)
+
+local bids_key = KEYS[1]
+local end_time_key = KEYS[2]
+local dasher_id = ARGV[1]
+local bid_amount = tonumber(ARGV[2])
+local snipe_window = tonumber(ARGV[3])
+local extension = tonumber(ARGV[4])
+
+-- 1. Get Redis's authoritative internal time (seconds, microseconds)
+local time = redis.call('TIME')
+local current_time_ms = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
+
+-- 2. Fetch the auction's current end_time
+local end_time_ms = tonumber(redis.call('GET', end_time_key))
+
+if end_time_ms == nil then
+    return {err = "AUCTION_NOT_FOUND"}
+end
+
+-- 3. Check if the auction is already closed
+if current_time_ms > end_time_ms then
+    return {err = "AUCTION_CLOSED"}
+end
+
+-- 4. Add/Update the bid in the ZSET
+redis.call('ZADD', bids_key, bid_amount, dasher_id)
+
+-- 5. Soft Close Logic: Check if bid is within the snipe window
+local time_remaining = end_time_ms - current_time_ms
+if time_remaining <= snipe_window then
+    -- Extend the auction
+    local new_end_time = current_time_ms + extension
+    redis.call('SET', end_time_key, new_end_time)
+    return {ok = "BID_ACCEPTED_AUCTION_EXTENDED", new_end_time}
+else
+    return {ok = "BID_ACCEPTED", end_time_ms}
+end
