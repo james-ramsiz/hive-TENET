@@ -1,0 +1,77 @@
+// internal/bidding/escrow.go
+package bidding
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+)
+
+type EscrowService struct {
+    db *sql.DB
+}
+
+const BidBondAmount = 5.00
+
+// PlaceHold locks funds in the Dasher's wallet before accepting the bid.
+func (e *EscrowService) PlaceHold(ctx context.Context, tx *sql.Tx, auctionID, dasherID string) (string, error) {
+    var bondID string
+
+    // 1. Attempt to deduct from available_balance and add to hold_balance
+    // We use 'FOR UPDATE' to lock the row, preventing double-spending across concurrent bids.
+    res, err := tx.ExecContext(ctx, `
+        UPDATE dasher_wallets 
+        SET available_balance = available_balance - $1, 
+            hold_balance = hold_balance + $1 
+        WHERE dasher_id = $2 AND available_balance >= $1`,
+        BidBondAmount, dasherID)
+
+    if err != nil {
+        return "", fmt.Errorf("failed to hold funds: %w", err)
+    }
+    rowsAffected, _ := res.RowsAffected()
+    if rowsAffected == 0 {
+        return "", fmt.Errorf("insufficient available balance for bond")
+    }
+
+    // 2. Record the Bond
+    err = tx.QueryRowContext(ctx, `
+        INSERT INTO bid_bonds (auction_id, dasher_id, hold_amount, status) 
+        VALUES ($1, $2, $3, 'HELD') 
+        RETURNING bond_id`,
+        auctionID, dasherID, BidBondAmount).Scan(&bondID)
+
+    if err != nil {
+        return "", fmt.Errorf("failed to record bond: %w", err)
+    }
+
+    return bondID, nil
+}
+
+// ReleaseHold returns the money if the Dasher loses the auction.
+func (e *EscrowService) ReleaseHold(ctx context.Context, bondID, dasherID string) error {
+    tx, err := e.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback() // Safe rollback if commit fails
+
+    // 1. Mark bond as RELEASED
+    _, err = tx.ExecContext(ctx, `UPDATE bid_bonds SET status = 'RELEASED' WHERE bond_id = $1`, bondID)
+    if err != nil {
+        return err
+    }
+
+    // 2. Reverse the wallet balances
+    _, err = tx.ExecContext(ctx, `
+        UPDATE dasher_wallets 
+        SET available_balance = available_balance + $1, 
+            hold_balance = hold_balance - $1 
+        WHERE dasher_id = $2`,
+        BidBondAmount, dasherID)
+    if err != nil {
+        return err
+    }
+
+    return tx.Commit()
+}
