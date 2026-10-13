@@ -1,0 +1,24 @@
+// flink-jobs/src/main/java/com/doordash/auction/AuctionTimerJob.java
+package com.doordash.auction;
+
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+
+public class AuctionTimerJob {
+    public static void main(String[] args) throws Exception {
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        DataStream<AuctionExpiredEvent> expiredAuctions = env
+            .addSource(new AuctionTimerSource()); // Polls Redis ZSET every 100ms
+
+        // 1. Group expirations into 1-second tumbling windows
+        expiredAuctions
+            .keyBy(e -> "global_batch_key") // Group all events to one parallel slot for batch processing
+            .timeWindow(Time.seconds(1))
+            .process(new BatchSettlementFunction()) // Process the entire batch at once
+            .addSink(new ElasticsearchBulkSink());
+
+        env.execute("Batched Auction Settlement Job");
+    }
+}
