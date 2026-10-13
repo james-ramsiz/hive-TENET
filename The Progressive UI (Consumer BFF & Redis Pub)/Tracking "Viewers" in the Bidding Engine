@@ -1,0 +1,29 @@
+// internal/bidding/hub.go
+// When Dasher connects to the WebSocket room:
+func (h *Hub) Register(ctx context.Context, auctionID, dasherID string, conn *websocket.Conn) {
+    // ... existing connection logic ...
+    
+    // Increment viewer count atomically
+    viewerKey := "auction_viewers:" + auctionID
+    count, _ := h.rdb.Incr(ctx, viewerKey).Result()
+    
+    // Broadcast the new viewer count to the Consumer BFF via Pub/Sub
+    h.rdb.Publish(ctx, "auction_updates:"+auctionID, map[string]interface{}{
+        "event": "VIEWER_COUNT_UPDATED",
+        "count": count,
+    })
+}
+
+// When Dasher disconnects:
+func (h *Hub) Unregister(auctionID, dasherID string) {
+    // ... existing disconnect logic ...
+    
+    viewerKey := "auction_viewers:" + auctionID
+    count, _ := h.rdb.Decr(context.Background(), viewerKey).Result()
+    if count < 0 { count = 0 } // Safety check
+    
+    h.rdb.Publish(context.Background(), "auction_updates:"+auctionID, map[string]interface{}{
+        "event": "VIEWER_COUNT_UPDATED",
+        "count": count,
+    })
+}
