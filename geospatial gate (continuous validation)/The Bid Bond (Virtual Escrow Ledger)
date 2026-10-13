@@ -1,0 +1,14 @@
+CREATE TABLE dasher_wallets (
+    dasher_id VARCHAR(36) PRIMARY KEY,
+    available_balance DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    hold_balance DECIMAL(10,2) NOT NULL DEFAULT 0.00
+);
+
+CREATE TABLE bid_bonds (
+    bond_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    auction_id VARCHAR(36) NOT NULL,
+    dasher_id VARCHAR(36) NOT NULL,
+    hold_amount DECIMAL(10,2) NOT NULL, -- e.g., $5.00
+    status VARCHAR(20) NOT NULL, -- 'HELD', 'RELEASED', 'FORFEITED', 'CAPTURED'
+    created_at TIMESTAMP DEFAULT NOW()
+);
