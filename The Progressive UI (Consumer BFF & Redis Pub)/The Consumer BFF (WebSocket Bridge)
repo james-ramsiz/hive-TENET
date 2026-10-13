@@ -1,0 +1,55 @@
+// consumer-bff/internal/handlers/auction_status.go
+package handlers
+
+import (
+    "context"
+    "encoding/json"
+    "net/http"
+    "github.com/redis/go-redis/v9"
+    "github.com/gorilla/websocket"
+)
+
+type StatusUpdate struct {
+    Event string      `json:"event"` // "VIEWER_COUNT_UPDATED", "BID_PLACED", "AUCTION_WON"
+    Data  interface{} `json:"data"`
+}
+
+func HandleAuctionStatus(w http.ResponseWriter, r *http.Request, rdb *redis.Client) {
+    auctionID := r.URL.Query().Get("auction_id")
+    if auctionID == "" {
+        http.Error(w, "Missing auction_id", http.StatusBadRequest)
+        return
+    }
+
+    // Upgrade Consumer App to WebSocket
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        return
+    }
+    defer conn.Close()
+
+    // Subscribe to the Bidding Engine's Redis Pub/Sub channel
+    pubsub := rdb.Subscribe(r.Context(), "auction_updates:"+auctionID)
+    defer pubsub.Close()
+
+    // Read loop: Listen to Redis, push to Consumer App
+    go func() {
+        for msg := range pubsub.Channel() {
+            var update StatusUpdate
+            // Parse the Pub/Sub message
+            json.Unmarshal([]byte(msg.Payload), &update)
+            
+            // Forward to Consumer App
+            if err := conn.WriteJSON(update); err != nil {
+                break // Consumer disconnected
+            }
+        }
+    }()
+
+    // Keep connection alive, handle ping/pongs
+    for {
+        if _, _, err := conn.ReadMessage(); err != nil {
+            break
+        }
+    }
+}
