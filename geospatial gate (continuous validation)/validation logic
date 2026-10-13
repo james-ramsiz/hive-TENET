@@ -1,0 +1,54 @@
+// internal/bidding/validator.go
+package bidding
+
+import (
+    "context"
+    "fmt"
+    "strconv"
+    "strings"
+    "time"
+
+    "github.com/redis/go-redis/v9"
+)
+
+type GeoValidator struct {
+    rdb *redis.Client
+}
+
+const MaxBidAgeSeconds = 30 // Location must be newer than 30s
+const MaxDistanceMeters = 5000 // Must be within 5km of pickup
+
+func (v *GeoValidator) IsDasherEligible(ctx context.Context, dasherID string, pickupLat, pickupLon float64) error {
+    // 1. Fetch Dasher's last known location from Redis
+    key := "dasher_coords:" + dasherID
+    val, err := v.rdb.Get(ctx, key).Result()
+    if err == redis.Nil {
+        return fmt.Errorf("location unknown: cannot bid")
+    }
+    if err != nil {
+        return fmt.Errorf("internal error: %w", err)
+    }
+
+    parts := strings.Split(val, ",")
+    if len(parts) != 3 {
+        return fmt.Errorf("malformed location data")
+    }
+
+    lat, _ := strconv.ParseFloat(parts[0], 64)
+    lon, _ := strconv.ParseFloat(parts[1], 64)
+    ts, _ := strconv.ParseInt(parts[2], 10, 64)
+
+    // 2. Check Staleness (Prevents ETA Spoofing with old cached coords)
+    age := time.Now().Unix() - ts
+    if age > MaxBidAgeSeconds {
+        return fmt.Errorf("location stale: last seen %d seconds ago", age)
+    }
+
+    // 3. Check Distance (Haversine)
+    distance := HaversineDistance(lat, lon, pickupLat, pickupLon)
+    if distance > MaxDistanceMeters {
+        return fmt.Errorf("out of bounds: %.2f km away", distance/1000)
+    }
+
+    return nil
+}
