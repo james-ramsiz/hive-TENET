@@ -1,0 +1,43 @@
+// internal/bidding/repository.go
+package bidding
+
+import (
+    "context"
+    "fmt"
+    "github.com/redis/go-redis/v9"
+)
+
+type Repository interface {
+    SubmitBidWithSoftClose(ctx context.Context, auctionID, dasherID string, amount float64) (string, error)
+}
+
+type redisRepo struct {
+    rdb        *redis.Client
+    scriptSHA  string
+}
+
+func NewRedisRepo(rdb *redis.Client, scriptSHA string) Repository {
+    return &redisRepo{rdb: rdb, scriptSHA: scriptSHA}
+}
+
+func (r *redisRepo) SubmitBidWithSoftClose(ctx context.Context, auctionID, dasherID string, amount float64) (string, error) {
+    bidsKey := fmt.Sprintf("auction_bids:%s", auctionID)
+    endTimeKey := fmt.Sprintf("auction_end_time:%s", auctionID)
+
+    // Execute the atomic Lua script
+    result, err := r.rdb.EvalSha(ctx, r.scriptSHA, []string{bidsKey, endTimeKey}, 
+        dasherID, amount, 2000, 5000).Result()
+    
+    if err != nil {
+        if err.Error() == "AUCTION_CLOSED" {
+            return "", fmt.Errorf("auction is closed")
+        }
+        return "", fmt.Errorf("internal error: %w", err)
+    }
+
+    // result is a slice: [status_string, end_time_int]
+    resSlice := result.([]interface{})
+    status := resSlice[0].(string)
+    
+    return status, nil
+}
