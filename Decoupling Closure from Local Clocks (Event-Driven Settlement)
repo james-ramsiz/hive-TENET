@@ -1,0 +1,42 @@
+// flink-jobs/src/main/java/com/doordash/auction/AuctionTimerJob.java
+package com.doordash.auction;
+
+import org.apache.flink.streaming.api.functions.source.SourceFunction;
+import redis.clients.jedis.Jedis;
+
+public class AuctionTimerSource implements SourceFunction<AuctionExpiredEvent> {
+    private volatile boolean isRunning = true;
+    private Jedis jedis;
+
+    @Override
+    public void run(SourceContext<AuctionExpiredEvent> ctx) throws Exception {
+        jedis = new Jedis("redis-cluster-master", 6379);
+        
+        while (isRunning) {
+            // 1. Get Redis's authoritative time
+            String[] timeStr = jedis.time().split(" ");
+            long currentTimeMs = Long.parseLong(timeStr[0]) * 1000 + Long.parseLong(timeStr[1]) / 1000;
+            
+            // 2. Find all auctions whose end_time is <= current time
+            // ZRANGEBYSCORE active_auction_timers -inf <currentTimeMs>
+            Set<String> expiredAuctions = jedis.zrangeByScore("active_auction_timers", 0, currentTimeMs);
+            
+            for (String auctionId : expiredAuctions) {
+                // 3. Emit event to Flink pipeline for processing
+                ctx.collect(new AuctionExpiredEvent(auctionId, currentTimeMs));
+                
+                // 4. Remove the timer so it doesn't fire again
+                jedis.zrem("active_auction_timers", auctionId);
+            }
+            
+            // Sleep 100ms to prevent Redis CPU saturation
+            Thread.sleep(100);
+        }
+    }
+
+    @Override
+    public void cancel() {
+        isRunning = false;
+        if (jedis != null) jedis.close();
+    }
+}
