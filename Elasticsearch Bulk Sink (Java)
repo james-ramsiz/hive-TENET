@@ -1,0 +1,56 @@
+// flink-jobs/src/main/java/com/doordash/auction/ElasticsearchBulkSink.java
+package com.doordash.auction;
+
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.configuration.Configuration;
+import org.elasticsearch.action.bulk.BulkRequest;
+import org.elasticsearch.action.update.UpdateRequest;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.common.xcontent.XContentType;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+public class ElasticsearchBulkSink extends RichSinkFunction<ShiftAssignment> {
+    
+    private transient RestHighLevelClient esClient;
+    private transient BulkRequest bulkRequest;
+    private transient ObjectMapper mapper;
+    private final int batchSize = 100;
+    private int currentCount = 0;
+
+    @Override
+    public void open(Configuration parameters) {
+        esClient = createElasticsearchClient();
+        bulkRequest = new BulkRequest();
+        mapper = new ObjectMapper();
+    }
+
+    @Override
+    public void invoke(ShiftAssignment assignment, Context context) throws Exception {
+        UpdateRequest updateRequest = new UpdateRequest("auctions_index", assignment.getAuctionId());
+        String json = mapper.writeValueAsString(assignment);
+        updateRequest.doc(json, XContentType.JSON);
+        
+        bulkRequest.add(updateRequest);
+        currentCount++;
+
+        // Flush when batch size is reached
+        if (currentCount >= batchSize) {
+            flushBulk();
+        }
+    }
+
+    private void flushBulk() throws Exception {
+        if (bulkRequest.numberOfActions() > 0) {
+            esClient.bulk(updateRequest, RequestOptions.DEFAULT); // Ignore deprecated warning for brevity
+        }
+        bulkRequest = new BulkRequest();
+        currentCount = 0;
+    }
+
+    @Override
+    public void close() throws Exception {
+        flushBulk(); // Flush remaining
+        if (esClient != null) esClient.close();
+    }
+}
