@@ -1,0 +1,46 @@
+// internal/marketplace/auction_creation.go
+package marketplace
+
+import (
+    "context"
+    "math/rand"
+    "time"
+    "github.com/redis/go-redis/v9"
+)
+
+const (
+    MinTTLSeconds = 45
+    MaxTTLSeconds = 75
+)
+
+type CreationService struct {
+    rdb *redis.Client
+    // ES client...
+}
+
+func (s *CreationService) CreateAuction(ctx context.Context, shift Shift) error {
+    // 1. Calculate Jittered End Time
+    ttl := MinTTLSeconds + rand.Intn(MaxTTLSeconds-MinTTLSeconds+1)
+    endTime := time.Now().Add(time.Duration(ttl) * time.Second)
+    endTimeMs := endTime.UnixMilli()
+
+    // 2. Write to Elasticsearch (omitted for brevity)
+    // ...
+
+    // 3. Initialize Redis Timer ZSET for the Flink poller
+    // Score = endTimeMs, Member = auction_id
+    zsetKey := "active_auction_timers"
+    err := s.rdb.ZAdd(ctx, zsetKey, redis.Z{
+        Score:  float64(endTimeMs),
+        Member: shift.AuctionID,
+    }).Err()
+    if err != nil {
+        return err
+    }
+
+    // 4. Initialize the bid ZSET and set the strict end_time key (for Lua script)
+    s.rdb.Set(ctx, "auction_end_time:"+shift.AuctionID, endTimeMs, 0)
+    s.rdb.Set(ctx, "auction_bids:"+shift.AuctionID, "", 0) 
+
+    return nil
+}
