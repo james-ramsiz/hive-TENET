@@ -1,0 +1,27 @@
+// flink-jobs/src/main/java/com/doordash/auction/AuctionSettlement.java
+@Override
+public void processElement(AuctionExpiredEvent event, Context ctx, Collector<ShiftAssignment> out) throws Exception {
+    String auctionId = event.getAuctionId();
+    String redisKey = "auction_bids:" + auctionId;
+    
+    try (Jedis jedis = jedisPool.getResource()) {
+        var result = jedis.zrevrangeWithScores(redisKey, 0, -1); // Get all bidders
+        
+        if (result != null && !result.isEmpty()) {
+            String winnerId = result.get(0).f0;
+            Double winningBid = result.get(0).f1;
+            
+            // Emit to Kafka for Wallet Service to CAPTURE winner's bond
+            out.collect(new ShiftAssignment(auctionId, winnerId, winningBid, "ASSIGNED"));
+            
+            // Emit to Kafka for Wallet Service to RELEASE all losers' bonds
+            for (int i = 1; i < result.size(); i++) {
+                String loserId = result.get(i).f0;
+                // Publish release event to Kafka...
+            }
+        } else {
+            out.collect(new ShiftAssignment(auctionId, null, 0.0, "EXPIRED_UNFULFILLED"));
+        }
+        jedis.del(redisKey);
+    }
+}
