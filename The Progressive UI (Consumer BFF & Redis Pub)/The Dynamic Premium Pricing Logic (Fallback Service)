@@ -1,0 +1,52 @@
+// dispatch-fallback/internal/service.go
+package service
+
+import (
+    "context"
+    "fmt"
+    "math"
+)
+
+type DeepRedClient interface {
+    ForceAssign(ctx context.Context, orderID string, payout float64) (string, error)
+}
+
+type FallbackService struct {
+    deepRed DeepRedClient
+    kafka   KafkaProducer
+}
+
+const (
+    BaseFallbackPayout = 12.00 // Starting premium if auction failed at $8 reserve
+    MaxFallbackPayout  = 35.00 // Hard cap to prevent runaway costs
+    PayoutIncrement    = 2.00  // How much to increase payout per retry
+    MaxRetries         = 5
+)
+
+func (s *FallbackService) HandleFailedAuction(ctx context.Context, event FallbackDispatchEvent) error {
+    orderID := event.AuctionID
+    currentPayout := BaseFallbackPayout
+
+    for attempt := 1; attempt <= MaxRetries; attempt++ {
+        // 1. Call legacy DeepRed to force-assign to the nearest available Dasher
+        // DeepRed pushes a high-priority, non-declinable offer to the Dasher's app.
+        dasherID, err := s.deepRed.ForceAssign(ctx, orderID, currentPayout)
+        if err == nil {
+            // Success! Dasher accepted the premium payout.
+            s.kafka.Publish(ctx, "dispatch.success", map[string]interface{}{
+                "order_id": orderID, "dasher_id": dasherID, "payout": currentPayout, "type": "FALLBACK",
+            })
+            return nil
+        }
+        
+        // 2. If DeepRed fails (Dasher declined or timed out), increase payout and retry
+        currentPayout = math.Min(currentPayout + PayoutIncrement, MaxFallbackPayout)
+    }
+
+    // 3. If MaxRetries hit, we must cancel the order and refund the consumer.
+    // This is the "Marketplace Failure" state.
+    s.kafka.Publish(ctx, "dispatch.critical_failure", map[string]interface{}{
+        "order_id": orderID, "reason": "MAX_RETRIES_EXCEEDED",
+    })
+    return fmt.Errorf("critical marketplace failure for order %s", orderID)
+}
