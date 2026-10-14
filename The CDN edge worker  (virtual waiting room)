@@ -1,0 +1,78 @@
+// ticketing-platform/internal/edge/waiting_room.go
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "time"
+)
+
+// Global config for the edge worker
+const (
+    MaxOriginRequestsPerSec = 2000
+    QueueCookieName          = "ticket_queue_pos"
+)
+
+// FetchHandler is the entry point for the Cloudflare Worker / WASM HTTP interface
+func FetchHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. Check if the user already has a valid queue cookie
+    cookie, err := r.Cookie(QueueCookieName)
+    
+    if err == nil && isValidCookie(cookie.Value) {
+        // User has waited their turn. Forward to origin.
+        proxyToOrigin(w, r)
+        return
+    }
+
+    // 2. User is new or still waiting. Check the current edge counter.
+    // (In production, this uses an Atomic counter in Cloudflare Durable Objects or KV)
+    currentQueuePos := incrementGlobalCounter()
+    
+    if currentQueuePos <= MaxOriginRequestsPerSec {
+        // We are under the limit. Let them through to the origin API.
+        http.SetCookie(w, &http.Cookie{
+            Name:  QueueCookieName,
+            Value: generateSecureToken(),
+            Path:  "/",
+        })
+        proxyToOrigin(w, r)
+        return
+    }
+
+    // 3. Over the limit. Put them in the waiting room.
+    estimatedWaitMins := (currentQueuePos - MaxOriginRequestsPerSec) / 1000 * 2
+    
+    w.Header().Set("Content-Type", "text/html")
+    w.WriteHeader(http.StatusTooManyRequests) // 429
+    fmt.Fprintf(w, `
+        <html>
+        <body style="text-align: center; font-family: sans-serif; margin-top: 50px;">
+            <h1>You are in the Queue</h1>
+            <p>Due to high demand, you have been placed in a virtual waiting room.</p>
+            <p>Estimated wait time: <strong>%d minutes</strong></p>
+            <p>Your position: <strong>%d</strong></p>
+            <p>Please do not refresh this page. You will be redirected automatically.</p>
+        </body>
+        </html>
+    `, estimatedWaitMins, currentQueuePos)
+}
+
+func proxyToOrigin(w http.ResponseWriter, r *http.Request) {
+    // Conceptual: Forward the request to the actual Ticketmaster/DoorDash origin server
+    // In WASM/Edge environments, this is done via the platform's specific fetch API.
+}
+
+func isValidCookie(val string) bool {
+    // Validate the edge-signed JWT/Token
+    return true
+}
+
+func incrementGlobalCounter() int {
+    // Conceptual: Increment a distributed edge counter
+    return 500000
+}
+
+func main() {
+    http.HandleFunc("/", FetchHandler)
+    // TinyGo compiles this into a WASM binary.
+}
