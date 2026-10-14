@@ -1,0 +1,84 @@
+// internal/payments/service.go
+package payments
+
+import (
+    "context"
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "github.com/google/uuid"
+)
+
+type PaymentRequest struct {
+    IdempotencyKey string
+    SourceAccount  string
+    DestAccount    string
+    AmountCents    int64
+}
+
+type Service struct {
+    db *sql.DB
+}
+
+func (s *Service) ProcessPayment(ctx context.Context, req PaymentRequest) error {
+    // 1. Start a strict Serializable transaction
+    tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+        Isolation: sql.LevelSerializable, // Strictest isolation level
+    })
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback() // Safe rollback if anything fails
+
+    // 2. Claim the Idempotency Key atomically
+    var isExisting bool
+    err = tx.QueryRowContext(ctx, `
+        INSERT INTO idempotency_keys (key, status) 
+        VALUES ($1, 'PROCESSING') 
+        ON CONFLICT (key) DO UPDATE 
+        SET status = idempotency_keys.status 
+        RETURNING (xmax = 0) AS is_new`, req.IdempotencyKey).Scan(&isExisting)
+    
+    // If the key already existed, a previous request is already processing or done.
+    // (Note: xmax = 0 is a Postgres trick to check if the row was actually inserted vs updated)
+    if err == nil && !isExisting {
+        return fmt.Errorf("idempotency_key_in_progress: payment is already being processed")
+    }
+
+    // 3. Create the Transaction record
+    txnID := uuid.New().String()
+    _, err = tx.ExecContext(ctx, `
+        INSERT INTO transactions (transaction_id, source_account, dest_account, amount, status) 
+        VALUES ($1, $2, $3, $4, 'PENDING')`,
+        txnID, req.SourceAccount, req.DestAccount, req.AmountCents)
+    if err != nil {
+        return err
+    }
+
+    // 4. Write Double-Entry Ledger Records (Debit Source, Credit Dest)
+    _, err = tx.ExecContext(ctx, `
+        INSERT INTO ledger_entries (transaction_id, account_id, debit, credit) 
+        VALUES 
+        ($1, $2, $3, 0),  -- Debit source account
+        ($1, $4, 0, $3)`, -- Credit dest account
+        txnID, req.SourceAccount, req.AmountCents, req.DestAccount)
+    if err != nil {
+        return err
+    }
+
+    // 5. Write to the Outbox for asynchronous external settlement
+    payload, _ := json.Marshal(map[string]interface{}{
+        "transaction_id": txnID,
+        "amount_cents":   req.AmountCents,
+    })
+    _, err = tx.ExecContext(ctx, `
+        INSERT INTO outbox_events (transaction_id, aggregate_type, payload) 
+        VALUES ($1, 'BANK_TRANSFER', $2)`,
+        txnID, payload)
+    if err != nil {
+        return err
+    }
+
+    // 6. Commit the transaction. At this exact moment, the money has "moved" internally.
+    return tx.Commit()
+}
