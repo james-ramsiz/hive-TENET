@@ -1,0 +1,87 @@
+// internal/outbox/router.go
+package outbox
+
+import (
+    "context"
+    "database/sql"
+    "log"
+    "time"
+)
+
+type BankClient interface {
+    Transfer(ctx context.Context, txnID string, amountCents int64) (string, error) // Returns bank reference ID
+}
+
+type Router struct {
+    db   *sql.DB
+    bank BankClient
+}
+
+func (r *Router) Start(ctx context.Context) {
+    ticker := time.NewTicker(500 * time.Millisecond)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            r.processBatch(ctx)
+        }
+    }
+}
+
+func (r *Router) processBatch(ctx context.Context) {
+    tx, err := r.db.BeginTx(ctx, nil)
+    if err != nil {
+        return
+    }
+    defer tx.Rollback()
+
+    // 1. Lock a batch of unprocessed events (FOR UPDATE SKIP LOCKED)
+    // SKIP LOCKED is critical for scaling outbox workers horizontally without contention.
+    rows, err := tx.QueryContext(ctx, `
+        SELECT event_id, transaction_id, payload 
+        FROM outbox_events 
+        WHERE processed_at IS NULL 
+        ORDER BY created_at ASC 
+        LIMIT 50 
+        FOR UPDATE SKIP LOCKED`)
+    if err != nil {
+        return
+    }
+
+    type event struct {
+        EventID string
+        TxnID   string
+        Payload []byte
+    }
+    var events []event
+
+    for rows.Next() {
+        var e event
+        rows.Scan(&e.EventID, &e.TxnID, &e.Payload)
+        events = append(events, e)
+    }
+    rows.Close()
+
+    // 2. Process events and call external Bank API
+    for _, e := range events {
+        var data map[string]interface{}
+        // unmarshal payload...
+        
+        _, err := r.bank.Transfer(ctx, e.TxnID, int64(data["amount_cents"].(float64)))
+        if err != nil {
+            log.Printf("Bank API failed for txn %s: %v. Will retry next batch.", e.TxnID, err)
+            continue // Do not mark as processed. It will be retried.
+        }
+
+        // 3. Mark as processed
+        _, err = tx.ExecContext(ctx, `UPDATE outbox_events SET processed_at = NOW() WHERE event_id = $1`, e.EventID)
+        if err != nil {
+            return
+        }
+    }
+
+    tx.Commit()
+}
