@@ -1,0 +1,34 @@
+// matching-engine/include/proto_gen/order.pb.h
+// (Excerpt of the generated class definition)
+#ifndef PROTOBUF_order_2eproto__INCLUDED
+#define PROTOBUF_order_2eproto__INCLUDED
+
+#include <google/protobuf/message.h>
+#include <google/protobuf/arena.h>
+
+namespace matching_engine {
+
+class OrderPacket : public ::google::protobuf::Message {
+public:
+    OrderPacket();
+    virtual ~OrderPacket();
+    
+    // Standard protobuf boilerplate...
+    
+    // CRITICAL METHOD: Parses a raw byte array.
+    // In DPDKListener.cpp, we pass the UDP payload pointer directly to this method.
+    bool ParseFromArray(const void* data, int size);
+    
+    // Accessors (Generated inline methods)
+    inline uint64_t user_id() const;
+    inline uint32_t symbol_id() const;
+    inline uint64_t price() const;
+    inline uint32_t quantity() const;
+    inline int side() const;
+    
+    // CRITICAL: We avoid using the string-based SerializeToString methods 
+    // inside the matching loop to prevent heap allocations.
+};
+
+}  // namespace matching_engine
+#endif
