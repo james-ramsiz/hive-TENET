@@ -1,0 +1,19 @@
+// matching-engine/src/persistence/Journaler.cpp
+#include "Journaler.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+Journaler::Journaler(const std::string& file_path) {
+    // O_DIRECT bypasses OS page cache for predictable latency
+    fd_ = open(file_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_DIRECT, 0644);
+    if (fd_ < 0) throw std::runtime_error("Failed to open NVMe journal");
+}
+
+void Journaler::append(const Order& order) {
+    // Write raw bytes to NVMe sequentially
+    ssize_t written = write(fd_, &order, sizeof(Order));
+    if (written != sizeof(Order)) {
+        // Handle critical disk write failure
+    }
+}
