@@ -1,0 +1,19 @@
+high-scale-systems-monorepo/
+├── .github/workflows/           # CI/CD pipelines (GitHub Actions)
+├── infrastructure/              # Terraform/K8s manifests for deployment
+├── matching-engine/             # SYSTEM 1: C++ Ultra-Low Latency Engine
+│   ├── cmake/                   # CMake build modules
+│   ├── include/                 # Header files (.h / .hpp)
+│   ├── src/                     # Implementation files (.cpp)
+│   ├── scripts/                 # DPDK setup, CPU isolation scripts
+│   ├── configs/                 # Engine configuration (TOML)
+│   └── CMakeLists.txt           # Root CMake build file
+├── ticketing-platform/          # SYSTEM 2: Go High-Concurrency Platform
+│   ├── cmd/                     # Entry points (main.go)
+│   ├── internal/                # Private application logic
+│   ├── pkg/                     # Public/sharable Go utilities
+│   ├── scripts/                 # DB migrations, Lua script loading
+│   ├── configs/                 # Platform configuration (YAML)
+│   ├── go.mod                   # Go module definition
+│   └── Makefile                 # Build & test scripts
+└── README.md
