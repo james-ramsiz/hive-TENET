@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package matching_engine;
+
+// Wire format for network packets arriving from the FIX gateway or trading terminal
+message OrderPacket {
+    uint64 user_id = 1;
+    uint32 symbol_id = 2;       // e.g., 1 = AAPL, 2 = MSFT
+    uint64 price = 3;          // Price in ticks (e.g., $150.25 = 15025)
+    uint32 quantity = 4;
+    enum Side {
+        UNKNOWN = 0;
+        BUY = 1;
+        SELL = 2;
+    }
+    Side side = 5;
+    uint64 timestamp_ns = 6;   // Nanosecond timestamp from client
+}
