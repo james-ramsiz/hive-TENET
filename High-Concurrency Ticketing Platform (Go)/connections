@@ -1,0 +1,47 @@
+// ticketing-platform/internal/events/kafka_producer.go
+package events
+
+import (
+    "context"
+    "encoding/json"
+    "github.com/segmentio/kafka-go"
+    "log"
+)
+
+type SeatEvent struct {
+    SeatID   string `json:"seat_id"`
+    UserID   string `json:"user_id"`
+    Section  string `json:"section"`
+    Event    string `json:"event"` // "HELD", "PURCHASED", "RELEASED"
+}
+
+type Producer struct {
+    writer *kafka.Writer
+}
+
+func NewProducer(brokers []string) *Producer {
+    return &Producer{
+        writer: &kafka.Writer{
+            Addr:     kafka.TCP(brokers...),
+            Topic:    "ticket-events",
+            Balancer: &kafka.LeastBytes{},
+            Async:    true, // Fire and forget to protect API latency. Outbox worker handles durability.
+        },
+    }
+}
+
+func (p *Producer) PublishSeatEvent(ctx context.Context, event SeatEvent) error {
+    payload, err := json.Marshal(event)
+    if err != nil {
+        return err
+    }
+
+    err = p.writer.WriteMessages(ctx, kafka.Message{
+        Value: payload,
+    })
+    if err != nil {
+        // In production, implement a local fallback queue here if Kafka is down.
+        log.Printf("KAFKA WARN: failed to publish seat event: %v", err)
+    }
+    return nil
+}
