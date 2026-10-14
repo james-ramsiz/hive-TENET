@@ -1,0 +1,38 @@
+// matching-engine/src/network/DPDKListener.cpp
+#include "DPDKListener.h"
+#include <rte_eal.h>
+#include <rte_ethdev.h>
+#include <rte_mbuf.h>
+
+#define RX_RING_SIZE 1024
+#define NUM_MBUFS 8191
+#define MBUF_CACHE_SIZE 250
+
+DPDKListener::DPDKListener(RingBuffer<Order>& buffer) : buffer_(buffer) {}
+
+void DPDKListener::poll_nic() {
+    struct rte_mbuf *bufs[32];
+    uint16_t port_id = 0;
+    
+    while (true) {
+        // Read packets directly from the NIC receive ring (Zero-copy)
+        const uint16_t nb_rx = rte_eth_rx_burst(port_id, 0, bufs, 32);
+        
+        if (nb_rx > 0) {
+            for (uint16_t i = 0; i < nb_rx; i++) {
+                struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr*);
+                struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)((char *)eth_hdr + sizeof(struct rte_ether_hdr));
+                
+                // Deserialize packet directly into an Order struct
+                Order order;
+                order.price = ntohl(*(uint32_t*)((char*)udp_hdr + sizeof(struct rte_udp_hdr)));
+                order.quantity = ntohl(*(uint32_t*)((char*)udp_hdr + sizeof(struct rte_udp_hdr) + 4));
+                
+                // Publish to the LMAX Disruptor Ring Buffer (no locks, no allocation)
+                buffer_.publish(order);
+                
+                rte_pktmbuf_free(bufs[i]); // Free the network buffer
+            }
+        }
+    }
+}
