@@ -1,0 +1,40 @@
+// ticketing-platform/internal/inventory/repository.go
+package inventory
+
+import (
+    "context"
+    "fmt"
+    "github.com/redis/go-redis/v9"
+)
+
+type Repository interface {
+    HoldSeat(ctx context.Context, sectionID, seatID, userID string, ttlSecs int) (bool, error)
+}
+
+type RedisRepo struct {
+    rdb      *redis.Client
+    luaSha   string
+}
+
+func NewRedisRepo(rdb *redis.Client, luaScript string) (*RedisRepo, error) {
+    // Load the Lua script into Redis memory once at startup
+    sha, err := rdb.ScriptLoad(context.Background(), luaScript).Result()
+    if err != nil {
+        return nil, fmt.Errorf("failed to load lua script: %w", err)
+    }
+
+    return &RedisRepo{rdb: rdb, luaSha: sha}, nil
+}
+
+func (r *RedisRepo) HoldSeat(ctx context.Context, sectionID, seatID, userID string, ttlSecs int) (bool, error) {
+    key := fmt.Sprintf("inventory:section_%s", sectionID)
+    
+    // Execute the cached Lua script atomically
+    result, err := r.rdb.EvalSha(ctx, r.luaSha, []string{key}, seatID, userID, ttlSecs).Result()
+    if err != nil {
+        return false, fmt.Errorf("redis eval failed: %w", err)
+    }
+
+    // Lua script returns 1 for success, 0 for failure
+    return result.(int64) == 1, nil
+}
