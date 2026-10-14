@@ -1,0 +1,37 @@
+-- Accounts represent wallets (User, Merchant, or Platform Fee Wallet)
+CREATE TABLE accounts (
+    account_id UUID PRIMARY KEY,
+    type VARCHAR(20) NOT NULL, -- 'USER_WALLET', 'MERCHANT_WALLET', 'PLATFORM_REVENUE'
+    currency VARCHAR(3) NOT NULL DEFAULT 'USD',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Transactions group the entries together
+CREATE TABLE transactions (
+    transaction_id UUID PRIMARY KEY,
+    source_account UUID NOT NULL REFERENCES accounts(account_id),
+    dest_account UUID NOT NULL REFERENCES accounts(account_id),
+    amount BIGINT NOT NULL, -- Store in cents (e.g., $10.00 = 1000) to avoid float precision errors
+    status VARCHAR(20) NOT NULL, -- 'PENDING', 'SETTLED', 'FAILED'
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Ledger Entries are immutable. We NEVER update or delete them.
+CREATE TABLE ledger_entries (
+    entry_id BIGSERIAL PRIMARY KEY,
+    transaction_id UUID NOT NULL REFERENCES transactions(transaction_id),
+    account_id UUID NOT NULL REFERENCES accounts(account_id),
+    debit BIGINT NOT NULL DEFAULT 0, -- Positive if money leaves
+    credit BIGINT NOT NULL DEFAULT 0, -- Positive if money enters
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- The Outbox table ensures we reliably send the event to the external bank API
+CREATE TABLE outbox_events (
+    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    transaction_id UUID NOT NULL,
+    aggregate_type VARCHAR(50) NOT NULL, -- 'PAYMENT'
+    payload JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    processed_at TIMESTAMP NULL
+);
