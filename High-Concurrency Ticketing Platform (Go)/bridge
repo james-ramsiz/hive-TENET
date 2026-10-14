@@ -1,0 +1,124 @@
+// ticketing-platform/internal/persistence/outbox_worker.go
+package persistence
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "time"
+
+    "github.com/segmentio/kafka-go"
+    "github.com/jackc/pgx/v5/pgxpool"
+)
+
+type SeatEvent struct {
+    SeatID  string `json:"seat_id"`
+    UserID  string `json:"user_id"`
+    Section string `json:"section"`
+    Event   string `json:"event"`
+}
+
+type OutboxWorker struct {
+    db      *pgxpool.Pool
+    reader  *kafka.Reader
+    batchSize int
+}
+
+func NewOutboxWorker(db *pgxpool.Pool, brokers []string) *OutboxWorker {
+    return &OutboxWorker{
+        db: db,
+        reader: kafka.NewReader(kafka.ReaderConfig{
+            Brokers:  brokers,
+            Topic:    "ticket-events",
+            GroupID:  "postgres-persister-group",
+            MinBytes: 1,
+            MaxBytes: 10e6, // 10MB
+        }),
+        batchSize: 100,
+    }
+}
+
+func (w *OutboxWorker) Start(ctx context.Context) {
+    log.Println("Outbox Worker started. Consuming from Kafka...")
+
+    batch := make([]SeatEvent, 0, w.batchSize)
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            log.Println("Outbox Worker shutting down...")
+            return
+        default:
+            // Read with a short timeout so we don't block forever waiting for a full batch
+            msg, err := w.reader.ReadMessage(ctx)
+            if err != nil {
+                if err == context.DeadlineExceeded {
+                    continue
+                }
+                log.Printf("Kafka read error: %v", err)
+                continue
+            }
+
+            var event SeatEvent
+            if err := json.Unmarshal(msg.Value, &event); err == nil {
+                batch = append(batch, event)
+            }
+
+            // Flush batch if it reaches the size limit OR the ticker fires (time-window batching)
+            if len(batch) >= w.batchSize {
+                w.flushBatch(ctx, batch)
+                batch = make([]SeatEvent, 0, w.batchSize)
+            }
+        }
+    }
+}
+
+// flushBatch writes 100 events to Postgres in a single network call using UNNEST
+func (w *OutboxWorker) flushBatch(ctx context.Context, events []SeatEvent) {
+    if len(events) == 0 {
+        return
+    }
+
+    // We use Event Sourcing: We only INSERT into the DB. We never UPDATE.
+    // This prevents row-lock contention entirely.
+    tx, err := w.db.Begin(ctx)
+    if err != nil {
+        log.Printf("Failed to begin Postgres tx: %v", err)
+        return
+    }
+    defer tx.Rollback(ctx)
+
+    // Build arrays for the UNNEST bulk insert
+    seatIDs := make([]string, len(events))
+    userIDs := make([]string, len(events))
+    sections := make([]string, len(events))
+    eventTypes := make([]string, len(events))
+
+    for i, e := range events {
+        seatIDs[i] = e.SeatID
+        userIDs[i] = e.UserID
+        sections[i] = e.Section
+        eventTypes[i] = e.Event
+    }
+
+    // Postgres UNNEST allows us to insert 100 rows as if they were 3 array parameters
+    _, err = tx.Exec(ctx, `
+        INSERT INTO seat_events (seat_id, user_id, section, event_type) 
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[])`,
+        seatIDs, userIDs, sections, eventTypes)
+
+    if err != nil {
+        log.Printf("Failed to bulk insert seat events to Postgres: %v", err)
+        return
+    }
+
+    if err := tx.Commit(ctx); err != nil {
+        log.Printf("Failed to commit Postgres tx: %v", err)
+        return
+    }
+
+    log.Printf("Successfully persisted batch of %d seat events to Postgres", len(events))
+}
