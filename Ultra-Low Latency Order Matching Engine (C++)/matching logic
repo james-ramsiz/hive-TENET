@@ -1,0 +1,49 @@
+// matching-engine/src/engine/MatchingEngine.cpp
+#include "MatchingEngine.h"
+#include <iostream>
+
+MatchingEngine::MatchingEngine() {
+    // Pre-allocate order pool to avoid runtime `new` calls
+    order_pool_.resize(1000000);
+    for(auto& order : order_pool_) {
+        free_orders_.push(&order);
+    }
+}
+
+void MatchingEngine::add_order(Order& order) {
+    if (order.side == Side::BUY) {
+        buy_book_[order.price].push_back(order);
+    } else {
+        sell_book_[order.price].push_back(order);
+    }
+    match();
+}
+
+void MatchingEngine::match() {
+    while (!buy_book_.empty() && !sell_book_.empty()) {
+        auto buy_it = buy_book_.begin();
+        auto sell_it = sell_book_.begin();
+        
+        if (buy_it->first >= sell_it->first) { // Buy price >= Sell price -> Match!
+            Order& buy_order = buy_it->second.front();
+            Order& sell_order = sell_it->second.front();
+            
+            uint64_t match_qty = std::min(buy_order.quantity, sell_order.quantity);
+            
+            // Execute trade (conceptual)
+            buy_order.quantity -= match_qty;
+            sell_order.quantity -= match_qty;
+            
+            if (buy_order.quantity == 0) {
+                buy_it->second.pop_front();
+                if (buy_it->second.empty()) buy_book_.erase(buy_it);
+            }
+            if (sell_order.quantity == 0) {
+                sell_it->second.pop_front();
+                if (sell_it->second.empty()) sell_book_.erase(sell_it);
+            }
+        } else {
+            break; // No matching prices
+        }
+    }
+}
