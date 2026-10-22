@@ -1,0 +1,7 @@
+rank_score = w1 * boost_tier
+           + w2 * freelancer_reputation_score
+           + w3 * profile_completeness
+           + w4 * proposal_relevance (keyword overlap with job)
+           + w5 * recency_bonus (new proposals get a small lift)
+           + w6 * price_competitiveness (closeness to budget)
+           - w7 * red_flags (template proposals, low response rate)
