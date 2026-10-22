@@ -1,0 +1,142 @@
+
+Bid shading: Beta-Binomial binned win-rate model with isotonic regression
+to enforce monotonicity (higher bid => higher win prob).
+
+This is a simplified but production-plausible version of what DSPs run.
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass, field
+from scipy.stats import beta
+from scipy.optimize import minimize_scalar
+from sklearn.isotonic import IsotonicRegression
+
+
+@dataclass
+class BidBucket:
+    """One bin of the win-rate histogram. Posterior is Beta(alpha, beta)."""
+    alpha: float = 1.0   # pseudo-wins (prior = 1 win, 1 loss → uniform)
+    beta_: float = 1.0   # pseudo-losses
+    n_obs: int = 0
+
+    def posterior_mean(self) -> float:
+        return self.alpha / (self.alpha + self.beta_)
+
+    def update(self, won: bool) -> None:
+        if won:
+            self.alpha += 1
+        else:
+            self.beta_ += 1
+        self.n_obs += 1
+
+
+@dataclass
+class BidShadingModel:
+    """
+    Maintains a piecewise win-rate curve over bid space [0, b_max].
+    Bids are bucketed; each bucket is an independent Beta-Binomial.
+    Isotonic regression enforces monotonic non-decreasing win prob.
+    """
+    b_max: float = 50.0           # max bid we model (USD CPM)
+    n_buckets: int = 50
+    buckets: list[BidBucket] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.buckets = [BidBucket() for _ in range(self.n_buckets)]
+
+    # ---------- training ----------
+    def _bucket_idx(self, bid: float) -> int:
+        idx = int(bid / self.b_max * self.n_buckets)
+        return min(idx, self.n_buckets - 1)
+
+    def observe(self, bid: float, won: bool) -> None:
+        """Log a past auction outcome."""
+        self.buckets[self._bucket_idx(bid)].update(won)
+
+    # ---------- inference ----------
+    def _win_rate_curve(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (bid_centers, posterior-mean win prob) — isotonic-regressed."""
+        centers = np.array([
+            (i + 0.5) * self.b_max / self.n_buckets for i in range(self.n_buckets)
+        ])
+        raw = np.array([b.posterior_mean() for b in self.buckets])
+        # Enforce monotonicity: higher bid must not lower win prob
+        iso = IsotonicRegression(increasing=True, y_min=0.0, y_max=1.0)
+        smoothed = iso.fit_transform(centers, raw)
+        return centers, smoothed
+
+    def win_prob(self, bid: float) -> float:
+        """Posterior-mean P(win | bid)."""
+        centers, p = self._win_rate_curve()
+        return float(np.interp(bid, centers, p))
+
+    def optimal_bid(self, v: float) -> tuple[float, float, float]:
+        """
+        Given true value v, return (optimal_bid, expected_surplus, win_prob).
+        Uses scipy to maximize p(b) * (v - b) on [0, min(v, b_max)].
+        """
+        if v <= 0:
+            return 0.0, 0.0, 0.0
+
+        centers, p = self._win_rate_curve()
+
+        def neg_expected_surplus(b: float) -> float:
+            win_p = float(np.interp(b, centers, p))
+            return -win_p * (v - b)
+
+        # Search on [0, v] — bidding above v guarantees negative surplus
+        res = minimize_scalar(
+            neg_expected_surplus,
+            bounds=(0.0, min(v, self.b_max)),
+            method="bounded",
+            options={"xatol": 1e-3},
+        )
+        b_star = float(res.x)
+        win_p = self.win_prob(b_star)
+        expected_surplus = win_p * (v - b_star)
+        return b_star, expected_surplus, win_p
+
+    # ---------- diagnostics ----------
+    def expected_surplus_ci(self, v: float, b: float, n_samples: int = 1000) -> tuple[float, float]:
+        """
+        95% credible interval on expected surplus at bid b, value v.
+        Samples p(b) from each bucket's Beta posterior — gives uncertainty.
+        """
+        idx = self._bucket_idx(b)
+        bucket = self.buckets[idx]
+        samples = beta.rvs(bucket.alpha, bucket.beta_, size=n_samples)
+        surplus_samples = samples * (v - b)
+        return float(np.percentile(surplus_samples, 2.5)), float(np.percentile(surplus_samples, 97.5))
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    np.random.seed(42)
+    model = BidShadingModel(b_max=30.0, n_buckets=30)
+
+    # Simulate a true win curve: p(b) = (b/20)^2, capped at 1
+    # This is the GROUND TRUTH the model doesn't know.
+    def true_win_prob(b: float) -> float:
+        return min(1.0, (b / 20.0) ** 2)
+
+    # Train: 10,000 auctions with random bids
+    for _ in range(10_000):
+        b = np.random.uniform(0, 25)
+        won = np.random.random() < true_win_prob(b)
+        model.observe(b, won)
+
+    # Test: for true value v=15, what's the optimal bid?
+    v = 15.0
+    b_star, exp_surplus, win_p = model.optimal_bid(v)
+    print(f"True value v=${v:.2f}")
+    print(f"Optimal bid b*=${b_star:.2f}  (shade factor {b_star/v:.1%})")
+    print(f"Win prob at b*: {win_p:.1%}")
+    print(f"Expected surplus: ${exp_surplus:.3f}")
+
+    # Theoretical optimum for p(b)=(b/20)^2:
+    # Closed form: b* = v * k/(k+1) where k=2 → b* = v * 2/3 = $10.00
+    print(f"\nTheoretical closed-form (k=2 power law): ${v * 2/3:.2f}")
+
+    # Uncertainty quantification
+    lo, hi = model.expected_surplus_ci(v, b_star)
+    print(f"95% credible interval on surplus: [${lo:.3f}, ${hi:.3f}]")
