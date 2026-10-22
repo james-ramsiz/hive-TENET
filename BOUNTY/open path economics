@@ -1,0 +1,15 @@
+Advertiser
+   │  $10.00 CPM
+   ▼
+TTD (DSP)
+   │  -$1.50  (TTD tech fee, ~15%)
+   │  -$0.50  (data costs: 3P data, UID2 ops)
+   │  =$8.00 passed to SSP
+   ▼
+SSP (e.g., Magnite)
+   │  -$1.20  (SSP take rate, ~15%)
+   │  -$0.30  (SSP ad-serving fees)
+   │  =$6.50 to publisher
+   ▼
+Publisher
+   Receives $6.50
