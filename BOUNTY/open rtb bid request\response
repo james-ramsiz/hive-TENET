@@ -1,0 +1,173 @@
+{
+  "id": "9c8b1f2a-3e4d-4b5c-9f1a-7e6d5c4b3a2f",
+
+  "imp": [
+    {
+      "id": "1",
+      "banner": {
+        "w": 300,
+        "h": 250,
+        "pos": 1,
+        "btype": [1, 4],
+        "battr": [1, 2, 6, 14],
+        "api": [3, 5],
+        "format": [
+          {"w": 300, "h": 250},
+          {"w": 300, "h": 600}
+        ]
+      },
+      "displaymanager": "prebid",
+      "displaymanagerver": "8.20.0",
+      "tagid": "nyt_med_rec_sidebar",
+      "bidfloor": 1.50,
+      "bidfloorcur": "USD",
+      "secure": 1,
+      "exp": 300
+    }
+  ],
+
+  "site": {
+    "id": "pub-1234",
+    "name": "The New York Times",
+    "domain": "nytimes.com",
+    "cat": ["IAB12", "IAB12-2"],
+    "sectioncat": ["IAB12-2"],
+    "pagecat": ["IAB12-2"],
+    "page": "https://www.nytimes.com/2025/01/15/business/economy/inflation-report.html",
+    "ref": "https://www.google.com/search?q=inflation",
+    "search": "inflation",
+    "publisher": {
+      "id": "pub-1234",
+      "name": "The New York Times Company",
+      "domain": "nytimes.com",
+      "cat": ["IAB12-2"]
+    },
+    "content": {
+      "id": "article-98765",
+      "title": "Inflation Cools for Third Straight Month",
+      "lang": "en",
+      "len": 1850,
+      "keywords": ["inflation", "fed", "economy", "cpi"],
+      "genre": "News",
+      "cat": ["IAB12-2"],
+      "producer": {
+        "id": "nyt-editorial",
+        "name": "NYT Business Desk"
+      }
+    }
+  },
+
+  "device": {
+    "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "geo": {
+      "lat": 40.7128,
+      "lon": -74.0060,
+      "type": 2,
+      "country": "USA",
+      "region": "NY",
+      "metro": "501",
+      "city": "New York",
+      "zip": "10001",
+      "utcoffset": -300
+    },
+    "dnt": 0,
+    "lmt": 0,
+    "ip": "63.252.91.10",
+    "ipv6": "2606:2800:220:1:248:1893:25c8:1946",
+    "devicetype": 2,
+    "make": "Apple",
+    "model": "MacBookPro",
+    "os": "MacOS",
+    "osv": "13.6.1",
+    "h": 900,
+    "w": 1440,
+    "pxratio": 2,
+    "js": 1,
+    "geofetch": 0
+  },
+
+  "user": {
+    "id": "YOa8n5k2vQ9pXrT3mNbV7sLwH1jZ8fCd",
+    "buyeruid": "ttd-uid-2K9mXqP4rNvT7bL1cY8wQ3sH5jZ2vN6",
+    "yob": 1985,
+    "gender": "M",
+    "keywords": "auto intender,finance reader,tech early adopter",
+    "geo": {
+      "country": "USA",
+      "region": "NY",
+      "city": "New York",
+      "zip": "10001"
+    },
+    "data": [
+      {
+        "id": "ttd_segments",
+        "name": "TTD Audience Cloud",
+        "segment": [
+          {"id": "auto_intender_30d", "name": "Auto Intender (30d)", "value": "0.87"},
+          {"id": "finance_pro_90d",   "name": "Finance Professional (90d)"},
+          {"id": "luxury_buyer",      "name": "Luxury Buyer Index", "value": "0.62"}
+        ]
+      }
+    ],
+    "ext": {
+      "eids": [
+        {
+          "source": "uid2",
+          "uids": [
+            {
+              "id": "AAAAAAAABhq3TR3KpV3YtA9UBgACv4m5p1c5tCqJ8vJ8nQ3sH5jZ2vN6rT7bL1cY8wQ3sH5jZ2vN6rT7bL1cY8wQ3sH5jZ2vN6rT7bL1cY8wQ",
+              "atype": 1
+            }
+          ]
+        },
+        {
+          "source": "lid",
+          "uids": [
+            {"id": "_a7b3c9d2e1f4g5h6i7j8k9l0m1n2o3p4", "atype": 1}
+          ]
+        }
+      ],
+      "consent": "CPu8n5kP2vQ9pXrT3mNbV7sLwH1jZ8fCd.YAAAAAAAAAAA"
+    }
+  },
+
+  "at": 1,
+  "tmax": 80,
+  "wlang": ["en"],
+  "wseat": ["ttd", "td", "appnexus"],
+  "bseat": ["dsp-competitor-x"],
+  "allimps": 0,
+  "cur": ["USD"],
+  "wtype": [1, 2],
+
+  "regs": {
+    "ext": {
+      "gdpr": 0,
+      "us_privacy": "1YYN"
+    }
+  },
+
+  "ext": {
+    "prebid": {
+      "version": "8.20.0",
+      "channels": ["web"],
+      "auctiontimestamp": 1737043200123,
+      "targeting": {
+        "hb_pb": "5.00",
+        "hb_bidder": "rubicon"
+      }
+    },
+    "schain": {
+      "ver": "1.0",
+      "complete": 1,
+      "nodes": [
+        {
+          "asi": "rubicon.com",
+          "sid": "pub-1234",
+          "rid": "9c8b1f2a-3e4d-4b5c",
+          "hp": 1
+        }
+      ]
+    }
+  }
+}
