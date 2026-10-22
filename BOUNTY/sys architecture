@@ -1,0 +1,25 @@
+┌──────────────┐      (1) email        ┌──────────────────┐
+│   Publisher  │ ─────────────────────►│   UID2 Operator  │
+│  (or DSP)    │      (2) email_hash   │   (TTD-hosted)   │
+└──────────────┘                       │                  │
+       ▲                               │  Master Key (K0) │
+       │                               │  rotated weekly  │
+       │ (5) advertising_token         │                  │
+       │     + refresh_token           │  Site Keys (K_s) │
+       ├───────────────────────────────┤  per-publisher   │
+       │                               └──────────────────┘
+       │                                          ▲
+       │ (6) Token placed in OpenRTB              │ (4) /v2/token/refresh
+       │     user.ext.eids                         │   authorized DSP refreshes
+       ▼                                          │
+┌──────────────┐                                  │
+│     SSP      │ ── (3) bid request forwarded ──► │
+└──────────────┘                                  │
+       │                                          ▼
+       ▼                               ┌──────────────────┐
+┌──────────────┐      (7) /v2/identity/map       │       DSP        │
+│     DSP      │ ──────────────────────────────► │  (e.g. TTD)     │
+│  decrypts    │      advertising_token           │  has site key    │
+│  via site    │ ◄────────────────────────────── │  K_s             │
+│  key K_s     │      raw UID2 user_id            └──────────────────┘
+└──────────────┘
