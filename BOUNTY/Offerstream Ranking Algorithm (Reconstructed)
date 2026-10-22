@@ -1,0 +1,258 @@
+"""
+PeoplePerHour-style Offerstream ranker.
+Ranks proposals for a client's job view.
+
+Weights are inferred, not authoritative. PPH's actual algorithm
+is proprietary and changes over time.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import IntEnum
+from typing import Optional
+
+
+class BoostTier(IntEnum):
+    NONE = 0
+    STANDARD = 1
+    PREMIUM = 2
+
+
+@dataclass
+class Freelancer:
+    id: str
+    rating: float                       # 0–5 star average
+    num_reviews: int                    # total reviews received
+    response_rate: float                # 0–1, fraction of messages replied to
+    avg_response_time_hours: float      # lower is better
+    profile_completeness: float         # 0–1
+    category_match_score: float         # 0–1, overlap with job skills
+    repeat_client_rate: float           # 0–1, fraction of clients who rehire
+    earnings_tier: int                  # 1–5, PPH tier based on cumulative earnings
+    is_pro_subscriber: bool = False
+
+
+@dataclass
+class Proposal:
+    id: str
+    freelancer: Freelancer
+    cover_letter: str
+    proposed_price: float
+    proposed_timeline_days: int
+    submitted_at: datetime
+    boost_tier: BoostTier = BoostTier.NONE
+    portfolio_items_attached: int = 0
+    has_questions_for_client: bool = False
+    word_count: int = 0
+    is_template_like: bool = False      # heuristic flag
+
+
+@dataclass
+class Job:
+    id: str
+    client_budget: float
+    posted_at: datetime
+    required_skills: set[str]
+    category: str
+
+
+# -------------------- scoring --------------------
+@dataclass
+class OfferstreamWeights:
+    boost: float = 100.0           # boost tier dominates
+    reputation: float = 25.0
+    profile_completeness: float = 10.0
+    relevance: float = 20.0
+    recency: float = 15.0          # decays over time
+    price_competitiveness: float = 12.0
+    response_quality: float = 8.0
+    red_flag_penalty: float = 40.0
+
+
+def reputation_score(f: Freelancer) -> float:
+    """
+    Bayesian-shrunk star rating.
+    A 5-star freelancer with 2 reviews shouldn't outrank a 4.8-star with 200.
+    Prior: Beta(2, 2) on the [0,1] star ratio.
+    """
+    prior_strength = 5.0
+    prior_mean = 0.8  # ~4 stars prior
+    observed = f.rating / 5.0
+    shrunk = (prior_strength * prior_mean + f.num_reviews * observed) / (prior_strength + f.num_reviews)
+    # Bonus for high earnings tier (proxy for sustained quality)
+    tier_bonus = 0.05 * (f.earnings_tier - 1) / 4.0
+    # Penalty for slow response
+    response_penalty = min(0.2, f.avg_response_time_hours / 100.0)
+    return max(0.0, min(1.0, shrunk + tier_bonus - response_penalty))
+
+
+def recency_score(submitted_at: datetime, now: datetime) -> float:
+    """
+    New proposals get a small boost; decays over 72h.
+    After 72h, the score floors at 0.2 (so older proposals aren't invisible).
+    """
+    age_hours = (now - submitted_at).total_seconds() / 3600
+    if age_hours < 1:
+        return 1.0
+    if age_hours > 72:
+        return 0.2
+    # Exponential decay
+    return 0.2 + 0.8 * (0.5 ** (age_hours / 12))
+
+
+def price_competitiveness_score(proposed: float, budget: float) -> float:
+    """
+    Score peaks when proposed is 80–95% of budget.
+    Below 60%: looks low-quality ("too cheap"). Above 110%: too expensive.
+    """
+    if budget <= 0:
+        return 0.5
+    ratio = proposed / budget
+    if 0.80 <= ratio <= 0.95:
+        return 1.0
+    if ratio < 0.60:
+        return 0.3
+    if ratio > 1.10:
+        return 0.2
+    if 0.60 <= ratio < 0.80:
+        return 0.6 + 0.4 * (ratio - 0.60) / 0.20
+    if 0.95 < ratio <= 1.10:
+        return 1.0 - 0.8 * (ratio - 0.95) / 0.15
+    return 0.5
+
+
+def relevance_score(f: Freelancer, job: Job) -> float:
+    """
+    Combines category match + repeat-client rate (proxy for niche expertise).
+    """
+    base = f.category_match_score
+    niche_bonus = 0.15 * f.repeat_client_rate
+    return min(1.0, base + niche_bonus)
+
+
+def response_quality_score(p: Proposal) -> float:
+    """
+    Heuristics on the cover letter.
+    """
+    s = 0.5  # baseline
+    if 150 <= p.word_count <= 400:
+        s += 0.2  # sweet spot — not too short, not a wall of text
+    elif p.word_count < 100:
+        s -= 0.2
+    elif p.word_count > 600:
+        s -= 0.1
+    if p.portfolio_items_attached >= 2:
+        s += 0.15
+    if p.has_questions_for_client:
+        s += 0.1  # engagement signal
+    if p.is_template_like:
+        s -= 0.4  # heavy penalty for copy-paste
+    return max(0.0, min(1.0, s))
+
+
+def red_flag_score(f: Freelancer, p: Proposal) -> float:
+    """Returns penalty in [0, 1]."""
+    penalty = 0.0
+    if f.response_rate < 0.5:
+        penalty += 0.5
+    if f.rating < 3.5:
+        penalty += 0.3
+    if p.is_template_like:
+        penalty += 0.2
+    if f.num_reviews < 2 and not f.is_pro_subscriber:
+        penalty += 0.1
+    return min(1.0, penalty)
+
+
+def rank_proposal(
+    p: Proposal, job: Job, now: datetime, w: OfferstreamWeights = OfferstreamWeights()
+) -> float:
+    rep = reputation_score(p.freelancer)
+    rec = recency_score(p.submitted_at, now)
+    prc = price_competitiveness_score(p.proposed_price, job.client_budget)
+    rel = relevance_score(p.freelancer, job)
+    rq  = response_quality_score(p)
+    rf  = red_flag_score(p.freelancer, p)
+    pc  = p.freelancer.profile_completeness
+
+    # Boost tier scaled 0/1/2 → 0/0.7/1.0 (premium boost isn't 2x standard)
+    boost_normalized = {BoostTier.NONE: 0.0, BoostTier.STANDARD: 0.7, BoostTier.PREMIUM: 1.0}[p.boost_tier]
+
+    score = (
+        w.boost * boost_normalized
+        + w.reputation * rep
+        + w.profile_completeness * pc
+        + w.relevance * rel
+        + w.recency * rec
+        + w.price_competitiveness * prc
+        + w.response_quality * rq
+        - w.red_flag_penalty * rf
+    )
+    return score
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    now = datetime(2025, 1, 15, 14, 30)
+
+    job = Job(
+        id="job-001",
+        client_budget=1500.0,
+        posted_at=now - timedelta(hours=2),
+        required_skills={"wordpress", "squarespace", "css", "ux"},
+        category="web-development",
+    )
+
+    # Three freelancers, same job
+    pro_high = Freelancer(
+        id="alice", rating=4.9, num_reviews=187, response_rate=0.96,
+        avg_response_time_hours=1.5, profile_completeness=0.95,
+        category_match_score=0.9, repeat_client_rate=0.42,
+        earnings_tier=4, is_pro_subscriber=True,
+    )
+    mid_freelancer = Freelancer(
+        id="bob", rating=4.6, num_reviews=42, response_rate=0.82,
+        avg_response_time_hours=6.0, profile_completeness=0.78,
+        category_match_score=0.75, repeat_client_rate=0.25,
+        earnings_tier=2, is_pro_subscriber=False,
+    )
+    new_freelancer = Freelancer(
+        id="carol", rating=5.0, num_reviews=2, response_rate=0.7,
+        avg_response_time_hours=12.0, profile_completeness=0.65,
+        category_match_score=0.6, repeat_client_rate=0.0,
+        earnings_tier=1, is_pro_subscriber=False,
+    )
+
+    proposals = [
+        Proposal(id="p1", freelancer=pro_high, cover_letter="…", proposed_price=1400,
+                 proposed_timeline_days=14, submitted_at=now - timedelta(minutes=30),
+                 boost_tier=BoostTier.NONE, portfolio_items_attached=3,
+                 has_questions_for_client=True, word_count=280),
+        Proposal(id="p2", freelancer=mid_freelancer, cover_letter="…", proposed_price=1200,
+                 proposed_timeline_days=10, submitted_at=now - timedelta(minutes=15),
+                 boost_tier=BoostTier.PREMIUM, portfolio_items_attached=2,
+                 has_questions_for_client=False, word_count=220),
+        Proposal(id="p3", freelancer=new_freelancer, cover_letter="…", proposed_price=800,
+                 proposed_timeline_days=21, submitted_at=now - timedelta(minutes=5),
+                 boost_tier=BoostTier.STANDARD, portfolio_items_attached=1,
+                 has_questions_for_client=True, word_count=180),
+    ]
+
+    ranked = sorted(proposals, key=lambda p: rank_proposal(p, job, now), reverse=True)
+    print(f"{'Rank':<6}{'Proposal':<10}{'Freelancer':<14}{'Boost':<10}{'Price':<8}{'Score':<8}")
+    print("-" * 60)
+    for i, p in enumerate(ranked, 1):
+        s = rank_proposal(p, job, now)
+        print(f"{i:<6}{p.id:<10}{p.freelancer.id:<14}"
+              f"{p.boost_tier.name:<10}£{p.proposed_price:<7.0f}{s:<8.1f}")
+
+    # Show component breakdown for top proposal
+    print("\n--- Component breakdown for top proposal ---")
+    top = ranked[0]
+    print(f"Boost:          {100.0 * 0.0:.1f}")  # NONE = 0
+    print(f"Reputation:     {25.0 * reputation_score(top.freelancer):.1f}")
+    print(f"Relevance:      {20.0 * relevance_score(top.freelancer, job):.1f}")
+    print(f"Recency:        {15.0 * recency_score(top.submitted_at, now):.1f}")
+    print(f"Price comp:     {12.0 * price_competitiveness_score(top.proposed_price, job.client_budget):.1f}")
+    print(f"Response qual:  {8.0 * response_quality_score(top):.1f}")
+    print(f"Red flag pen:  -{40.0 * red_flag_score(top.freelancer, top):.1f}")
