@@ -1,0 +1,163 @@
+"""
+Optimal boost decision for a PPH freelancer.
+Models the boost decision as a Bayesian expected-value calculation.
+
+Key insight: P(win | boost) is learned from your own past applications.
+Different freelancers have different boost sensitivities.
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass
+from scipy.stats import beta
+
+
+@dataclass
+class BoostTier:
+    name: str
+    extra_credits: int
+    prior_win_alpha: float   # Beta prior on win rate at this tier
+    prior_win_beta: float
+
+
+@dataclass
+class FreelancerHistory:
+    """Per-freelancer, per-job-category win-rate observations by boost tier."""
+    none_obs: tuple[int, int] = (1, 24)        # (wins, losses) at no boost
+    standard_obs: tuple[int, int] = (3, 27)    # at standard boost
+    premium_obs: tuple[int, int] = (8, 36)     # at premium boost
+
+    def posterior(self, tier: BoostTier) -> tuple[float, float]:
+        """Returns (alpha, beta) for Beta posterior at this tier."""
+        priors = {"none": (1, 24), "standard": (3, 27), "premium": (8, 36)}
+        # Beta-Binomial conjugate: posterior = prior + observations
+        if tier.name == "none":
+            obs = self.none_obs
+        elif tier.name == "standard":
+            obs = self.standard_obs
+        else:
+            obs = self.premium_obs
+        a = tier.prior_win_alpha + obs[0]
+        b = tier.prior_win_beta + obs[1]
+        return a, b
+
+
+def service_fee(revenue: float, prior_earnings: float) -> float:
+    """PPH tiered service fee."""
+    tiers = [(350, 0.0), (3500, 0.10), (15000, 0.075), (50000, 0.05), (float("inf"), 0.035)]
+    fee = 0.0
+    remaining = revenue
+    cumulative = prior_earnings
+    for threshold, rate in tiers:
+        headroom = threshold - cumulative
+        if headroom <= 0:
+            continue
+        chunk = min(remaining, headroom)
+        fee += chunk * rate
+        cumulative += chunk
+        remaining -= chunk
+        if remaining <= 0:
+            break
+    return fee
+
+
+def expected_value(
+    tier: BoostTier,
+    proposed_revenue: float,
+    prior_earnings: float,
+    credit_value_gbp: float,
+    base_credits: int,
+    time_cost_gbp: float,
+    history: FreelancerHistory,
+    n_samples: int = 1000,
+) -> dict:
+    """
+    Compute expected value (and 95% CI) of submitting at a given boost tier.
+    Samples P(win) from the Beta posterior to propagate uncertainty.
+    """
+    alpha, beta_ = history.posterior(tier)
+    win_samples = beta.rvs(alpha, beta_, size=n_samples)
+
+    fee = service_fee(proposed_revenue, prior_earnings)
+    net_revenue = proposed_revenue - fee
+    total_credits = base_credits + tier.extra_credits
+    credit_cost = total_credits * credit_value_gbp
+
+    surplus_samples = win_samples * net_revenue - credit_cost - time_cost_gbp
+
+    return {
+        "tier": tier.name,
+        "credits_spent": total_credits,
+        "credit_cost_gbp": credit_cost,
+        "win_rate_mean": float(win_samples.mean()),
+        "win_rate_ci": (float(np.percentile(win_samples, 2.5)),
+                        float(np.percentile(win_samples, 97.5))),
+        "ev_mean": float(surplus_samples.mean()),
+        "ev_ci": (float(np.percentile(surplus_samples, 2.5)),
+                  float(np.percentile(surplus_samples, 97.5))),
+        "net_revenue_if_won": net_revenue,
+    }
+
+
+def best_boost_decision(
+    tiers: list[BoostTier],
+    proposed_revenue: float,
+    prior_earnings: float,
+    credit_value_gbp: float,
+    base_credits: int,
+    time_cost_gbp: float,
+    history: FreelancerHistory,
+) -> tuple[BoostTier, dict]:
+    """Returns (best_tier, ev_breakdown) maximizing expected value."""
+    results = []
+    for tier in tiers:
+        r = expected_value(
+            tier, proposed_revenue, prior_earnings, credit_value_gbp,
+            base_credits, time_cost_gbp, history,
+        )
+        results.append((tier, r))
+        print(f"\n[{tier.name:>8}]  credits={r['credits_spent']:>3}  "
+              f"P(win)={r['win_rate_mean']:.1%} [CI {r['win_rate_ci'][0]:.1%}–{r['win_rate_ci'][1]:.1%}]  "
+              f"EV=£{r['ev_mean']:.2f} [CI £{r['ev_ci'][0]:.2f}–£{r['ev_ci'][1]:.2f}]")
+
+    best = max(results, key=lambda x: x[1]["ev_mean"])
+    return best
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    tiers = [
+        BoostTier("none",     0,  1, 24),
+        BoostTier("standard", 15, 3, 27),
+        BoostTier("premium",  30, 8, 36),
+    ]
+
+    # Scenario 1: High-value web design job, mid-tier freelancer
+    print("=" * 80)
+    print("SCENARIO 1: £1,500 web design job, freelancer has £2,000 prior earnings")
+    print("=" * 80)
+    history = FreelancerHistory()
+    best = best_boost_decision(
+        tiers=tiers,
+        proposed_revenue=1500.0,
+        prior_earnings=2000.0,
+        credit_value_gbp=0.08,    # Pro subscriber effective cost
+        base_credits=15,
+        time_cost_gbp=25.0,       # 30 min at £50/hr
+        history=history,
+    )
+    print(f"\n→ Best tier: {best[0].name.upper()}  (EV = £{best[1]['ev_mean']:.2f})")
+
+    # Scenario 2: Low-value job — boost math flips
+    print("\n" + "=" * 80)
+    print("SCENARIO 2: £150 small job, same freelancer")
+    print("=" * 80)
+    best = best_boost_decision(
+        tiers=tiers,
+        proposed_revenue=150.0,
+        prior_earnings=2000.0,
+        credit_value_gbp=0.08,
+        base_credits=15,
+        time_cost_gbp=10.0,       # less time spent
+        history=history,
+    )
+    print(f"\n→ Best tier: {best[0].name.upper()}  (EV = £{best[1]['ev_mean']:.2f})")
