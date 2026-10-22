@@ -1,0 +1,1 @@
+EV(offer) = P(win | boost_tier) × (revenue − PPH_service_fee) − credit_cost − time_cost
