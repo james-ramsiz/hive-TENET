@@ -1,0 +1,61 @@
+{
+  "id": "9c8b1f2a-3e4d-4b5c-9f1a-7e6d5c4b3a2f",
+  "seatbid": [
+    {
+      "seat": "ttd",
+      "bid": [
+        {
+          "id": "ttd-bid-8f7e6d5c-4b3a-2918-7f6e-5d4c3b2a1908",
+          "impid": "1",
+          "price": 7.42,
+          "adm": "<script src=\"https://insight.adsrvr.org/track/rtb?mid=1234&tid=ttd-req-9c8b1f2a\"></script>",
+          "adid": "ttddda-12345",
+          "adomain": ["pampers.com"],
+          "iurl": "https://creative.adsrvr.org/preview/pampers_300x250.png",
+          "cid": "pampers_q1_brand_2025",
+          "crid": "pampers_300x250_v3",
+          "cat": ["IAB13", "IAB13-3"],
+          "attr": [2],
+          "api": [3, 5],
+          "protocol": [7, 8],
+          "qagmediarating": 1,
+          "nurl": "https://win-notice.adsrvr.org/win?bidid=ttd-bid-8f7e6d5c&price=${AUCTION_PRICE}&bidder=ttd",
+          "lurl": "https://loss-notice.adsrvr.org/loss?bidid=ttd-bid-8f7e6d5c",
+          "exp": 300,
+          "ext": {
+            "prebid": {
+              "type": "banner",
+              "event": [
+                {
+                  "type": "bid",
+                  "url": "https://insight.adsrvr.org/track/bid?bidid=ttd-bid-8f7e6d5c"
+                },
+                {
+                  "type": "win",
+                  "url": "https://insight.adsrvr.org/track/win?bidid=ttd-bid-8f7e6d5c"
+                }
+              ]
+            },
+            "skadn": {
+              "sourceapp": "pub-1234",
+              "skadnetids": [],
+              "versions": ["2.2"]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "bidid": "ttd-req-9c8b1f2a-3e4d-4b5c-9f1a-7e6d5c4b3a2f",
+  "cur": "USD",
+  "ext": {
+    "responsetimemillis": {
+      "ttd": 23
+    },
+    "ttdlambda": {
+      "decision_ms": 17,
+      "model_version": "koa-2025-01-15",
+      "shade_factor": 0.495
+    }
+  }
+}
