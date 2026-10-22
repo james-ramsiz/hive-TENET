@@ -1,0 +1,110 @@
+"""
+Multi-job credit allocation.
+Knapsack-style: maximize total EV subject to monthly credit budget.
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class JobOpportunity:
+    job_id: str
+    estimated_revenue: float
+    estimated_win_rate_no_boost: float
+    estimated_win_rate_standard: float
+    estimated_win_rate_premium: float
+    time_cost_gbp: float
+    base_credits: int = 15
+
+
+def ev_for_choice(job: JobOpportunity, choice: str, credit_value: float = 0.08) -> tuple[float, int]:
+    """Returns (EV, credits_spent) for choice in {'skip','none','standard','premium'}."""
+    if choice == "skip":
+        return 0.0, 0
+    wr_map = {
+        "none":     (job.estimated_win_rate_no_boost, 0),
+        "standard": (job.estimated_win_rate_standard, 15),
+        "premium":  (job.estimated_win_rate_premium, 30),
+    }
+    wr, extra = wr_map[choice]
+    credits = job.base_credits + extra
+    ev = wr * job.estimated_revenue - credits * credit_value - job.time_cost_gbp
+    return ev, credits
+
+
+def allocate_credits(jobs: list[JobOpportunity], credit_budget: int) -> dict[str, str]:
+    """
+    Greedy knapsack: for each job, evaluate all 4 choices.
+    Sort by EV/credit and greedily fill the credit budget.
+    """
+    candidates = []
+    for job in jobs:
+        for choice in ["skip", "none", "standard", "premium"]:
+            ev, credits = ev_for_choice(job, choice)
+            if credits == 0:
+                efficiency = 0  # skip is the baseline
+            else:
+                efficiency = ev / credits
+            candidates.append({
+                "job_id": job.job_id, "choice": choice, "ev": ev,
+                "credits": credits, "efficiency": efficiency,
+            })
+
+    # Sort by efficiency descending; tie-break by absolute EV
+    candidates.sort(key=lambda c: (c["efficiency"], c["ev"]), reverse=True)
+
+    allocation = {}
+    remaining = credit_budget
+    total_ev = 0.0
+    for c in candidates:
+        if c["job_id"] in allocation:
+            continue  # already decided on this job
+        if c["choice"] == "skip":
+            allocation[c["job_id"]] = "skip"
+            continue
+        if c["credits"] <= remaining:
+            allocation[c["job_id"]] = c["choice"]
+            remaining -= c["credits"]
+            total_ev += c["ev"]
+        else:
+            # Can't afford this choice; try cheaper options for same job
+            for fallback in ["none", "skip"]:
+                fb_ev, fb_credits = ev_for_choice(next(j for j in jobs if j.job_id == c["job_id"]), fallback)
+                if fb_credits <= remaining:
+                    allocation[c["job_id"]] = fallback
+                    remaining -= fb_credits
+                    total_ev += fb_ev
+                    break
+            else:
+                allocation[c["job_id"]] = "skip"
+
+    return {"allocations": allocation, "remaining_credits": remaining, "total_ev": total_ev}
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    np.random.seed(7)
+    # 20 jobs in the feed this month
+    jobs = [
+        JobOpportunity(
+            job_id=f"job-{i:02d}",
+            estimated_revenue=np.random.choice([150, 400, 800, 1500, 3000], p=[0.3, 0.3, 0.2, 0.15, 0.05]),
+            estimated_win_rate_no_boost=np.random.uniform(0.02, 0.08),
+            estimated_win_rate_standard=np.random.uniform(0.05, 0.15),
+            estimated_win_rate_premium=np.random.uniform(0.10, 0.25),
+            time_cost_gbp=np.random.uniform(10, 40),
+        )
+        for i in range(20)
+    ]
+
+    # Pro subscription: 150 credits/month
+    result = allocate_credits(jobs, credit_budget=150)
+    print(f"\nMonthly credit allocation (budget=150 credits):")
+    print(f"{'Job':<10}{'Revenue':>10}{'Allocated':>12}")
+    print("-" * 40)
+    for j in jobs:
+        choice = result["allocations"][j.job_id]
+        print(f"{j.job_id:<10}£{j.estimated_revenue:>8.0f}{choice:>12}")
+    print(f"\nTotal EV: £{result['total_ev']:.2f}")
+    print(f"Credits remaining: {result['remaining_credits']}")
