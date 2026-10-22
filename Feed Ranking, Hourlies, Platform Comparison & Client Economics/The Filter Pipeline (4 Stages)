@@ -1,0 +1,15 @@
+All live jobs (~50,000)
+   │
+   ├─ Stage 1: Hard filters (category, geo, language, budget range)
+   │           → ~5,000 jobs pass
+   │
+   ├─ Stage 2: Subscription-tier gating (Pro sees everything;
+   │           free users see jobs older than 24h)
+   │           → variable, often 2,000–4,000 jobs visible
+   │
+   ├─ Stage 3: Soft scoring (relevance, past performance, freshness,
+   │           saturation, fit score)
+   │           → all visible jobs get a rank score
+   │
+   └─ Stage 4: Pagination (top 50–100 shown on first page)
+              → only top-ranked jobs get eyeballs
