@@ -1,0 +1,269 @@
+"""
+UID2-style token generation and decryption.
+Implements the three-tier key hierarchy with AES-256-GCM.
+
+NOT a drop-in replica of TTD's production code (that is closed-source),
+but follows the published UID2 spec at github.com/UnifiedID2/uid2docs.
+"""
+from __future__ import annotations
+import base64
+import hashlib
+import json
+import re
+import secrets
+import struct
+import time
+from dataclasses import dataclass
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+# -------------------- email normalization --------------------
+def normalize_email(email: str) -> str:
+    """
+    UID2 normalization rules:
+    - lowercase
+    - strip leading/trailing whitespace
+    - remove spaces within
+    - for gmail only: remove dots in local part, remove +suffix
+    """
+    email = email.strip().lower().replace(" ", "")
+    local, _, domain = email.partition("@")
+    if domain == "gmail.com" or domain == "googlemail.com":
+        local = local.split("+", 1)[0]   # drop +suffix
+        local = local.replace(".", "")    # gmail ignores dots
+    return f"{local}@{domain}"
+
+
+def email_hash(email: str) -> bytes:
+    """SHA-256 of normalized email. This is what the operator receives."""
+    return hashlib.sha256(normalize_email(email).encode("utf-8")).digest()
+
+
+# -------------------- key hierarchy --------------------
+@dataclass
+class MasterKey:
+    """K0 — rotates weekly. Encrypts site keys for distribution to DSPs."""
+    key_id: int
+    key: bytes  # 32 bytes for AES-256
+
+    @classmethod
+    def generate(cls, key_id: int) -> "MasterKey":
+        return cls(key_id=key_id, key=secrets.token_bytes(32))
+
+
+@dataclass
+class SiteKey:
+    """K_s — one per publisher. Encrypts advertising tokens."""
+    site_id: int
+    key_id: int      # which master key encrypted this site key (for rotation)
+    key: bytes
+
+    @classmethod
+    def generate(cls, site_id: int, key_id: int) -> "SiteKey":
+        return cls(site_id=site_id, key_id=key_id, key=secrets.token_bytes(32))
+
+
+# -------------------- token format --------------------
+# Layout (all big-endian):
+#   uint8   version         (0x01)
+#   uint32  site_id
+#   uint32  key_id          (which site key to use for decryption)
+#   uint64  token_gen_time  (unix seconds)
+#   uint64  token_exp_time  (unix seconds — typically gen + 1 hour)
+#   uint64  identity_exp    (unix seconds — typically gen + 30 days)
+#   32 bytes user_id        (the actual stable UID2 — SHA-256(email_hash || salt))
+#   12 bytes nonce          (for AES-GCM)
+#   variable ciphertext+tag (encrypted payload = same user_id again, for integrity)
+
+TOKEN_VERSION = 1
+TOKEN_TTL_SECONDS = 3600           # advertising_token valid for 1 hour
+IDENTITY_TTL_SECONDS = 30 * 86400  # underlying identity valid for 30 days
+
+
+def _pack_token_header(site_id: int, key_id: int, gen: int, exp: int, id_exp: int) -> bytes:
+    return struct.pack(
+        ">BIIQQQ",
+        TOKEN_VERSION, site_id, key_id, gen, exp, id_exp,
+    )
+
+
+# -------------------- operator (minting side) --------------------
+class UID2Operator:
+    """
+    Runs at TTD (or another trusted operator). Mints tokens and
+    distributes site keys to authorized DSPs.
+    """
+    def __init__(self) -> None:
+        self.master_keys: dict[int, MasterKey] = {}
+        self.site_keys: dict[tuple[int, int], SiteKey] = {}  # (site_id, key_id) -> key
+        self.user_salts: dict[bytes, bytes] = {}             # email_hash -> salt
+        self.revoked: set[bytes] = set()                     # revoked user_ids
+        self._rotate_master_key()
+
+    def _rotate_master_key(self) -> None:
+        kid = (max(self.master_keys) + 1) if self.master_keys else 1
+        self.master_keys[kid] = MasterKey.generate(kid)
+        self.current_master_key_id = kid
+
+    def provision_site(self, site_id: int) -> None:
+        """Generate a new site key under the current master key."""
+        sk = SiteKey.generate(site_id, self.current_master_key_id)
+        self.site_keys[(site_id, sk.key_id)] = sk
+
+    def _user_id(self, email: str) -> bytes:
+        """
+        Stable UID2 user_id = SHA-256(email_hash || per-user salt).
+        Salt is created once per user and persisted by the operator.
+        """
+        eh = email_hash(email)
+        if eh not in self.user_salts:
+            self.user_salts[eh] = secrets.token_bytes(16)
+        return hashlib.sha256(eh + self.user_salts[eh]).digest()
+
+    def mint_token(self, email: str, site_id: int) -> tuple[str, str]:
+        """
+        Returns (advertising_token, refresh_token).
+        advertising_token is what flows in OpenRTB.
+        refresh_token is what the client uses to mint new advertising tokens.
+        """
+        user_id = self._user_id(email)
+        if user_id in self.revoked:
+            raise PermissionError("user has revoked consent")
+
+        sk = self._site_key_for(site_id)
+        now = int(time.time())
+        gen, exp, id_exp = now, now + TOKEN_TTL_SECONDS, now + IDENTITY_TTL_SECONDS
+
+        header = _pack_token_header(site_id, sk.key_id, gen, exp, id_exp)
+        # Plaintext for AES-GCM = user_id (we re-include it inside the AEAD
+        # so tampering with the cleartext header invalidates the token).
+        aesgcm = AESGCM(sk.key)
+        nonce = secrets.token_bytes(12)
+        # AAD = header (binds token metadata to ciphertext)
+        ciphertext = aesgcm.encrypt(nonce, user_id, header)
+
+        payload = header + nonce + ciphertext
+        advertising_token = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+        # Refresh token: longer-lived, encrypts (user_id, site_id) under master key
+        refresh_payload = struct.pack(">IQ", site_id, now + 7 * 86400) + user_id
+        rgcm = AESGCM(self.master_keys[self.current_master_key_id].key)
+        rnonce = secrets.token_bytes(12)
+        rcipher = rgcm.encrypt(rnonce, refresh_payload, b"refresh")
+        refresh_token = base64.urlsafe_b64encode(
+            struct.pack(">I", self.current_master_key_id) + rnonce + rcipher
+        ).decode("ascii").rstrip("=")
+
+        return advertising_token, refresh_token
+
+    def revoke(self, email: str) -> None:
+        """User opts out — their user_id is added to the revoked set."""
+        # Note: salt must be preserved so re-joining produces the same user_id,
+        # which we then deny. This is the spec'd behavior.
+        uid = self._user_id(email)
+        self.revoked.add(uid)
+
+    def _site_key_for(self, site_id: int) -> SiteKey:
+        # Pick the most recent site key for this site
+        candidates = [(k, v) for k, v in self.site_keys.items() if k[0] == site_id]
+        if not candidates:
+            self.provision_site(site_id)
+            candidates = list(self.site_keys.items())
+        return max(candidates, key=lambda kv: kv[1].key_id)[1]
+
+    def export_site_key(self, site_id: int, dsp_id: int) -> bytes:
+        """
+        Hand a site key to an authorized DSP, encrypted under that DSP's
+        pre-shared transport key (omitted for brevity — in production
+        this is a mTLS + envelope-encryption call).
+        """
+        sk = self._site_key_for(site_id)
+        return sk.key  # in real code: encrypt under DSP transport key
+
+
+# -------------------- DSP (decryption side) --------------------
+class DSPClient:
+    """
+    Runs at TTD / any authorized DSP. Holds site keys for publishers
+    it has commercial relationships with. Can decrypt advertising tokens
+    to recover the raw user_id, but CANNOT mint tokens.
+    """
+    def __init__(self) -> None:
+        self.site_keys: dict[tuple[int, int], bytes] = {}  # (site_id, key_id) -> key
+
+    def receive_site_key(self, site_id: int, key_id: int, key: bytes) -> None:
+        self.site_keys[(site_id, key_id)] = key
+
+    def decrypt_token(self, advertising_token: str) -> dict:
+        """
+        Returns {user_id, site_id, gen_time, exp_time, identity_exp_time}.
+        Raises if token is expired, tampered, or site key is unknown.
+        """
+        raw = base64.urlsafe_b64decode(advertising_token + "==")
+        version, site_id, key_id, gen, exp, id_exp = struct.unpack_from(">BIIQQQ", raw, 0)
+        if version != TOKEN_VERSION:
+            raise ValueError(f"unsupported token version {version}")
+
+        header_len = 1 + 4 + 4 + 8 + 8 + 8  # 33 bytes
+        header = raw[:header_len]
+        nonce = raw[header_len:header_len + 12]
+        ciphertext = raw[header_len + 12:]
+
+        sk = self.site_keys.get((site_id, key_id))
+        if sk is None:
+            raise PermissionError(f"DSP does not have site key for site_id={site_id} key_id={key_id}")
+
+        aesgcm = AESGCM(sk)
+        try:
+            user_id = aesgcm.decrypt(nonce, ciphertext, header)  # AAD = header
+        except Exception as e:
+            raise ValueError("token tampered or wrong key") from e
+
+        now = int(time.time())
+        if now > exp:
+            raise ValueError("advertising token expired — call /token/refresh")
+        if now > id_exp:
+            raise ValueError("underlying identity expired — user must re-authenticate")
+
+        return {
+            "user_id": user_id.hex(),
+            "site_id": site_id,
+            "gen_time": gen,
+            "exp_time": exp,
+            "identity_exp_time": id_exp,
+        }
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    op = UID2Operator()
+    op.provision_site(site_id=42)  # publisher "nytimes.com"
+
+    # User logs into the publisher with email
+    adv_token, refresh_token = op.mint_token("John.Doe+news@gmail.com", site_id=42)
+    print(f"advertising_token (first 60 chars): {adv_token[:60]}...")
+    print(f"refresh_token (first 60 chars):     {refresh_token[:60]}...")
+
+    # DSP receives the token via OpenRTB and decrypts
+    dsp = DSPClient()
+    sk_bytes = op.export_site_key(site_id=42, dsp_id=7)
+    dsp.receive_site_key(site_id=42, key_id=op.current_master_key_id, key=sk_bytes)
+
+    decoded = dsp.decrypt_token(adv_token)
+    print(f"\nDecoded user_id: {decoded['user_id']}")
+    print(f"Decoded site_id: {decoded['site_id']}")
+
+    # Same email → same user_id (stable across sessions)
+    adv_token_2, _ = op.mint_token("johndoe@gmail.com", site_id=42)  # gmail normalizes same
+    decoded_2 = dsp.decrypt_token(adv_token_2)
+    print(f"Second login user_id: {decoded_2['user_id']}")
+    assert decoded['user_id'] == decoded_2['user_id'], "UID2 must be stable!"
+    print("✓ Same email produced same UID2 (stable)")
+
+    # Revocation
+    op.revoke("johndoe@gmail.com")
+    try:
+        op.mint_token("johndoe@gmail.com", site_id=42)
+        print("✗ Token minted after revocation — BUG")
+    except PermissionError:
+        print("✓ Revoked user cannot mint new tokens")
