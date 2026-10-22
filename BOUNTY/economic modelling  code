@@ -1,0 +1,118 @@
+"""
+OpenPath vs. traditional SSP path economics.
+Models the full P&L for advertiser, DSP, SSP, publisher.
+"""
+from dataclasses import dataclass
+
+
+@dataclass
+class FlowStep:
+    name: str
+    amount: float
+    note: str
+
+
+@dataclass
+class MoneyFlow:
+    path_name: str
+    gross_cpm: float
+    steps: list[FlowStep]
+
+    def publisher_revenue(self) -> float:
+        net = self.gross_cpm
+        for s in self.steps:
+            net -= s.amount
+        return net
+
+    def total_take(self) -> float:
+        return sum(s.amount for s in self.steps)
+
+    def take_rate(self) -> float:
+        return self.total_take() / self.gross_cpm
+
+    def pretty(self) -> str:
+        lines = [f"\n=== {self.path_name} ==="]
+        lines.append(f"Advertiser pays: ${self.gross_cpm:.2f} CPM")
+        net = self.gross_cpm
+        for s in self.steps:
+            net -= s.amount
+            lines.append(f"  - {s.name}: -${s.amount:.2f}  ({s.note})")
+        lines.append(f"  = Publisher net: ${net:.2f}")
+        lines.append(f"Total take: ${self.total_take():.2f} ({self.take_rate():.1%})")
+        lines.append(f"Publisher keeps: {net/self.gross_cpm:.1%} of advertiser dollar")
+        return "\n".join(lines)
+
+
+def traditional_path(cpm: float = 10.0) -> MoneyFlow:
+    return MoneyFlow(
+        path_name="Traditional (DSP → SSP → Publisher)",
+        gross_cpm=cpm,
+        steps=[
+            FlowStep("TTD tech fee",   cpm * 0.15, "~15% DSP margin"),
+            FlowStep("3P data + UID2", 0.50,       "data licensing"),
+            FlowStep("SSP take",       cpm * 0.12, "~12% SSP margin"),
+            FlowStep("SSP ad serving", 0.30,       "creative hosting"),
+        ],
+    )
+
+
+def openpath(cpm: float = 10.0) -> MoneyFlow:
+    return MoneyFlow(
+        path_name="OpenPath (DSP → Publisher direct)",
+        gross_cpm=cpm,
+        steps=[
+            FlowStep("TTD tech fee",   cpm * 0.05, "reduced — no SSP integration cost"),
+            FlowStep("3P data + UID2", 0.20,       "data licensing"),
+        ],
+    )
+
+
+def sustainability_check(cpm: float, impressions: int) -> None:
+    """
+    Why doesn't TTD just kill all SSPs and go 100% OpenPath?
+    Because SSPs still provide INVENTORY ACCESS. TTD can only do
+    OpenPath with publishers that have signed direct deals.
+    """
+    print(f"\n--- Annual economics at ${cpm} CPM, {impressions:,} impressions ---")
+
+    trad = traditional_path(cpm)
+    op = openpath(cpm)
+
+    print(trad.pretty())
+    print(op.pretty())
+
+    # What TTD earns per impression (rough)
+    ttd_trad_rev = cpm * 0.15 - 0.50  # tech fee minus data cost
+    ttd_op_rev = cpm * 0.05 - 0.20
+    print(f"\nTTD revenue per impression:")
+    print(f"  Traditional path: ${ttd_trad_rev:.3f} ({ttd_trad_rev/cpm:.1%} of gross)")
+    print(f"  OpenPath:         ${ttd_op_rev:.3f} ({ttd_op_rev/cpm:.1%} of gross)")
+    print(f"\nTTD earns ~{ttd_trad_rev/ttd_op_rev:.1f}x MORE per impression on the traditional path.")
+    print("But on OpenPath, TTD has higher win rate (no SSP auction competition),")
+    print("so net revenue can be higher despite lower per-impression margin.")
+
+
+# -------------------- strategic dynamics --------------------
+def win_rate_sensitivity():
+    """
+    OpenPath's real value isn't per-impression margin — it's WIN RATE.
+    If TTD's bid reaches the publisher without competing SSP bids,
+    TTD's effective win rate on OpenPath inventory jumps from ~15% to ~40%+.
+    """
+    cpm = 10.0
+    ttd_per_imp_trad = cpm * 0.15 - 0.50
+    ttd_per_imp_op = cpm * 0.05 - 0.20
+
+    print("\n--- Win-rate breakeven analysis ---")
+    print(f"{'Win rate trad':>20} | {'Win rate OpenPath':>20} | {'OpenPath better?':>20}")
+    print("-" * 70)
+    for wr_trad, wr_op in [(0.15, 0.30), (0.15, 0.40), (0.20, 0.45), (0.10, 0.35)]:
+        rev_trad = wr_trad * ttd_per_imp_trad
+        rev_op = wr_op * ttd_per_imp_op
+        better = "YES" if rev_op > rev_trad else "no"
+        print(f"{wr_trad:>20.1%} | {wr_op:>20.1%} | {better:>20}  (trad ${rev_trad:.3f} vs op ${rev_op:.3f}/imp)")
+
+
+if __name__ == "__main__":
+    sustainability_check(cpm=10.0, impressions=1_000_000_000)
+    win_rate_sensitivity()
