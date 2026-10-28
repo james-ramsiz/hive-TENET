@@ -1,0 +1,246 @@
+"""
+Optimal allocation of freelancer time between Offerstream proposals
+and Hourlies. Models both as asset classes with different risk/return.
+
+Key insight: Hourlies are a high-fixed-cost, low-marginal-cost asset
+(list once, sell many times). Offerstream is a low-fixed-cost, high-marginal-cost
+asset (write each proposal from scratch). The optimal mix depends on
+the freelancer's time horizon and risk aversion.
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class HourlieSpec:
+    """A productized gig listing."""
+    title: str
+    price_gbp: float
+    setup_hours: float                  # time to create listing, write copy, portfolio
+    maintenance_hours_per_week: float   # responding to messages, fulfilling orders
+    expected_conv_rate: float           # P(buy | view) — depends on ranking
+    expected_views_per_week: float      # depends on search ranking
+    days_since_last_sale: int = 0       # for staleness penalty
+    current_reviews: int = 0
+    current_rating: float = 0.0
+
+
+@dataclass
+class OfferstreamOpportunity:
+    """A custom-proposal job in the feed."""
+    job_id: str
+    revenue_if_won: float
+    win_rate: float                     # P(win | apply, no boost)
+    win_rate_with_boost: float
+    time_per_proposal_hours: float
+    credits_required: int
+    boost_credits: int
+
+
+@dataclass
+class FreelancerCapacity:
+    hours_per_week: float = 40
+    credit_balance: int = 150           # monthly Pro allowance
+    risk_aversion: float = 0.5          # 0=risk-neutral, 1=very risk-averse
+
+
+def hourlie_weekly_revenue(h: HourlieSpec) -> dict:
+    """Expected weekly revenue and time cost for an Hourlie."""
+    # Staleness penalty: if no sale in 30+ days, conv rate decays
+    staleness_factor = max(0.3, 1.0 - max(0, h.days_since_last_sale - 14) / 60.0)
+    effective_conv = h.expected_conv_rate * staleness_factor
+
+    expected_sales = h.expected_views_per_week * effective_conv
+    expected_revenue = expected_sales * h.price_gbp
+    weekly_time = h.maintenance_hours_per_week
+
+    # After first sale, conv rate typically improves (social proof)
+    # We model this stochastically
+    return {
+        "expected_sales": expected_sales,
+        "expected_revenue": expected_revenue,
+        "weekly_time_hours": weekly_time,
+        "revenue_per_hour": expected_revenue / max(weekly_time, 0.1),
+    }
+
+
+def offerstream_ev(opp: OfferstreamOpportunity, credit_value: float = 0.08) -> dict:
+    """EV of submitting one proposal (no boost)."""
+    credit_cost = opp.credits_required * credit_value
+    ev = opp.win_rate * opp.revenue_if_won - credit_cost
+    return {
+        "ev": ev,
+        "credit_cost": credit_cost,
+        "expected_revenue": opp.win_rate * opp.revenue_if_won,
+        "expected_time_hours": opp.time_per_proposal_hours,
+        "revenue_per_hour": ev / max(opp.time_per_proposal_hours, 0.1),
+    }
+
+
+def portfolio_optimization(
+    hourlies: list[HourlieSpec],
+    opportunities: list[OfferstreamOpportunity],
+    capacity: FreelancerCapacity,
+) -> dict:
+    """
+    Greedy portfolio: rank both asset classes by revenue/hour.
+    Allocate capacity hour-by-hour to the best option.
+    """
+    # Score each Hourlie
+    hourlie_scores = []
+    for i, h in enumerate(hourlies):
+        rev = hourlie_weekly_revenue(h)
+        hourlie_scores.append({
+            "type": "hourlie",
+            "index": i,
+            "title": h.title,
+            "revenue_per_hour": rev["revenue_per_hour"],
+            "expected_weekly_revenue": rev["expected_revenue"],
+            "weekly_time": rev["weekly_time_hours"],
+            "setup_hours": h.setup_hours,
+        })
+
+    # Score each Offerstream opportunity
+    opp_scores = []
+    for i, opp in enumerate(opportunities):
+        ev = offerstream_ev(opp)
+        opp_scores.append({
+            "type": "offerstream",
+            "index": i,
+            "job_id": opp.job_id,
+            "revenue_per_hour": ev["revenue_per_hour"],
+            "ev": ev["ev"],
+            "time": ev["expected_time_hours"],
+            "credits": opp.credits_required,
+        })
+
+    # Allocate
+    remaining_hours = capacity.hours_per_week
+    remaining_credits = capacity.credit_balance
+    total_revenue = 0.0
+    allocation = {"hourlies": [], "offers": [], "skipped": []}
+
+    # First: setup Hourlies (high fixed cost but high long-term payoff)
+    # Sort by expected weekly revenue / setup hours
+    hourlie_scores.sort(
+        key=lambda h: h["expected_weekly_revenue"] / max(h["setup_hours"], 0.1),
+        reverse=True,
+    )
+    for h in hourlie_scores:
+        if remaining_hours >= h["setup_hours"]:
+            allocation["hourlies"].append({
+                "title": h["title"],
+                "setup_hours": h["setup_hours"],
+                "expected_weekly_revenue": h["expected_weekly_revenue"],
+                "weekly_maintenance_hours": h["weekly_time"],
+            })
+            remaining_hours -= h["setup_hours"]
+            total_revenue += h["expected_weekly_revenue"]  # first week revenue
+        else:
+            allocation["skipped"].append({"type": "hourlie", "title": h["title"]})
+
+    # Subtract Hourlie maintenance from remaining hours
+    weekly_maintenance = sum(h["weekly_time"] for h in hourlie_scores
+                             if any(a["title"] == h["title"] for a in allocation["hourlies"]))
+    remaining_hours -= weekly_maintenance
+
+    # Then: allocate remaining hours to best Offerstream opportunities
+    opp_scores.sort(key=lambda o: o["revenue_per_hour"], reverse=True)
+    for o in opp_scores:
+        if remaining_hours < o["time"]:
+            break
+        if remaining_credits < o["credits"]:
+            continue
+        allocation["offers"].append({
+            "job_id": o["job_id"],
+            "ev": o["ev"],
+            "time_hours": o["time"],
+            "credits": o["credits"],
+        })
+        remaining_hours -= o["time"]
+        remaining_credits -= o["credits"]
+        total_revenue += o["ev"]
+
+    return {
+        "allocation": allocation,
+        "weekly_revenue_estimate": total_revenue,
+        "remaining_hours": remaining_hours,
+        "remaining_credits": remaining_credits,
+    }
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    np.random.seed(42)
+
+    # Alice's potential Hourlies
+    hourlies = [
+        HourlieSpec(
+            title="Squarespace 5-page site",
+            price_gbp=500, setup_hours=4, maintenance_hours_per_week=2,
+            expected_conv_rate=0.025, expected_views_per_week=80,
+            current_reviews=12, current_rating=4.8,
+        ),
+        HourlieSpec(
+            title="WordPress speed optimization",
+            price_gbp=180, setup_hours=2, maintenance_hours_per_week=1,
+            expected_conv_rate=0.04, expected_views_per_week=120,
+            current_reviews=45, current_rating=4.9,
+        ),
+        HourlieSpec(
+            title="Shopify theme customization",
+            price_gbp=350, setup_hours=3, maintenance_hours_per_week=1.5,
+            expected_conv_rate=0.018, expected_views_per_week=60,
+            current_reviews=8, current_rating=4.7,
+        ),
+        HourlieSpec(
+            title="SEO audit + recommendations",
+            price_gbp=120, setup_hours=1.5, maintenance_hours_per_week=0.5,
+            expected_conv_rate=0.05, expected_views_per_week=200,
+            current_reviews=23, current_rating=4.6,
+        ),
+    ]
+
+    # Random stream of custom-proposal jobs this week
+    opportunities = [
+        OfferstreamOpportunity(
+            job_id=f"job-{i:02d}",
+            revenue_if_won=np.random.choice([400, 800, 1500, 3000, 5000]),
+            win_rate=np.random.uniform(0.05, 0.15),
+            win_rate_with_boost=np.random.uniform(0.15, 0.25),
+            time_per_proposal_hours=np.random.uniform(0.5, 2.0),
+            credits_required=15,
+            boost_credits=15,
+        )
+        for i in range(15)
+    ]
+
+    # Three freelancer profiles
+    profiles = [
+        ("Risk-neutral, time-rich",  FreelancerCapacity(hours_per_week=45, credit_balance=150, risk_aversion=0.0)),
+        ("Balanced",                  FreelancerCapacity(hours_per_week=40, credit_balance=150, risk_aversion=0.5)),
+        ("Risk-averse, time-poor",    FreelancerCapacity(hours_per_week=25, credit_balance=80, risk_aversion=1.0)),
+    ]
+
+    for name, cap in profiles:
+        print(f"\n{'='*70}")
+        print(f"PROFILE: {name}  ({cap.hours_per_week}h/wk, {cap.credit_balance} credits)")
+        print(f"{'='*70}")
+        result = portfolio_optimization(hourlies, opportunities, cap)
+
+        print(f"\nHourlies to launch:")
+        for h in result["allocation"]["hourlies"]:
+            print(f"  - {h['title']:<40} setup={h['setup_hours']:.1f}h  "
+                  f"weekly_rev=£{h['expected_weekly_revenue']:.0f}/wk  "
+                  f"maintenance={h['weekly_maintenance_hours']:.1f}h/wk")
+
+        print(f"\nOfferstream proposals to submit:")
+        for o in result["allocation"]["offers"]:
+            print(f"  - {o['job_id']:<10} EV=£{o['ev']:.2f}  time={o['time_hours']:.1f}h  credits={o['credits']}")
+        print(f"  (total offers: {len(result['allocation']['offers'])})")
+
+        print(f"\nWeekly revenue estimate: £{result['weekly_revenue_estimate']:.0f}")
+        print(f"Hours left over: {result['remaining_hours']:.1f}")
+        print(f"Credits left over: {result['remaining_credits']}")
