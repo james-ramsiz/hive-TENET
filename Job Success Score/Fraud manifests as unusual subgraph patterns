@@ -1,0 +1,11 @@
+Suspicious pattern 1: Dense subgraph (collusion ring)
+  A small set of clients only hire a small set of freelancers,
+  with no connections to the rest of the marketplace.
+
+Suspicious pattern 2: Temporal correlation
+  Client signs up → posts job within 1 hour → hires within 24h
+  → both accounts go dormant after the review is left.
+
+Suspicious pattern 3: Financial fingerprint
+  Client and freelancer share: payment instrument, IP range,
+  device fingerprint, or bank account.
