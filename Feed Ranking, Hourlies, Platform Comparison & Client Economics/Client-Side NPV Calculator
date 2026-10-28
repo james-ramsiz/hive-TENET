@@ -1,0 +1,218 @@
+"""
+Client-side economics: NPV of posting a project on PPH vs Upwork vs Fiverr
+vs hiring directly via a recruiter.
+
+Models the FULL cost of a hire, not just the invoice.
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class ClientProject:
+    project_value_to_client_gbp: float     # NPV of project's value to client's business
+    budget_gbp: float
+    hours_to_write_brief: float            # client's time investment
+    client_hourly_rate_gbp: float          # opportunity cost of client's time
+    needs_ongoing: bool = False
+    seniority_required: str = "mid"        # "junior", "mid", "senior"
+    is_one_off: bool = True
+
+
+@dataclass
+class PlatformClientEconomics:
+    name: str
+    posting_time_hours: float              # time to write+post job
+    review_time_hours: float               # time to review proposals
+    interview_time_hours: float            # per-candidate interview time
+    expected_num_proposals: int
+    expected_shortlist_size: int
+    fee_passthrough_pct: float             # fraction of platform fee passed to client
+    time_to_hire_days: float
+    bad_hire_probability: float            # 0-1
+    bad_hire_redo_cost_multiplier: float   # multiplier on budget if hire fails
+    freelancer_quality_mean: float         # 0-5 stars expected
+    freelancer_quality_std: float
+
+
+def client_npv(project: ClientProject, econ: PlatformClientEconomics) -> dict:
+    """
+    Compute client-side NPV of using this platform for the project.
+    Returns breakdown of all cost components.
+    """
+    # Time costs
+    posting_cost = project.hours_to_write_brief * project.client_hourly_rate_gbp
+    review_cost = econ.review_time_hours * project.client_hourly_rate_gbp
+    interview_cost = econ.expected_shortlist_size * econ.interview_time_hours * project.client_hourly_rate_gbp
+
+    # Time-to-hire opportunity cost (project not delivering value during wait)
+    delay_cost = (econ.time_to_hire_days / 30.0) * (project.project_value_to_client_gbp * 0.05)
+    # Rule of thumb: 5% of project value per month of delay
+
+    # Freelancer invoice
+    invoice = project.budget_gbp
+
+    # Platform fee pass-through (client pays this on top of invoice)
+    # On PPH and Fiverr, fees are deducted from freelancer's payout (so client pays invoice only)
+    # On Upwork, client pays 3-5% client-side fee on top
+    client_side_fee = invoice * econ.fee_passthrough_pct
+
+    # Expected bad-hire cost
+    # If bad hire: redo the project, lose time, pay again
+    bad_hire_cost = econ.bad_hire_probability * (
+        project.budget_gbp * econ.bad_hire_redo_cost_multiplier
+        + (econ.time_to_hire_days + 30) / 30 * project.project_value_to_client_gbp * 0.05
+    )
+
+    total_cost = (
+        posting_cost + review_cost + interview_cost
+        + delay_cost + invoice + client_side_fee + bad_hire_cost
+    )
+
+    npv = project.project_value_to_client_gbp - total_cost
+
+    return {
+        "platform": econ.name,
+        "posting_cost": posting_cost,
+        "review_cost": review_cost,
+        "interview_cost": interview_cost,
+        "delay_cost": delay_cost,
+        "invoice": invoice,
+        "client_side_fee": client_side_fee,
+        "expected_bad_hire_cost": bad_hire_cost,
+        "total_cost": total_cost,
+        "npv": npv,
+        "expected_quality": econ.freelancer_quality_mean,
+        "time_to_hire_days": econ.time_to_hire_days,
+    }
+
+
+# -------------------- define platforms --------------------
+pph_client = PlatformClientEconomics(
+    name="PeoplePerHour",
+    posting_time_hours=1.0,
+    review_time_hours=2.0,
+    interview_time_hours=0.5,
+    expected_num_proposals=15,
+    expected_shortlist_size=3,
+    fee_passthrough_pct=0.0,           # fees deducted from freelancer
+    time_to_hire_days=3.0,
+    bad_hire_probability=0.15,
+    bad_hire_redo_cost_multiplier=1.3,
+    freelancer_quality_mean=4.3,
+    freelancer_quality_std=0.4,
+)
+
+upwork_client = PlatformClientEconomics(
+    name="Upwork",
+    posting_time_hours=1.5,
+    review_time_hours=3.0,
+    interview_time_hours=0.75,
+    expected_num_proposals=30,
+    expected_shortlist_size=5,
+    fee_passthrough_pct=0.05,          # 5% client-side fee on Upwork
+    time_to_hire_days=4.0,
+    bad_hire_probability=0.20,
+    bad_hire_redo_cost_multiplier=1.4,
+    freelancer_quality_mean=4.0,
+    freelancer_quality_std=0.6,
+)
+
+fiverr_client = PlatformClientEconomics(
+    name="Fiverr",
+    posting_time_hours=0.5,            # just search and buy
+    review_time_hours=1.0,
+    interview_time_hours=0.0,          # no interviews — buy the gig
+    expected_num_proposals=0,          # N/A
+    expected_shortlist_size=0,
+    fee_passthrough_pct=0.0,           # fee in freelancer's price
+    time_to_hire_days=1.0,
+    bad_hire_probability=0.25,
+    bad_hire_redo_cost_multiplier=1.2,
+    freelancer_quality_mean=3.8,
+    freelancer_quality_std=0.7,
+)
+
+# Direct hire via recruiter
+recruiter_client = PlatformClientEconomics(
+    name="Recruiter (direct hire)",
+    posting_time_hours=2.0,            # brief the recruiter
+    review_time_hours=4.0,             # review 3-5 candidates
+    interview_time_hours=2.0,          # full interviews
+    expected_num_proposals=5,
+    expected_shortlist_size=3,
+    fee_passthrough_pct=0.20,          # recruiter fee ~20% of first-year salary
+    time_to_hire_days=21.0,            # 3 weeks
+    bad_hire_probability=0.08,         # recruiters vet heavily
+    bad_hire_redo_cost_multiplier=1.1,
+    freelancer_quality_mean=4.6,
+    freelancer_quality_std=0.3,
+)
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    # Scenario A: Small one-off project (£800 budget)
+    print("=" * 90)
+    print("SCENARIO A: Small one-off project  (£800 budget, £5,000 value to client)")
+    print("=" * 90)
+    project_a = ClientProject(
+        project_value_to_client_gbp=5000.0,
+        budget_gbp=800.0,
+        hours_to_write_brief=1.5,
+        client_hourly_rate_gbp=100.0,
+        is_one_off=True,
+    )
+    for econ in [pph_client, upwork_client, fiverr_client, recruiter_client]:
+        r = client_npv(project_a, econ)
+        print(f"\n{r['platform']}")
+        print(f"  Time-to-hire: {r['time_to_hire_days']:.0f} days")
+        print(f"  Expected quality: {r['expected_quality']:.1f}★")
+        print(f"  Client time cost: £{r['posting_cost'] + r['review_cost'] + r['interview_cost']:.0f}")
+        print(f"  Delay cost: £{r['delay_cost']:.0f}")
+        print(f"  Invoice: £{r['invoice']:.0f}")
+        print(f"  Platform fee: £{r['client_side_fee']:.0f}")
+        print(f"  Expected bad-hire cost: £{r['expected_bad_hire_cost']:.0f}")
+        print(f"  Total cost: £{r['total_cost']:.0f}")
+        print(f"  NPV: £{r['npv']:.0f}")
+
+    # Scenario B: Large ongoing project (£15,000 budget)
+    print(f"\n{'='*90}")
+    print("SCENARIO B: Large ongoing project  (£15,000 budget, £80,000 value to client)")
+    print("=" * 90)
+    project_b = ClientProject(
+        project_value_to_client_gbp=80000.0,
+        budget_gbp=15000.0,
+        hours_to_write_brief=4.0,
+        client_hourly_rate_gbp=150.0,
+        needs_ongoing=True,
+        seniority_required="senior",
+    )
+    results_b = []
+    for econ in [pph_client, upwork_client, fiverr_client, recruiter_client]:
+        r = client_npv(project_b, econ)
+        results_b.append(r)
+        print(f"\n{r['platform']}")
+        print(f"  Total cost: £{r['total_cost']:,.0f}   NPV: £{r['npv']:,.0f}   "
+              f"Quality: {r['expected_quality']:.1f}★   "
+              f"Bad-hire risk: {r['expected_bad_hire_cost']:,.0f}")
+
+    # Decision: highest NPV wins
+    best = max(results_b, key=lambda r: r["npv"])
+    print(f"\n→ Best for Scenario B: {best['platform']} (NPV £{best['npv']:,.0f})")
+
+    # Scenario C: Tiny quick task (£100 budget)
+    print(f"\n{'='*90}")
+    print("SCENARIO C: Tiny quick task  (£100 budget, £500 value to client)")
+    print("=" * 90)
+    project_c = ClientProject(
+        project_value_to_client_gbp=500.0,
+        budget_gbp=100.0,
+        hours_to_write_brief=0.5,
+        client_hourly_rate_gbp=80.0,
+    )
+    for econ in [pph_client, upwork_client, fiverr_client, recruiter_client]:
+        r = client_npv(project_c, econ)
+        print(f"  {r['platform']:<30}  Total cost: £{r['total_cost']:>6.0f}  NPV: £{r['npv']:>6.0f}")
