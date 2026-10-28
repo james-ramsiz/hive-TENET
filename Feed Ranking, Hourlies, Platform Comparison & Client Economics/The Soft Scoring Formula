@@ -1,0 +1,7 @@
+feed_score = w_relevance      × skill_overlap(job, freelancer)
+           + w_performance    × category_track_record(freelancer, job.category)
+           + w_budget_fit     × budget_alignment(job.budget, freelancer.hourly_rate)
+           + w_freshness      × recency_decay(job.posted_at)
+           + w_saturation     × (1 − saturation_penalty(job.num_existing_proposals))
+           + w_client_quality × client_score(job.client)
+           − w_red_flags      × red_flags(job, freelancer)
