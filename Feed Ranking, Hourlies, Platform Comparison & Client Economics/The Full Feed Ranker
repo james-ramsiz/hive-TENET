@@ -1,0 +1,337 @@
+"""
+PPH discovery-feed ranker.
+Simulates the filtering pipeline that determines which jobs a freelancer sees.
+
+Stages:
+  1. Hard filters (category, geo, language, budget range)
+  2. Subscription-tier gating (Pro sees jobs immediately; free users wait 24h)
+  3. Soft scoring (weighted multi-attribute utility)
+  4. Pagination (top-N shown)
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Optional
+import math
+
+
+# -------------------- domain types --------------------
+@dataclass
+class Freelancer:
+    id: str
+    skills: dict[str, float]               # skill → self-assessed proficiency [0,1]
+    categories: dict[str, float]           # category → historical win rate [0,1]
+    hourly_rate_gbp: float
+    geography: str                         # ISO country code
+    languages: set[str]
+    subscription_tier: str                 # "free" | "pro" | "premium"
+    earnings_tier: int                     # 1-5
+    response_rate: float
+    avg_rating: float
+    num_completed_jobs: int
+
+
+@dataclass
+class Client:
+    id: str
+    avg_rating: float                      # ratings from past freelancers
+    num_jobs_posted: int
+    total_spent_gbp: float
+    payment_verified: bool
+    repeat_hire_rate: float                # 0-1, hires same freelancer again
+
+
+@dataclass
+class Job:
+    id: str
+    posted_at: datetime
+    category: str
+    required_skills: dict[str, float]      # skill → required proficiency [0,1]
+    budget_gbp: float
+    budget_type: str                       # "fixed" | "hourly"
+    geography_restriction: Optional[str]   # ISO code or None
+    language_required: str
+    num_existing_proposals: int
+    client: Client
+    title: str
+    description_length: int
+
+
+# -------------------- Stage 1: Hard filters --------------------
+def passes_hard_filters(job: Job, f: Freelancer) -> tuple[bool, str]:
+    """Returns (passes, reason_if_failed)."""
+    if job.category not in f.categories:
+        return False, "category_mismatch"
+
+    if job.geography_restriction and job.geography_restriction != f.geography:
+        # PPH sometimes restricts to UK/EU/US; freelancers outside are filtered out
+        return False, "geo_restricted"
+
+    if job.language_required not in f.languages:
+        return False, "language_mismatch"
+
+    # Budget fit hard filter: don't show jobs <10% of freelancer's typical project size
+    typical_project = f.hourly_rate_gbp * 20  # rough: 20 hours of work
+    if job.budget_gbp < typical_project * 0.10:
+        return False, "budget_too_low"
+
+    # Skill floor: must have at least one matching skill above 0.5
+    has_matching_skill = any(
+        job.required_skills.get(s, 0) <= f.skills.get(s, 0)
+        for s in job.required_skills
+    )
+    if not has_matching_skill:
+        return False, "no_skill_match"
+
+    return True, "ok"
+
+
+# -------------------- Stage 2: Subscription gating --------------------
+def is_visible_to_tier(job: Job, f: Freelancer, now: datetime) -> bool:
+    """
+    Pro/Premium subscribers see jobs immediately.
+    Free users see jobs only after a 24h delay.
+    """
+    age = now - job.posted_at
+    if f.subscription_tier in ("pro", "premium"):
+        return age >= timedelta(minutes=5)  # small buffer for indexing
+    return age >= timedelta(hours=24)
+
+
+# -------------------- Stage 3: Soft scoring --------------------
+def skill_overlap(job: Job, f: Freelancer) -> float:
+    """
+    Weighted Jaccard-like overlap.
+    Returns [0, 1]: how well freelancer's skills match the job's required skills.
+    """
+    if not job.required_skills:
+        return 0.5
+    total_weight = 0.0
+    matched = 0.0
+    for skill, required_proficiency in job.required_skills.items():
+        freelancer_proficiency = f.skills.get(skill, 0)
+        # If freelancer meets or exceeds required proficiency, full credit
+        if freelancer_proficiency >= required_proficiency:
+            match = 1.0
+        else:
+            # Partial credit, scaled by gap
+            match = freelancer_proficiency / max(required_proficiency, 0.01)
+        weight = required_proficiency  # weight rarer/more-demanding skills higher
+        matched += match * weight
+        total_weight += weight
+    return matched / total_weight if total_weight > 0 else 0.5
+
+
+def category_track_record(f: Freelancer, category: str) -> float:
+    """Historical win rate in this category, Bayesian-shrunk."""
+    prior_alpha, prior_beta = 2, 18  # prior mean ~10% win rate
+    # num_completed_jobs is a proxy for observations
+    obs_wins = f.categories.get(category, 0.1) * f.num_completed_jobs
+    obs_losses = f.num_completed_jobs - obs_wins
+    alpha = prior_alpha + obs_wins
+    beta = prior_beta + obs_losses
+    return alpha / (alpha + beta)
+
+
+def budget_alignment(job: Job, f: Freelancer) -> float:
+    """
+    Score peaks when job budget is 0.5x–2x freelancer's typical project size.
+    Below 0.3x: too small, freelancer will skip. Above 3x: out of league.
+    """
+    typical = f.hourly_rate_gbp * 20
+    ratio = job.budget_gbp / typical
+    if 0.5 <= ratio <= 2.0:
+        return 1.0
+    if ratio < 0.3:
+        return 0.2
+    if ratio > 3.0:
+        return 0.3
+    if 0.3 <= ratio < 0.5:
+        return 0.2 + 0.8 * (ratio - 0.3) / 0.2
+    return max(0.3, 1.0 - 0.35 * (ratio - 2.0))
+
+
+def recency_decay(posted_at: datetime, now: datetime) -> float:
+    """
+    New jobs get score 1.0; decays exponentially with half-life of 3 days.
+    After 14 days, floors at 0.1 (still visible but buried).
+    """
+    age_days = (now - posted_at).total_seconds() / 86400
+    if age_days < 0.5:
+        return 1.0
+    if age_days > 14:
+        return 0.1
+    return 0.1 + 0.9 * (0.5 ** (age_days / 3.0))
+
+
+def saturation_penalty(num_proposals: int) -> float:
+    """
+    Penalty for jobs that already have many proposals.
+    Linear ramp: 0 proposals = 0 penalty, 30+ proposals = full penalty (0.9).
+    """
+    return min(0.9, num_proposals / 30.0 * 0.9)
+
+
+def client_quality_score(c: Client) -> float:
+    """Higher = better client. Bayesian-shrunk rating + verification bonus."""
+    prior_strength = 5.0
+    prior_mean = 0.7
+    if c.num_jobs_posted == 0:
+        # New client — moderate score, no verification penalty yet
+        return 0.5 if c.payment_verified else 0.3
+    observed = c.avg_rating / 5.0
+    shrunk = (prior_strength * prior_mean + c.num_jobs_posted * observed) / (prior_strength + c.num_jobs_posted)
+    if c.payment_verified:
+        shrunk += 0.1
+    if c.repeat_hire_rate > 0.3:
+        shrunk += 0.05  # clients who rehire are great to work with
+    return min(1.0, shrunk)
+
+
+def red_flags(job: Job, f: Freelancer) -> float:
+    """Penalty score in [0, 1]."""
+    p = 0.0
+    if not job.client.payment_verified:
+        p += 0.3
+    if job.client.num_jobs_posted > 0 and job.client.avg_rating < 3.5:
+        p += 0.4
+    if job.description_length < 100:
+        # Vague job posts correlate with bad clients
+        p += 0.2
+    if job.budget_gbp < 50:
+        # Very low budgets attract scope-creep
+        p += 0.2
+    return min(1.0, p)
+
+
+# -------------------- the ranker --------------------
+@dataclass
+class FeedWeights:
+    relevance: float = 0.30
+    performance: float = 0.20
+    budget_fit: float = 0.15
+    freshness: float = 0.15
+    saturation: float = 0.10
+    client_quality: float = 0.10
+    red_flag_penalty: float = 0.50  # multiplicative weight on red_flags
+
+
+def feed_score(job: Job, f: Freelancer, now: datetime, w: FeedWeights = FeedWeights()) -> float:
+    rel = skill_overlap(job, f)
+    perf = category_track_record(f, job.category)
+    bf = budget_alignment(job, f)
+    fresh = recency_decay(job.posted_at, now)
+    sat = 1.0 - saturation_penalty(job.num_existing_proposals)
+    cq = client_quality_score(job.client)
+    rf = red_flags(job, f)
+
+    score = (
+        w.relevance * rel
+        + w.performance * perf
+        + w.budget_fit * bf
+        + w.freshness * fresh
+        + w.saturation * sat
+        + w.client_quality * cq
+        - w.red_flag_penalty * rf
+    )
+    return score
+
+
+def rank_feed(
+    jobs: list[Job], f: Freelancer, now: datetime, page_size: int = 50
+) -> list[tuple[Job, float, str]]:
+    """
+    Full pipeline: hard filter → subscription gate → soft score → paginate.
+    Returns [(job, score, filter_stage_passed), ...] in ranked order.
+    """
+    # Stage 1 + 2: hard filter + subscription gate
+    candidates = []
+    for job in jobs:
+        passes, reason = passes_hard_filters(job, f)
+        if not passes:
+            continue
+        if not is_visible_to_tier(job, f, now):
+            continue
+        candidates.append(job)
+
+    # Stage 3: soft scoring
+    scored = [(job, feed_score(job, f, now)) for job in candidates]
+
+    # Stage 4: paginate
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:page_size]
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    now = datetime(2025, 1, 15, 14, 0)
+
+    alice = Freelancer(
+        id="alice", 
+        skills={"wordpress": 0.9, "shopify": 0.85, "css": 0.95, "react": 0.7, "seo": 0.6},
+        categories={"web-development": 0.18, "ecommerce": 0.22, "design": 0.05},
+        hourly_rate_gbp=75, geography="GBR", languages={"en"},
+        subscription_tier="pro", earnings_tier=4, response_rate=0.96,
+        avg_rating=4.9, num_completed_jobs=187,
+    )
+
+    # Pro subscriber sees ALL jobs immediately
+    # Free subscriber sees only jobs older than 24h
+    alice_free = Freelancer(**{**alice.__dict__, "subscription_tier": "free"})
+
+    # Generate 200 random jobs
+    import random
+    random.seed(42)
+    jobs = []
+    for i in range(200):
+        cat = random.choice(["web-development", "ecommerce", "design", "writing", "marketing"])
+        age_hours = random.uniform(0.1, 240)
+        client = Client(
+            id=f"c-{i}",
+            avg_rating=random.uniform(3.0, 5.0),
+            num_jobs_posted=random.randint(0, 50),
+            total_spent_gbp=random.uniform(0, 50000),
+            payment_verified=random.random() > 0.3,
+            repeat_hire_rate=random.uniform(0, 0.5),
+        )
+        job = Job(
+            id=f"job-{i:03d}",
+            posted_at=now - timedelta(hours=age_hours),
+            category=cat,
+            required_skills={
+                s: random.uniform(0.5, 0.9)
+                for s in random.sample(["wordpress","shopify","css","react","seo","copywriting","figma"],
+                                       k=random.randint(1, 3))
+            },
+            budget_gbp=random.choice([100, 300, 800, 1500, 3000, 6000]),
+            budget_type="fixed",
+            geography_restriction=random.choice([None, None, None, "GBR", "EU"]),
+            language_required="en",
+            num_existing_proposals=random.randint(0, 25),
+            client=client,
+            title=f"Job {i}",
+            description_length=random.randint(50, 800),
+        )
+        jobs.append(job)
+
+    # Compare Pro vs Free
+    print("=" * 70)
+    print("ALICE (Pro subscriber) — feed ranking, top 10")
+    print("=" * 70)
+    feed_pro = rank_feed(jobs, alice, now, page_size=10)
+    print(f"{'Rank':<6}{'Job':<10}{'Category':<18}{'Budget':>8}{'Age(h)':>8}{'Proposals':>11}{'Score':>8}")
+    print("-" * 75)
+    for i, (job, score) in enumerate(feed_pro, 1):
+        age_h = (now - job.posted_at).total_seconds() / 3600
+        print(f"{i:<6}{job.id:<10}{job.category:<18}£{job.budget_gbp:>6.0f}{age_h:>8.1f}"
+              f"{job.num_existing_proposals:>11}{score:>8.3f}")
+
+    print(f"\nTotal jobs visible to Pro Alice: {len([j for j in jobs if passes_hard_filters(j, alice)[0] and is_visible_to_tier(j, alice, now)])}")
+    print(f"Total jobs visible to Free Alice: {len([j for j in jobs if passes_hard_filters(j, alice_free)[0] and is_visible_to_tier(j, alice_free, now)])}")
+
+    # Quantify the Pro advantage: how many of the top 10 Pro jobs are invisible to Free?
+    top_pro_ids = {j.id for j, _ in feed_pro}
+    free_feed = rank_feed(jobs, alice_free, now, page_size=100)
+    free_visible_ids = {j.id for j, _ in free_feed}
+    invisible_to_free = top_pro_ids - free_visible_ids
+    print(f"\nOf Pro Alice's top 10 jobs, {len(invisible_to_free)} are INVISIBLE to Free Alice (too fresh)")
