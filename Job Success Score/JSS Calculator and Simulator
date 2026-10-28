@@ -1,0 +1,308 @@
+"""
+Upwork JSS (Job Success Score) calculator — reconstructed model.
+Simulates how the score responds to different contract patterns.
+
+Based on public Upwork documentation and community reverse-engineering.
+The actual formula is proprietary.
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional
+
+
+class ContractOutcome(Enum):
+    COMPLETED_WITH_FEEDBACK = "completed_feedback"   # best case
+    COMPLETED_NO_FEEDBACK = "completed_no_feedback"  # neutral-negative
+    LONG_TERM_ONGOING = "long_term"                  # best case (6+ months)
+    REPEAT_CLIENT = "repeat_client"                  # best case
+    ENDED_BY_CLIENT = "ended_by_client"              # negative
+    REFUND_GIVEN = "refund"                          # heavy negative
+    DISPUTE_LOST = "dispute_lost"                    # heaviest negative
+    DISPUTE_WON = "dispute_won"                      # slight negative
+
+
+@dataclass
+class Contract:
+    start_date: datetime
+    end_date: Optional[datetime]
+    value_usd: float
+    public_rating: Optional[float]           # 1-5 stars, None if no feedback
+    private_feedback: Optional[float]        # 1-10, None if no feedback
+    outcome: ContractOutcome
+    is_repeat_client: bool = False
+
+
+# -------------------- JSS calculation --------------------
+# Weights (estimated from community reverse-engineering)
+WEIGHTS = {
+    "private_feedback": 0.40,
+    "public_rating": 0.15,
+    "long_term_relationship": 0.15,
+    "no_feedback_penalty": 0.15,
+    "dispute_penalty": 0.10,
+    "communication": 0.05,
+}
+
+# Prior parameters for Bayesian shrinkage
+PRIOR_MEAN_JSS = 0.78          # platform average ~78%
+PRIOR_STRENGTH = 3.0           # equivalent to 3 contracts of prior data
+
+
+def map_private_feedback_to_jss_component(private_score: float) -> float:
+    """
+    Maps average private feedback (1-10) to a [0,1] JSS component.
+    Piecewise linear — steeper below 8 (punishes mediocre disproportionately).
+    """
+    if private_score >= 9.5:
+        return 0.95 + (private_score - 9.5) / 0.5 * 0.05  # 0.95 → 1.0
+    elif private_score >= 9.0:
+        return 0.88 + (private_score - 9.0) / 0.5 * 0.07  # 0.88 → 0.95
+    elif private_score >= 8.0:
+        return 0.78 + (private_score - 8.0) / 1.0 * 0.10  # 0.78 → 0.88
+    elif private_score >= 7.0:
+        return 0.65 + (private_score - 7.0) / 1.0 * 0.13  # 0.65 → 0.78
+    elif private_score >= 6.0:
+        return 0.50 + (private_score - 6.0) / 1.0 * 0.15  # 0.50 → 0.65
+    else:
+        return max(0.0, 0.50 - (6.0 - private_score) / 6.0 * 0.50)
+
+
+def map_public_rating_to_jss_component(rating: Optional[float]) -> float:
+    """Maps public star rating to [0,1]. No rating → 0.5 (neutral)."""
+    if rating is None:
+        return 0.5
+    return (rating - 1.0) / 4.0  # 1 star → 0.0, 5 stars → 1.0
+
+
+def long_term_component(contracts: list[Contract]) -> float:
+    """
+    Fraction of contracts that are long-term or repeat.
+    Returns [0,1] — higher is better.
+    """
+    if not contracts:
+        return 0.5
+    good = sum(1 for c in contracts
+               if c.outcome == ContractOutcome.LONG_TERM_ONGOING
+               or c.outcome == ContractOutcome.REPEAT_CLIENT
+               or c.is_repeat_client)
+    return min(1.0, good / len(contracts) * 2.0)  # scale: 50% long-term = perfect score
+
+
+def no_feedback_penalty_component(contracts: list[Contract]) -> float:
+    """
+    Penalizes contracts that ended without any feedback.
+    Returns [0,1] — higher is better (fewer no-feedback contracts).
+    """
+    if not contracts:
+        return 0.5
+    no_fb = sum(1 for c in contracts
+                if c.outcome == ContractOutcome.COMPLETED_NO_FEEDBACK)
+    # Each no-feedback contract drags this down by 0.15
+    return max(0.0, 1.0 - no_fb * 0.15)
+
+
+def dispute_penalty_component(contracts: list[Contract]) -> float:
+    """Returns [0,1] — higher is better (fewer disputes)."""
+    if not contracts:
+        return 1.0
+    penalty = 0.0
+    for c in contracts:
+        if c.outcome == ContractOutcome.DISPUTE_LOST:
+            penalty += 0.5
+        elif c.outcome == ContractOutcome.REFUND_GIVEN:
+            penalty += 0.3
+        elif c.outcome == ContractOutcome.DISPUTE_WON:
+            penalty += 0.1
+    return max(0.0, 1.0 - penalty)
+
+
+def compute_jss(contracts: list[Contract], now: datetime) -> dict:
+    """
+    Full JSS calculation. Uses best of 6-month, 12-month, 24-month windows.
+    Returns detailed breakdown.
+    """
+
+    def in_window(months: int) -> list[Contract]:
+        cutoff = now - timedelta(days=months * 30)
+        return [c for c in contracts
+                if (c.end_date or now) >= cutoff]
+
+    windows = {}
+    for months in [6, 12, 24]:
+        window_contracts = in_window(months)
+        if len(window_contracts) < 2:
+            continue  # need at least 2 contracts for a valid score
+
+        # Private feedback component
+        priv_scores = [c.private_feedback for c in window_contracts
+                       if c.private_feedback is not None]
+        if priv_scores:
+            avg_priv = sum(priv_scores) / len(priv_scores)
+            priv_component = map_private_feedback_to_jss_component(avg_priv)
+        else:
+            priv_component = 0.5
+
+        # Public rating component
+        pub_scores = [c.public_rating for c in window_contracts
+                      if c.public_rating is not None]
+        if pub_scores:
+            avg_pub = sum(pub_scores) / len(pub_scores)
+            pub_component = map_public_rating_to_jss_component(avg_pub)
+        else:
+            pub_component = 0.5
+
+        # Other components
+        lt_component = long_term_component(window_contracts)
+        nf_component = no_feedback_penalty_component(window_contracts)
+        dp_component = dispute_penalty_component(window_contracts)
+
+        # Weighted score
+        raw_score = (
+            WEIGHTS["private_feedback"] * priv_component
+            + WEIGHTS["public_rating"] * pub_component
+            + WEIGHTS["long_term_relationship"] * lt_component
+            + WEIGHTS["no_feedback_penalty"] * nf_component
+            + WEIGHTS["dispute_penalty"] * dp_component
+            + WEIGHTS["communication"] * 0.8  # assume good communication
+        )
+
+        # Bayesian shrinkage toward prior
+        n = len(window_contracts)
+        shrunk_score = (PRIOR_STRENGTH * PRIOR_MEAN_JSS + n * raw_score) / (PRIOR_STRENGTH + n)
+
+        windows[f"{months}mo"] = {
+            "n_contracts": n,
+            "avg_private_feedback": avg_priv if priv_scores else None,
+            "avg_public_rating": avg_pub if pub_scores else None,
+            "raw_score": raw_score,
+            "shrunk_score": shrunk_score,
+        }
+
+    if not windows:
+        return {"jss": None, "reason": "insufficient contracts in any window"}
+
+    # Best of the three windows
+    best_window = max(windows.items(), key=lambda x: x[1]["shrunk_score"])
+    best_score = best_window[1]["shrunk_score"]
+
+    return {
+        "jss": round(best_score * 100, 1),
+        "best_window": best_window[0],
+        "window_details": windows,
+    }
+
+
+# -------------------- JSS trajectory simulator --------------------
+def simulate_jss_trajectory(
+    n_contracts: int,
+    private_feedback_dist: tuple[float, float],   # (mean, std) of private feedback
+    no_feedback_rate: float,                       # fraction of contracts ending without feedback
+    long_term_rate: float,                         # fraction of long-term/repeat contracts
+    months: int = 24,
+    seed: int = 42,
+) -> list[tuple[datetime, float]]:
+    """
+    Simulates a freelancer's JSS over time as contracts accumulate.
+    Returns [(date, jss), ...] trajectory.
+    """
+    rng = np.random.default_rng(seed)
+    now = datetime(2025, 1, 1)
+    contracts: list[Contract] = []
+
+    # Generate contracts spread over `months`
+    contract_dates = sorted(rng.choice(
+        [now - timedelta(days=d) for d in range(0, months * 30)],
+        size=n_contracts,
+    ))
+
+    trajectory = []
+    for i, start_date in enumerate(contract_dates):
+        # Sample private feedback
+        priv = np.clip(rng.normal(*private_feedback_dist), 1, 10)
+        # Sample public rating (correlated with private)
+        pub = np.clip((priv - 1) / 9 * 4 + 1 + rng.normal(0, 0.3), 1, 5)
+
+        # Sample outcome
+        r = rng.random()
+        if r < long_term_rate:
+            outcome = ContractOutcome.LONG_TERM_ONGOING
+        elif r < long_term_rate + no_feedback_rate:
+            outcome = ContractOutcome.COMPLETED_NO_FEEDBACK
+            priv_sample, pub_sample = None, None
+        else:
+            outcome = ContractOutcome.COMPLETED_WITH_FEEDBACK
+            priv_sample, pub_sample = priv, pub
+
+        contracts.append(Contract(
+            start_date=start_date,
+            end_date=start_date + timedelta(days=int(rng.uniform(14, 90)),
+                                           ) if outcome != ContractOutcome.LONG_TERM_ONGOING else None,
+            value_usd=rng.uniform(500, 5000),
+            public_rating=pub_sample if outcome != ContractOutcome.COMPLETED_NO_FEEDBACK else None,
+            private_feedback=priv_sample if outcome != ContractOutcome.COMPLETED_NO_FEEDBACK else None,
+            outcome=outcome,
+        ))
+
+        # Compute JSS at this point in time
+        current_date = start_date + timedelta(days=30)
+        jss = compute_jss(contracts, current_date)
+        if jss["jss"] is not None:
+            trajectory.append((current_date, jss["jss"]))
+
+    return trajectory
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    now = datetime(2025, 1, 1)
+
+    # Three freelancer profiles over 24 months
+    profiles = [
+        {
+            "name": "Star freelancer (avg private 9.5, no no-feedback, high long-term)",
+            "private_dist": (9.5, 0.3),
+            "no_feedback_rate": 0.05,
+            "long_term_rate": 0.40,
+        },
+        {
+            "name": "Good freelancer (avg private 8.5, some no-feedback)",
+            "private_dist": (8.5, 0.5),
+            "no_feedback_rate": 0.20,
+            "long_term_rate": 0.20,
+        },
+        {
+            "name": "Struggling freelancer (avg private 7.0, lots of no-feedback)",
+            "private_dist": (7.0, 0.8),
+            "no_feedback_rate": 0.35,
+            "long_term_rate": 0.10,
+        },
+    ]
+
+    for profile in profiles:
+        print(f"\n{'='*70}")
+        print(f"PROFILE: {profile['name']}")
+        print(f"{'='*70}")
+        traj = simulate_jss_trajectory(
+            n_contracts=30,
+            private_feedback_dist=profile["private_dist"],
+            no_feedback_rate=profile["no_feedback_rate"],
+            long_term_rate=profile["long_term_rate"],
+            months=24,
+        )
+        # Show JSS at a few key points
+        for i in [4, 9, 14, 19, 24, 29]:
+            if i < len(traj):
+                date, jss = traj[i]
+                badge = ""
+                if jss >= 90:
+                    badge = " ← Top Rated eligible"
+                elif jss >= 80:
+                    badge = " ← decent visibility"
+                elif jss >= 70:
+                    badge = " ← reduced visibility"
+                else:
+                    badge = " ← near-invisible"
+                print(f"  Contract #{i+1:>2} ({date.strftime('%Y-%m')}): JSS = {jss:.1f}%{badge}")
