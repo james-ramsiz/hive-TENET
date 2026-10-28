@@ -1,0 +1,7 @@
+hourlie_search_score = w_conv_rate     × historical_conversion_rate
+                     + w_rating        × bayesian_shrunk_rating
+                     + w_recency       × recency_of_last_sale
+                     + w_price         × price_competitiveness(query_budget)
+                     + w_keyword       × title_keyword_match(query)
+                     + w_impressions   × log(1 + total_impressions)
+                     - w_staleness     × staleness_penalty(days_since_last_sale)
