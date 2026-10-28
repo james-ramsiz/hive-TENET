@@ -1,0 +1,306 @@
+"""
+Shill-bidding and review-fraud detection.
+Builds the client-freelancer bipartite graph and identifies
+suspicious subgraph patterns using:
+  1. Community detection (dense subgraphs = collusion rings)
+  2. Temporal anomaly scoring
+  3. Financial fingerprint overlap
+  4. Review text similarity (fake reviews are often template-generated)
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from collections import defaultdict
+from itertools import combinations
+import hashlib
+import re
+
+
+@dataclass
+class Account:
+    id: str
+    created_at: datetime
+    ip_addresses: set[str]
+    device_fingerprints: set[str]
+    payment_method_hashes: set[str]
+    is_active: bool = True
+    last_active: datetime = None
+
+
+@dataclass
+class Edge:
+    """A contract between a client and a freelancer."""
+    client_id: str
+    freelancer_id: str
+    contract_date: datetime
+    value_usd: float
+    review_given: Optional[float]     # 1-5 stars or None
+    review_text: Optional[str]
+    ended_within_days: Optional[int]  # how fast contract ended
+
+
+@dataclass
+class SuspicionScore:
+    account_id: str
+    account_type: str
+    overall_suspicion: float          # 0-1
+    signals: dict[str, float]         # individual signal scores
+    connected_suspicious: list[str]   # other accounts in the ring
+
+
+def ip_overlap(a: Account, b: Account) -> float:
+    """Jaccard similarity of IP sets."""
+    if not a.ip_addresses or not b.ip_addresses:
+        return 0.0
+    return len(a.ip_addresses & b.ip_addresses) / len(a.ip_addresses | b.ip_addresses)
+
+
+def device_overlap(a: Account, b: Account) -> float:
+    if not a.device_fingerprints or not b.device_fingerprints:
+        return 0.0
+    return len(a.device_fingerprints & b.device_fingerprints) / len(
+        a.device_fingerprints | b.device_fingerprints)
+
+
+def payment_overlap(a: Account, b: Account) -> float:
+    if not a.payment_method_hashes or not b.payment_method_hashes:
+        return 0.0
+    return 1.0 if a.payment_method_hashes & b.payment_method_hashes else 0.0
+
+
+def temporal_anomaly(client: Account, edges: list[Edge]) -> float:
+    """
+    Score for: client created → job posted → hired → review left → both dormant.
+    All happening suspiciously fast.
+    """
+    client_edges = [e for e in edges if e.client_id == client.id]
+    if not client_edges:
+        return 0.0
+
+    score = 0.0
+    for e in client_edges:
+        # Time from client creation to contract
+        time_to_contract = (e.contract_date - client.created_at).total_seconds() / 3600
+        if time_to_contract < 24:  # hired within 24h of creating account
+            score += 0.2
+
+        # Contract ended suspiciously fast with a good review
+        if e.ended_within_days and e.ended_within_days < 7:
+            if e.review_given and e.review_given >= 4.5:
+                score += 0.3
+
+        # Review is suspiciously positive with no detail
+        if e.review_text:
+            if len(e.review_text) < 50 and e.review_given and e.review_given == 5.0:
+                score += 0.2
+
+    # Account went dormant after activity
+    if client.last_active and client.last_active < datetime.now() - timedelta(days=30):
+        if not client.is_active:
+            score += 0.3
+
+    return min(1.0, score)
+
+
+def review_text_similarity(texts: list[str]) -> float:
+    """
+    Detects template-generated reviews.
+    Real reviews have diverse vocabulary; fake reviews share n-gram patterns.
+    """
+    if len(texts) < 2:
+        return 0.0
+
+    def ngrams(text: str, n: int = 3) -> set[tuple]:
+        words = re.findall(r'\w+', text.lower())
+        return set(tuple(words[i:i+n]) for i in range(len(words) - n + 1))
+
+    all_ngrams = [ngrams(t) for t in texts]
+    # Pairwise Jaccard
+    similarities = []
+    for i, j in combinations(range(len(texts)), 2):
+        if all_ngrams[i] and all_ngrams[j]:
+            sim = len(all_ngrams[i] & all_ngrams[j]) / len(all_ngrams[i] | all_ngrams[j])
+            similarities.append(sim)
+    return float(np.mean(similarities)) if similarities else 0.0
+
+
+def detect_collusion_rings(
+    clients: dict[str, Account],
+    freelancers: dict[str, Account],
+    edges: list[Edge],
+    suspicion_threshold: float = 0.5,
+) -> list[SuspicionScore]:
+    """
+    Main detection: builds the bipartite graph, computes per-account
+    suspicion scores, identifies dense suspicious subgraphs.
+    """
+    all_accounts = {**clients, **freelancers}
+    account_types = {**{k: "client" for k in clients}, **{k: "freelancer" for k in freelancers}}
+
+    # Build adjacency from edges
+    adj = defaultdict(set)
+    for e in edges:
+        adj[e.client_id].add(e.freelancer_id)
+        adj[e.freelancer_id].add(e.client_id)
+
+    # Compute pairwise suspicion between connected accounts
+    scores = {}
+    for acc_id, acc in all_accounts.items():
+        signals = {}
+
+        # Signal 1: Financial fingerprint overlap with connected accounts
+        max_fingerprint = 0.0
+        for neighbor_id in adj[acc_id]:
+            if neighbor_id in all_accounts:
+                neighbor = all_accounts[neighbor_id]
+                fp = max(
+                    ip_overlap(acc, neighbor),
+                    device_overlap(acc, neighbor),
+                    payment_overlap(acc, neighbor),
+                )
+                max_fingerprint = max(max_fingerprint, fp)
+        signals["fingerprint_overlap"] = max_fingerprint
+
+        # Signal 2: Temporal anomaly
+        if acc_id in clients:
+            signals["temporal_anomaly"] = temporal_anomaly(acc, edges)
+        else:
+            signals["temporal_anomaly"] = 0.0
+
+        # Signal 3: Connectivity anomaly
+        # How concentrated are this account's connections?
+        # A legit freelancer works with many different clients.
+        # A shill freelancer works with a small ring repeatedly.
+        neighbors = adj[acc_id]
+        if len(neighbors) > 0:
+            # Check if neighbors are interconnected (they shouldn't be in a
+            # legit marketplace — clients don't hire each other)
+            client_neighbors = [n for n in neighbors if n in clients]
+            freelancer_neighbors = [n for n in neighbors if n in freelancers]
+            # For a client: how many total contracts do their freelancers have?
+            # Shill freelancers have few outside contracts
+            if acc_id in clients:
+                outside_activity = sum(
+                    len(adj.get(fn, set())) - 1 for fn in freelancer_neighbors
+                ) / max(len(freelancer_neighbors), 1)
+                # Low outside activity = suspicious
+                signals["connectivity_anomaly"] = max(0.0, 1.0 - outside_activity / 5.0)
+            else:
+                # For a freelancer: how many distinct clients?
+                signals["connectivity_anomaly"] = max(0.0, 1.0 - len(client_neighbors) / 3.0)
+        else:
+            signals["connectivity_anomaly"] = 0.0
+
+        # Signal 4: Review text similarity (for accounts that left reviews)
+        if acc_id in clients:
+            client_reviews = [e.review_text for e in edges
+                              if e.client_id == acc_id and e.review_text]
+            signals["review_text_similarity"] = review_text_similarity(client_reviews)
+        else:
+            signals["review_text_similarity"] = 0.0
+
+        # Weighted combination
+        overall = (
+            0.30 * signals["fingerprint_overlap"]
+            + 0.25 * signals["temporal_anomaly"]
+            + 0.25 * signals["connectivity_anomaly"]
+            + 0.20 * signals["review_text_similarity"]
+        )
+        signals["overall"] = overall
+        scores[acc_id] = signals
+
+    # Identify rings: accounts above threshold that are connected to each other
+    suspicious = []
+    for acc_id, sig in scores.items():
+        if sig["overall"] >= suspicion_threshold:
+            connected_suspicious = [
+                n for n in adj[acc_id] if n in scores and scores[n]["overall"] >= suspicion_threshold
+            ]
+            suspicious.append(SuspicionScore(
+                account_id=acc_id,
+                account_type=account_types.get(acc_id, "unknown"),
+                overall_suspicion=sig["overall"],
+                signals=sig,
+                connected_suspicious=connected_suspicious,
+            ))
+
+    return sorted(suspicious, key=lambda s: s.overall_suspicion, reverse=True)
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    now = datetime(2025, 1, 15)
+
+    # --- Legit marketplace ---
+    legit_clients = {
+        "c-real-1": Account("c-real-1", now - timedelta(days=400), {"1.2.3.4"}, {"d1"}, {"pm1"}, True, now),
+        "c-real-2": Account("c-real-2", now - timedelta(days=200), {"5.6.7.8"}, {"d2"}, {"pm2"}, True, now),
+        "c-real-3": Account("c-real-3", now - timedelta(days=100), {"9.10.11.12"}, {"d3"}, {"pm3"}, True, now),
+    }
+    legit_freelancers = {
+        "f-real-1": Account("f-real-1", now - timedelta(days=500), {"20.30.40.50"}, {"d4"}, {"pm4"}, True, now),
+        "f-real-2": Account("f-real-2", now - timedelta(days=300), {"60.70.80.90"}, {"d5"}, {"pm5"}, True, now),
+    }
+
+    # --- The fraud ring ---
+    # Same IP range, same device, created recently, only hire each other
+    fraud_clients = {
+        "c-fraud-1": Account("c-fraud-1", now - timedelta(days=10), {"100.100.1.1", "100.100.1.5"},
+                              {"device-fraud"}, {"pm-fraud-1"}, False, now - timedelta(days=5)),
+        "c-fraud-2": Account("c-fraud-2", now - timedelta(days=8), {"100.100.1.2"},
+                              {"device-fraud"}, {"pm-fraud-2"}, False, now - timedelta(days=3)),
+    }
+    fraud_freelancers = {
+        "f-fraud-1": Account("f-fraud-1", now - timedelta(days=15), {"100.100.1.3", "100.100.2.1"},
+                              {"device-fraud"}, {"pm-fraud-1"}, True, now),
+    }
+
+    all_clients = {**legit_clients, **fraud_clients}
+    all_freelancers = {**legit_freelancers, **fraud_freelancers}
+
+    # Edges (contracts)
+    edges = [
+        # Legit contracts — diverse, spread over time, detailed reviews
+        Edge("c-real-1", "f-real-1", now - timedelta(days=300), 2000, 5.0,
+             "Excellent work on our e-commerce site. Delivered ahead of schedule and communicated well throughout. Would definitely hire again.", 45),
+        Edge("c-real-2", "f-real-1", now - timedelta(days=150), 1500, 5.0,
+             "Great communication, understood requirements quickly, and the final product exceeded expectations.", 30),
+        Edge("c-real-3", "f-real-2", now - timedelta(days=80), 800, 4.0,
+             "Good work overall, though there were some delays in the middle. Final delivery was solid.", 60),
+        Edge("c-real-1", "f-real-2", now - timedelta(days=40), 1200, 5.0,
+             "Fantastic developer. Took our vague requirements and turned them into exactly what we needed.", 35),
+
+        # Fraud contracts — fast, high-rated, template reviews, same devices
+        Edge("c-fraud-1", "f-fraud-1", now - timedelta(days=8), 500, 5.0,
+             "Great work, highly recommended! Excellent communication and delivered on time.", 2),
+        Edge("c-fraud-2", "f-fraud-1", now - timedelta(days=5), 300, 5.0,
+             "Great work, highly recommended! Excellent communication and delivered on time.", 1),
+    ]
+
+    print("=" * 80)
+    print("COLLUSION RING DETECTION — Bipartite Graph Analysis")
+    print("=" * 80)
+
+    suspicious = detect_collusion_rings(all_clients, all_freelancers, edges, threshold=0.4)
+
+    if not suspicious:
+        print("No suspicious accounts detected.")
+    else:
+        print(f"\n🚨 {len(suspicious)} suspicious accounts detected:\n")
+        for s in suspicious:
+            print(f"  {s.account_id} ({s.account_type})")
+            print(f"    Overall suspicion: {s.overall_suspicion:.1%}")
+            print(f"    Fingerprint overlap: {s.signals['fingerprint_overlap']:.1%}")
+            print(f"    Temporal anomaly:    {s.signals['temporal_anomaly']:.1%}")
+            print(f"    Connectivity anomaly: {s.signals['connectivity_anomaly']:.1%}")
+            print(f"    Review text similarity: {s.signals['review_text_similarity']:.1%}")
+            if s.connected_suspicious:
+                print(f"    Connected to: {', '.join(s.connected_suspicious)}")
+            print()
+
+    print("--- What the platform would do ---")
+    print("  1. Flag the accounts for manual review")
+    print("  2. Freeze payments pending investigation")
+    print("  3. If confirmed: ban accounts, reverse reviews, refund affected clients")
+    print("  4. Add device/payment fingerprints to a lifetime blocklist")
