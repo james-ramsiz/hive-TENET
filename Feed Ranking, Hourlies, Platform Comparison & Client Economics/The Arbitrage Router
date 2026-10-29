@@ -1,0 +1,234 @@
+"""
+Cross-platform arbitrage dashboard.
+Monitors PPH, Upwork, and Fiverr opportunities, computes EV per hour,
+and routes the freelancer to the highest-EV action.
+
+In production, this would connect to platform APIs. Since none of the
+three platforms offer public opportunity APIs, this simulation shows
+the decision logic. You would need to build scrapers or browser
+extensions to feed it real data.
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional
+
+
+class Platform(Enum):
+    PPH = "PeoplePerHour"
+    UPWORK = "Upwork"
+    FIVERR = "Fiverr"
+
+
+class ActionType(Enum):
+    PPH_PROPOSAL = "pph_proposal"
+    PPH_BOOSTED_PROPOSAL = "pph_boosted_proposal"
+    UPWORK_PROPOSAL = "upwork_proposal"
+    UPWORK_BOOSTED_PROPOSAL = "upwork_boosted_proposal"
+    FIVERR_GIG_MAINTENANCE = "fiverr_gig_maintenance"
+    FIVERR_GIG_CREATION = "fiverr_gig_creation"
+    SKILL_DEVELOPMENT = "skill_development"      # learn, build portfolio
+    REST = "rest"
+
+
+@dataclass
+class Opportunity:
+    """A single actionable opportunity across any platform."""
+    id: str
+    platform: Platform
+    action_type: ActionType
+    description: str
+    estimated_revenue_gbp: float        # gross revenue if successful
+    estimated_win_rate: float           # P(success)
+    time_required_hours: float
+    credits_required: int = 0           # PPH credits or Upwork Connects
+    deadline_hours: Optional[float] = None  # urgency — how soon must you act?
+    fee_rate: float = 0.10              # platform fee as fraction of revenue
+
+
+@dataclass
+class FreelancerState:
+    """Current state — updated as the day progresses."""
+    hours_remaining_today: float
+    pph_credits_remaining: int
+    upwork_connects_remaining: int
+    energy_level: float                  # 0-1, affects proposal quality
+    proposals_submitted_today: int = 0
+    day_of_week: int = 1                 # 1=Mon ... 7=Sun
+
+
+# -------------------- EV computation --------------------
+def compute_action_ev(
+    opp: Opportunity, state: FreelancerState, credit_value_gbp: float = 0.08
+) -> dict:
+    """
+    Compute expected value of an action, adjusted for:
+    - Platform fees
+    - Credit costs
+    - Energy decay (each successive proposal is worse quality)
+    - Opportunity cost of time
+    """
+    # Gross EV
+    net_revenue = opp.estimated_revenue_gbp * (1 - opp.fee_rate)
+    gross_ev = opp.estimated_win_rate * net_revenue
+
+    # Credit cost
+    credit_cost = opp.credits_required * credit_value_gbp
+
+    # Energy adjustment: proposals get worse as you tire
+    # Model: win rate decays 10% per proposal after the 3rd
+    if opp.action_type in (ActionType.PPH_PROPOSAL, ActionType.UPWORK_PROPOSAL,
+                           ActionType.PPH_BOOSTED_PROPOSAL, ActionType.UPWORK_BOOSTED_PROPOSAL):
+        energy_factor = max(0.5, 1.0 - 0.10 * max(0, state.proposals_submitted_today - 3))
+        adjusted_win_rate = opp.estimated_win_rate * energy_factor
+        gross_ev = adjusted_win_rate * net_revenue
+
+    # Urgency bonus: if deadline is close, act now (can't do it later)
+    urgency_multiplier = 1.0
+    if opp.deadline_hours and opp.deadline_hours < 24:
+        urgency_multiplier = 1.3  # 30% bonus — you can't defer this
+
+    net_ev = (gross_ev - credit_cost) * urgency_multiplier
+
+    # EV per hour (for routing decision)
+    ev_per_hour = net_ev / max(opp.time_required_hours, 0.1)
+
+    return {
+        "opportunity": opp,
+        "net_ev": net_ev,
+        "ev_per_hour": ev_per_hour,
+        "adjusted_win_rate": opp.estimated_win_rate * energy_factor if "energy_factor" in dir() else opp.estimated_win_rate,
+        "net_revenue_if_won": net_revenue,
+    }
+
+
+# -------------------- the router --------------------
+def route_day(
+    opportunities: list[Opportunity],
+    state: FreelancerState,
+    min_ev_threshold: float = 5.0,   # don't act on EV < £5
+) -> list[dict]:
+    """
+    Routes the freelancer through the day.
+    Greedy: at each step, pick the highest EV/hour action that's feasible.
+    """
+    schedule = []
+    remaining_opp = list(opportunities)
+    s = FreelancerState(**state.__dict__)
+
+    while s.hours_remaining_today > 0.25 and remaining_opp:
+        # Compute EV for all remaining opportunities
+        scored = []
+        for opp in remaining_opp:
+            # Feasibility check
+            if opp.time_required_hours > s.hours_remaining_today:
+                continue
+            if opp.credits_required > 0:
+                if opp.platform == Platform.PPH and opp.credits_required > s.pph_credits_remaining:
+                    continue
+                if opp.platform == Platform.UPWORK and opp.credits_required > s.upwork_connects_remaining:
+                    continue
+
+            ev = compute_action_ev(opp, s)
+            if ev["net_ev"] >= min_ev_threshold:
+                scored.append(ev)
+
+        if not scored:
+            break
+
+        # Pick highest EV/hour
+        scored.sort(key=lambda x: x["ev_per_hour"], reverse=True)
+        best = scored[0]
+        opp = best["opportunity"]
+
+        # Execute
+        schedule.append({
+            "time_slot": len(schedule) + 1,
+            "action": opp.action_type.value,
+            "platform": opp.platform.value,
+            "description": opp.description,
+            "hours": opp.time_required_hours,
+            "ev": best["net_ev"],
+            "ev_per_hour": best["ev_per_hour"],
+            "adjusted_win_rate": best["adjusted_win_rate"],
+        })
+
+        # Update state
+        s.hours_remaining_today -= opp.time_required_hours
+        s.proposals_submitted_today += 1
+        s.energy_level = max(0.3, s.energy_level - 0.08)
+        if opp.platform == Platform.PPH:
+            s.pph_credits_remaining -= opp.credits_required
+        elif opp.platform == Platform.UPWORK:
+            s.upwork_connects_remaining -= opp.credits_required
+
+        # Remove from remaining
+        remaining_opp.remove(opp)
+
+    return schedule
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    # A realistic morning of opportunities
+    opportunities = [
+        # PPH jobs in the feed
+        Opportunity("pph-1", Platform.PPH, ActionType.PPH_BOOSTED_PROPOSAL,
+                     "£2,000 e-commerce build, Shopify", 2000, 0.15, 1.0, 30, 48, 0.10),
+        Opportunity("pph-2", Platform.PPH, ActionType.PPH_PROPOSAL,
+                     "£800 WordPress site", 800, 0.08, 0.75, 15, 72, 0.10),
+        Opportunity("pph-3", Platform.PPH, ActionType.PPH_PROPOSAL,
+                     "£300 landing page", 300, 0.12, 0.5, 15, 24, 0.10),
+        Opportunity("pph-4", Platform.PPH, ActionType.PPH_PROPOSAL,
+                     "£5,000 custom platform", 5000, 0.04, 1.5, 15, 120, 0.10),
+
+        # Upwork jobs in the feed
+        Opportunity("up-1", Platform.UPWORK, ActionType.UPWORK_BOOSTED_PROPOSAL,
+                     "$3,000 React dashboard", 2362, 0.06, 1.25, 35, 36, 0.10),
+        Opportunity("up-2", Platform.UPWORK, ActionType.UPWORK_PROPOSAL,
+                     "$1,200 ongoing content", 945, 0.05, 1.0, 15, 48, 0.10),
+        Opportunity("up-3", Platform.UPWORK, ActionType.UPWORK_PROPOSAL,
+                     "$600 bug fixes", 472, 0.10, 0.5, 10, 24, 0.10),
+
+        # Fiverr maintenance
+        Opportunity("fiv-1", Platform.FIVERR, ActionType.FIVERR_GIG_MAINTENANCE,
+                     "Respond to 4 buyer messages, fulfill 1 order", 150, 0.95, 1.5, 0, None, 0.20),
+        Opportunity("fiv-2", Platform.FIVERR, ActionType.FIVERR_GIG_CREATION,
+                     "Create new 'Speed Optimization' gig", 400, 0.30, 3.0, 0, None, 0.20),
+
+        # Alternative uses of time
+        Opportunity("skill-1", Platform.PPH, ActionType.SKILL_DEVELOPMENT,
+                     "Build portfolio piece: SaaS dashboard", 0, 0.0, 3.0, 0, None, 0.0),
+    ]
+
+    # Monday morning, full capacity
+    state = FreelancerState(
+        hours_remaining_today=8.0,
+        pph_credits_remaining=120,
+        upwork_connects_remaining=80,
+        energy_level=1.0,
+        day_of_week=1,
+    )
+
+    schedule = route_day(opportunities, state, min_ev_threshold=5.0)
+
+    print("=" * 95)
+    print("CROSS-PLATFORM ARBITRAGE — Daily Routing Plan")
+    print("=" * 95)
+    print(f"{'Slot':<6}{'Platform':<18}{'Action':<28}{'Hours':>6}{'EV (£)':>8}{'EV/h':>8}{'Win%':>7}")
+    print("-" * 95)
+    total_ev = 0
+    total_hours = 0
+    for s in schedule:
+        print(f"{s['time_slot']:<6}{s['platform']:<18}{s['description'][:26]:<28}"
+              f"{s['hours']:>6.2f}{s['ev']:>8.1f}{s['ev_per_hour']:>8.1f}{s['adjusted_win_rate']:>6.1%}")
+        total_ev += s["ev"]
+        total_hours += s["hours"]
+
+    print("-" * 95)
+    print(f"Total: {total_hours:.1f} hours, £{total_ev:.1f} expected value")
+    print(f"\nInterpretation: Over many similar days, expect ~£{total_ev:.0f}/day gross")
+    print(f"before time costs. At £50/hr opportunity cost, {total_hours:.0f}h = £{total_hours * 50:.0f},")
+    print(f"so net = £{total_ev - total_hours * 50:.0f} (positive = arbitrage is working).")
