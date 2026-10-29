@@ -1,0 +1,12 @@
+FreelancerSimulator
+├── FreelancerProfile     (skills, rates, risk aversion, capacity)
+├── Strategy              (abstract; implements decide(opportunity) → action)
+│   ├── NaiveStrategy     (bid on everything)
+│   ├── GreedyEVStrategy  (bid on highest EV, boost optimally)
+│   └── PortfolioStrategy (balance PPH proposals + Fiverr gigs + rest)
+├── Platform              (abstract; generates opportunities, applies fees)
+│   ├── PPHPlatform
+│   ├── UpworkPlatform
+│   └── FiverrPlatform
+├── Market                (generates job streams, seasonality, trends)
+└── Simulation            (runs the loop, collects metrics)
