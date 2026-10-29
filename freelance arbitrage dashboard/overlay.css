@@ -1,0 +1,9 @@
+/* overlay.css — reserve for future page-integration styles */
+#ev-arbitrage-overlay {
+  user-select: none;
+  animation: ev-slide-in 0.25s ease-out;
+}
+@keyframes ev-slide-in {
+  from { transform: translateX(20px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
