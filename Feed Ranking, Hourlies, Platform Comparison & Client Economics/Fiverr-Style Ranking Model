@@ -1,0 +1,259 @@
+"""
+Fiverr-style search ranking — a two-stage funnel model.
+Ranks gigs by expected revenue per impression.
+
+Stage 1: P(click | impression) — CTR model
+Stage 2: P(order | click) — conversion model
+Combined: E[revenue] = CTR × CVR × AOV × take_rate
+"""
+from __future__ import annotations
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class Seller:
+    id: str
+    level: int                     # 0=New, 1=Level 1, 2=Level 2, 3=Top Rated, 4=Pro
+    order_completion_rate: float   # 0-1
+    on_time_rate: float            # 0-1
+    response_rate: float           # 0-1
+    response_time_minutes: float
+    total_orders: int
+    account_age_days: int
+    warnings: int                  # TOS violations
+
+
+@dataclass
+class Gig:
+    id: str
+    seller: Seller
+    title: str
+    tags: list[str]
+    base_price: float              # starting price in USD
+    avg_order_value: float         # actual average order including upsells
+    review_count: int
+    avg_rating: float              # 1-5
+    review_velocity_30d: int       # reviews in last 30 days
+    ctr_7d: float                  # click-through rate in last 7 days
+    ctr_30d: float
+    cvr_7d: float                  # conversion rate (view→order) last 7 days
+    cvr_30d: float
+    gig_age_days: int
+    last_order_days_ago: int
+    image_quality_score: float     # 0-1, from a CV model on thumbnail
+    video_present: bool
+    mobile_friendly: bool
+    promoted: bool = False         # using Promoted Gigs (paid)
+
+
+@dataclass
+class SearchQuery:
+    query: str
+    buyer_geo: str                 # "US", "UK", "IN", etc.
+    buyer_historical_category: Optional[str] = None
+    competition_level: float = 0.5  # 0-1, how many gigs match this query
+
+
+# -------------------- CTR model --------------------
+def predict_ctr(gig: Gig, query: SearchQuery) -> float:
+    """
+    Predicts P(click | impression).
+    Simplified model — production Fiverr uses gradient-boosted trees with ~50 features.
+    """
+    # Base CTR from recent performance (weighted 70% last 7d, 30% last 30d)
+    base_ctr = 0.7 * gig.ctr_7d + 0.3 * gig.ctr_30d
+
+    # Image quality boost (thumbnails drive clicks heavily)
+    image_effect = 0.5 * gig.image_quality_score
+    if gig.video_present:
+        image_effect += 0.1
+
+    # Seller level boost
+    level_boost = [0.0, 0.02, 0.04, 0.08, 0.12][min(gig.seller.level, 4)]
+
+    # Review count effect (logarithmic — diminishing returns)
+    review_effect = 0.03 * np.log1p(gig.review_count) / np.log(1 + 500)
+
+    # Freshness (new gigs get a testing boost)
+    if gig.gig_age_days <= 14:
+        freshness_boost = 0.05
+    elif gig.gig_age_days <= 30:
+        freshness_boost = 0.02
+    else:
+        freshness_boost = 0.0
+
+    # Staleness penalty (no recent orders → looks abandoned)
+    staleness = max(0.0, (gig.last_order_days_ago - 14) / 60.0 * 0.3)
+
+    # Keyword match (simplified — production uses embeddings)
+    query_words = set(query.query.lower().split())
+    tag_words = set(t.lower() for t in gig.tags)
+    title_words = set(gig.title.lower().split())
+    keyword_match = (
+        len(query_words & tag_words) / max(len(query_words), 1) * 0.6
+        + len(query_words & title_words) / max(len(query_words), 1) * 0.4
+    )
+
+    ctr = (
+        base_ctr * 0.40
+        + image_effect * 0.20
+        + level_boost * 1.0
+        + review_effect * 1.0
+        + freshness_boost
+        + keyword_match * 0.25
+        - staleness
+    )
+
+    return float(np.clip(ctr, 0.005, 0.30))  # realistic CTR range
+
+
+# -------------------- Conversion model --------------------
+def predict_cvr(gig: Gig, query: SearchQuery) -> float:
+    """
+    Predicts P(order | click).
+    """
+    base_cvr = 0.7 * gig.cvr_7d + 0.3 * gig.cvr_30d
+
+    # Rating effect (Bayesian-shrunk)
+    prior_n = 5
+    shrunk_rating = (prior_n * 4.5 + gig.review_count * gig.avg_rating) / (prior_n + gig.review_count)
+    rating_effect = (shrunk_rating - 4.0) / 1.0 * 0.05  # ±5% per rating point
+
+    # Price competitiveness (relative to category average, ~$80 for most categories)
+    category_avg_price = 80.0
+    price_ratio = gig.base_price / category_avg_price
+    if price_ratio < 0.5:
+        price_effect = 0.08  # cheap → higher conversion
+    elif price_ratio < 1.0:
+        price_effect = 0.03
+    elif price_ratio < 2.0:
+        price_effect = -0.02
+    else:
+        price_effect = -0.06  # expensive → lower conversion
+
+    # Review count social proof (logarithmic)
+    social_proof = 0.04 * np.log1p(gig.review_count) / np.log(1 + 300)
+
+    # Response time effect (fast responses convert better)
+    if gig.seller.response_time_minutes < 60:
+        response_effect = 0.03
+    elif gig.seller.response_time_minutes < 240:
+        response_effect = 0.01
+    else:
+        response_effect = -0.03
+
+    # Seller quality signals
+    completion_effect = (gig.seller.order_completion_rate - 0.90) * 0.3
+    ontime_effect = (gig.seller.on_time_rate - 0.90) * 0.2
+    warning_penalty = gig.seller.warnings * 0.05
+
+    cvr = (
+        base_cvr * 0.50
+        + rating_effect
+        + price_effect
+        + social_proof
+        + response_effect
+        + completion_effect
+        + ontime_effect
+        - warning_penalty
+    )
+
+    return float(np.clip(cvr, 0.005, 0.25))  # realistic CVR range
+
+
+# -------------------- the ranker --------------------
+FIVERR_TAKE_RATE = 0.20
+
+
+def rank_gigs(gigs: list[Gig], query: SearchQuery, n_results: int = 20) -> list[dict]:
+    """
+    Ranks gigs by expected Fiverr revenue per impression.
+    Also computes the component breakdown for each gig.
+    """
+    results = []
+    for gig in gigs:
+        ctr = predict_ctr(gig, query)
+        cvr = predict_cvr(gig, query)
+        aov = gig.avg_order_value
+        expected_revenue = ctr * cvr * aov * FIVERR_TAKE_RATE
+
+        # Promoted Gigs boost (paid placement, always shown above organic)
+        promoted_boost = 1.5 if gig.promoted else 1.0
+
+        results.append({
+            "gig": gig,
+            "ctr": ctr,
+            "cvr": cvr,
+            "aov": aov,
+            "expected_revenue": expected_revenue,
+            "final_score": expected_revenue * promoted_boost,
+            "promoted": gig.promoted,
+        })
+
+    # Promoted gigs first, then organic by score
+    results.sort(key=lambda r: (r["promoted"], r["final_score"]), reverse=True)
+    return results[:n_results]
+
+
+# -------------------- demo --------------------
+if __name__ == "__main__":
+    # Create a set of competing gigs
+    sellers = [
+        Seller("s1", level=3, order_completion_rate=0.98, on_time_rate=0.99,
+               response_rate=0.98, response_time_minutes=30, total_orders=450,
+               account_age_days=900, warnings=0),
+        Seller("s2", level=2, order_completion_rate=0.95, on_time_rate=0.97,
+               response_rate=0.94, response_time_minutes=90, total_orders=120,
+               account_age_days=500, warnings=0),
+        Seller("s3", level=0, order_completion_rate=0.92, on_time_rate=0.90,
+               response_rate=0.88, response_time_minutes=300, total_orders=3,
+               account_age_days=20, warnings=0),
+        Seller("s4", level=2, order_completion_rate=0.93, on_time_rate=0.91,
+               response_rate=0.92, response_time_minutes=180, total_orders=85,
+               account_age_days=400, warnings=1),
+    ]
+
+    gigs = [
+        Gig("g1", sellers[0], "I will design a professional WordPress website",
+            ["wordpress", "web design", "website"], 150, 280,
+            380, 4.9, 12, 0.06, 0.05, 0.08, 0.07,
+            700, 1, 0.9, True, True),
+        Gig("g2", sellers[1], "WordPress website design and development",
+            ["wordpress", "web design"], 100, 180,
+            95, 4.8, 5, 0.04, 0.035, 0.06, 0.055,
+            450, 3, 0.75, False, True),
+        Gig("g3", sellers[2], "I will create a WordPress website for you",
+            ["wordpress", "website"], 25, 35,
+            2, 5.0, 2, 0.03, 0.025, 0.10, 0.08,
+            18, 2, 0.5, False, False),
+        Gig("g4", sellers[3], "Professional WordPress development",
+            ["wordpress", "development", "php"], 200, 400,
+            72, 4.6, 3, 0.035, 0.03, 0.04, 0.035,
+            380, 7, 0.7, False, True, promoted=True),
+    ]
+
+    query = SearchQuery(query="wordpress website design", buyer_geo="US",
+                        competition_level=0.7)
+
+    results = rank_gigs(gigs, query, n_results=10)
+    print(f"\nQuery: '{query.query}'  |  Fiverr take rate: 20%")
+    print(f"{'Rank':<6}{'Gig':<6}{'Seller Level':<14}{'CTR':>7}{'CVR':>7}{'AOV':>7}{'E[Rev]':>9}{'Promo':>7}")
+    print("-" * 70)
+    for i, r in enumerate(results, 1):
+        g = r["gig"]
+        print(f"{i:<6}{g.id:<6}L{g.seller.level:<13}{r['ctr']:>6.1%}{r['cvr']:>6.1%}"
+              f"${r['aov']:>6.0f}${r['expected_revenue']:>8.3f}{'YES' if r['promoted'] else 'no':>7}")
+
+    print(f"\n--- Insight ---")
+    best = results[0]
+    print(f"Winner: {best['gig'].id} (Level {best['gig'].seller.level} seller)")
+    print(f"  Expected revenue per impression: ${best['expected_revenue']:.4f}")
+    print(f"  Over 100,000 impressions/month = ${best['expected_revenue'] * 100000:.0f}/mo for Fiverr")
+    print(f"\nThe new seller (g3) has HIGH CVR (10%) but LOW AOV ($35).")
+    print(f"  Their E[rev] = 0.03 × 0.10 × $35 × 0.20 = ${0.03 * 0.10 * 35 * 0.20:.4f}")
+    print(f"The established seller (g1) has LOWER CVR (8%) but HIGH AOV ($280).")
+    print(f"  Their E[rev] = 0.06 × 0.08 × $280 × 0.20 = ${0.06 * 0.08 * 280 * 0.20:.4f}")
+    print(f"→ Fiverr ranks g1 higher because Fiverr's revenue is proportional to AOV.")
+    print(f"→ The algorithm structurally favors expensive gigs from established sellers.")
