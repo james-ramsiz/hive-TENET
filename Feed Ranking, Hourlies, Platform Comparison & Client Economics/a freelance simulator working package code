@@ -1,0 +1,497 @@
+"""
+freelancer_sim.py — A 12-month freelancer simulation across PPH, Upwork, Fiverr.
+Run: python freelancer_sim.py
+"""
+from __future__ import annotations
+import numpy as np
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional
+import json
+
+
+# ============================================================
+# Domain types
+# ============================================================
+class PlatformName(Enum):
+    PPH = "PeoplePerHour"
+    UPWORK = "Upwork"
+    FIVERR = "Fiverr"
+
+
+@dataclass
+class FreelancerProfile:
+    name: str
+    hourly_rate_gbp: float = 60.0
+    hours_per_week: float = 40.0
+    risk_aversion: float = 0.5           # 0=risk-neutral, 1=very risk-averse
+    skill_level: float = 0.7             # 0-1, affects win rates
+    initial_pph_credits: int = 150
+    initial_upwork_connects: int = 100
+    initial_cash_gbp: float = 2000.0
+    categories: list[str] = field(default_factory=lambda: ["web-development", "ecommerce"])
+
+
+@dataclass
+class Opportunity:
+    id: str
+    platform: PlatformName
+    category: str
+    budget_gbp: float
+    posted_week: int
+    estimated_win_rate: float            # pre-computed by platform model
+
+
+@dataclass
+class FreelancerState:
+    cash_gbp: float
+    pph_credits: int
+    upwork_connects: int
+    cumulative_earnings_pph: float = 0.0   # for PPH sliding fee
+    jss_score: float = 75.0                # Upwork JSS (0-100)
+    fiverr_gig_active: bool = False        # has the freelancer set up a Fiverr gig?
+    fiverr_reviews: int = 0
+    fiverr_rating: float = 0.0
+    contracts_won: int = 0
+    proposals_submitted: int = 0
+    hours_worked_this_week: float = 0.0
+    hours_available_this_week: float = 40.0
+    pph_wins: int = 0
+    pph_losses: int = 0
+    upwork_wins: int = 0
+    upwork_losses: int = 0
+
+
+# ============================================================
+# Platform models
+# ============================================================
+class Platform(ABC):
+    @abstractmethod
+    def generate_opportunities(self, week: int, profile: FreelancerProfile,
+                                state: FreelancerState, rng: np.random.Generator) -> list[Opportunity]:
+        ...
+
+    @abstractmethod
+    def apply_win(self, opp: Opportunity, state: FreelancerState, rng: np.random.Generator) -> float:
+        """Called when freelancer wins. Returns net revenue. Updates state."""
+        ...
+
+    @abstractmethod
+    def cost_per_proposal(self, boost: bool) -> float:
+        ...
+
+
+class PPHPlatform(Platform):
+    """PeoplePerHour with sliding fee and credit costs."""
+
+    def __init__(self):
+        self.credit_value_gbp = 0.08
+        self.base_credits = 15
+        self.boost_credits = 15
+
+    def generate_opportunities(self, week, profile, state, rng):
+        n_jobs = rng.poisson(12)  # avg 12 jobs/week visible
+        opps = []
+        for i in range(n_jobs):
+            category = rng.choice(profile.categories)
+            budget = float(rng.lognormal(np.log(800) - 0.5, 0.7))
+            # Win rate: skilled freelancers win more
+            base_wr = 0.06 + profile.skill_level * 0.06
+            # Adjust by category experience
+            if state.pph_wins + state.pph_losses > 10:
+                empirical = state.pph_wins / (state.pph_wins + state.pph_losses)
+                base_wr = 0.7 * base_wr + 0.3 * empirical
+            opps.append(Opportunity(
+                id=f"pph-{week}-{i}", platform=PlatformName.PPH,
+                category=category, budget_gbp=budget, posted_week=week,
+                estimated_win_rate=base_wr,
+            ))
+        return opps
+
+    def apply_win(self, opp, state, rng):
+        # PPH sliding fee
+        revenue = opp.budget_gbp
+        fee = self._sliding_fee(revenue, state.cumulative_earnings_pph)
+        net = revenue - fee
+        state.cumulative_earnings_pph += revenue
+        state.cash_gbp += net
+        state.pph_wins += 1
+        state.contracts_won += 1
+        return net
+
+    def _sliding_fee(self, revenue, prior):
+        tiers = [(350, 0.0), (3500, 0.10), (15000, 0.075), (50000, 0.05), (float("inf"), 0.035)]
+        fee = 0.0
+        remaining = revenue
+        cumulative = prior
+        for threshold, rate in tiers:
+            headroom = threshold - cumulative
+            if headroom <= 0:
+                continue
+            chunk = min(remaining, headroom)
+            fee += chunk * rate
+            cumulative += chunk
+            remaining -= chunk
+            if remaining <= 0:
+                break
+        return fee
+
+    def cost_per_proposal(self, boost):
+        credits = self.base_credits + (self.boost_credits if boost else 0)
+        return credits * self.credit_value_gbp
+
+
+class UpworkPlatform(Platform):
+    def __init__(self):
+        self.connect_value_gbp = 0.06 / 1.27  # $0.06/connect in GBP
+        self.base_connects = 15
+        self.boost_connects = 25
+
+    def generate_opportunities(self, week, profile, state, rng):
+        n_jobs = rng.poisson(18)
+        opps = []
+        for i in range(n_jobs):
+            budget = float(rng.lognormal(np.log(1200) - 0.5, 0.8)) / 1.27  # USD→GBP
+            # JSS affects win rate significantly
+            jss_factor = (state.jss_score / 100.0) ** 2  # convex penalty for low JSS
+            base_wr = 0.04 * jss_factor + profile.skill_level * 0.04
+            opps.append(Opportunity(
+                id=f"up-{week}-{i}", platform=PlatformName.UPWORK,
+                category=rng.choice(profile.categories), budget_gbp=budget,
+                posted_week=week, estimated_win_rate=base_wr,
+            ))
+        return opps
+
+    def apply_win(self, opp, state, rng):
+        revenue = opp.budget_gbp
+        net = revenue * 0.90  # 10% flat fee
+        state.cash_gbp += net
+        state.upwork_wins += 1
+        state.contracts_won += 1
+        # Winning improves JSS slightly
+        state.jss_score = min(100, state.jss_score + 0.5)
+        return net
+
+    def cost_per_proposal(self, boost):
+        connects = self.base_connects + (self.boost_connects if boost else 0)
+        return connects * self.connect_value_gbp
+
+
+class FiverrPlatform(Platform):
+    """Fiverr is passive — gig income, not proposal-based."""
+
+    def __init__(self):
+        self.gig_setup_hours = 8.0
+        self.gig_maintenance_hours_per_week = 4.0
+
+    def generate_opportunities(self, week, profile, state, rng):
+        # Fiverr generates passive income if gig is active
+        if not state.fiverr_gig_active:
+            return []
+        # Views depend on reviews (more reviews → higher ranking → more views)
+        base_views = 50 + state.fiverr_reviews * 2
+        views = rng.poisson(base_views)
+        conv_rate = 0.02 + (state.fiverr_rating / 5.0) * 0.01 if state.fiverr_reviews > 0 else 0.015
+        sales = rng.binomial(views, conv_rate)
+        if sales > 0:
+            avg_price = 150.0
+            revenue = sales * avg_price
+            net = revenue * 0.80  # 20% fee
+            state.cash_gbp += net
+            # Accumulate reviews
+            for _ in range(sales):
+                if rng.random() < 0.7:  # 70% of buyers leave reviews
+                    state.fiverr_reviews += 1
+                    state.fiverr_rating = (state.fiverr_rating * (state.fiverr_reviews - 1) +
+                                           rng.uniform(4.0, 5.0)) / state.fiverr_reviews
+        return []  # no active opportunities — passive
+
+    def apply_win(self, opp, state, rng):
+        return 0.0
+
+    def cost_per_proposal(self, boost):
+        return 0.0
+
+
+# ============================================================
+# Strategies
+# ============================================================
+class Strategy(ABC):
+    @abstractmethod
+    def decide(self, opportunities: list[Opportunity], state: FreelancerState,
+               profile: FreelancerProfile, rng: np.random.Generator) -> list[tuple[Opportunity, bool]]:
+        """Returns [(opportunity, boost?), ...] to submit this week."""
+        ...
+
+
+class NaiveStrategy(Strategy):
+    """Bid on everything, never boost. Baseline."""
+
+    def decide(self, opportunities, state, profile, rng):
+        decisions = []
+        pph_cost = 15 * 0.08
+        for opp in opportunities:
+            if opp.platform == PlatformName.PPH:
+                if state.pph_credits >= 15:
+                    decisions.append((opp, False))
+            elif opp.platform == PlatformName.UPWORK:
+                if state.upwork_connects >= 15:
+                    decisions.append((opp, False))
+        return decisions
+
+
+class GreedyEVStrategy(Strategy):
+    """Bid on highest-EV opportunities, boost optimally."""
+
+    def decide(self, opportunities, state, profile, rng):
+        scored = []
+        for opp in opportunities:
+            # Compute EV for no-boost and boost
+            if opp.platform == PlatformName.PPH:
+                cost_none = 15 * 0.08
+                cost_boost = 30 * 0.08
+                boost_lift = 0.07
+            elif opp.platform == PlatformName.UPWORK:
+                cost_none = 15 * (0.06 / 1.27)
+                cost_boost = 40 * (0.06 / 1.27)
+                boost_lift = 0.06
+            else:
+                continue
+
+            ev_none = opp.estimated_win_rate * opp.budget_gbp * 0.9 - cost_none
+            ev_boost = (opp.estimated_win_rate + boost_lift) * opp.budget_gbp * 0.9 - cost_boost
+
+            best_ev = max(ev_none, ev_boost)
+            best_boost = ev_boost > ev_none
+            scored.append((opp, best_boost, best_ev))
+
+        # Sort by EV descending
+        scored.sort(key=lambda x: x[2], reverse=True)
+
+        # Select subject to credit constraints
+        decisions = []
+        for opp, boost, ev in scored:
+            if ev <= 0:
+                continue
+            if opp.platform == PlatformName.PPH:
+                credits = 30 if boost else 15
+                if state.pph_credits >= credits:
+                    decisions.append((opp, boost))
+            elif opp.platform == PlatformName.UPWORK:
+                connects = 40 if boost else 15
+                if state.upwork_connects >= connects:
+                    decisions.append((opp, boost))
+        return decisions
+
+
+class PortfolioStrategy(Strategy):
+    """
+    Hybrid: allocate time between PPH proposals, Upwork proposals,
+    and Fiverr gig setup/maintenance. Rebalances as the year progresses.
+    """
+
+    def decide(self, opportunities, state, profile, rng):
+        # If Fiverr gig not set up and we have spare time, set it up (one-time)
+        if not state.fiverr_gig_active and state.hours_available_this_week >= 12:
+            state.fiverr_gig_active = True
+            state.hours_available_this_week -= 8.0
+            state.hours_worked_this_week += 8.0
+
+        # Reserve Fiverr maintenance time
+        if state.fiverr_gig_active:
+            state.hours_available_this_week -= 4.0
+            state.hours_worked_this_week += 4.0
+
+        # Use GreedyEV for remaining opportunities
+        return GreedyEVStrategy().decide(opportunities, state, profile, rng)
+
+
+# ============================================================
+# Simulation engine
+# ============================================================
+@dataclass
+class WeekResult:
+    week: int
+    cash_gbp: float
+    weekly_revenue_gbp: float
+    contracts_won: int
+    proposals_submitted: int
+    pph_credits_remaining: int
+    upwork_connects_remaining: int
+    jss_score: float
+    fiverr_reviews: int
+
+
+class Simulation:
+    def __init__(self, profile: FreelancerProfile, strategy: Strategy,
+                 n_weeks: int = 52, seed: int = 42):
+        self.profile = profile
+        self.strategy = strategy
+        self.n_weeks = n_weeks
+        self.platforms = {
+            PlatformName.PPH: PPHPlatform(),
+            PlatformName.UPWORK: UpworkPlatform(),
+            PlatformName.FIVERR: FiverrPlatform(),
+        }
+        self.rng = np.random.default_rng(seed)
+        self.results: list[WeekResult] = []
+
+    def run(self) -> list[WeekResult]:
+        state = FreelancerState(
+            cash_gbp=self.profile.initial_cash_gbp,
+            pph_credits=self.profile.initial_pph_credits,
+            upwork_connects=self.profile.initial_upwork_connects,
+            hours_available_this_week=self.profile.hours_per_week,
+        )
+
+        for week in range(1, self.n_weeks + 1):
+            # Reset weekly hours
+            state.hours_available_this_week = self.profile.hours_per_week
+            state.hours_worked_this_week = 0
+
+            cash_at_start = state.cash_gbp
+
+            # Generate opportunities from all platforms
+            all_opps = []
+            for platform_name, platform in self.platforms.items():
+                opps = platform.generate_opportunities(week, self.profile, state, self.rng)
+                all_opps.extend(opps)
+
+            # Fiverr passive income (already applied in generate_opportunities)
+            # Now decide what to submit via strategy
+            decisions = self.strategy.decide(all_opps, state, self.profile, self.rng)
+
+            # Time cost: each proposal takes 45 min
+            hours_per_proposal = 0.75
+            max_proposals_by_time = int(state.hours_available_this_week / hours_per_proposal)
+            decisions = decisions[:max_proposals_by_time]
+
+            # Submit proposals
+            weekly_revenue = 0.0
+            for opp, boost in decisions:
+                # Deduct credits
+                if opp.platform == PlatformName.PPH:
+                    credits = 30 if boost else 15
+                    state.pph_credits -= credits
+                    state.hours_worked_this_week += hours_per_proposal
+                elif opp.platform == PlatformName.UPWORK:
+                    connects = 40 if boost else 15
+                    state.upwork_connects -= connects
+                    state.hours_worked_this_week += hours_per_proposal
+
+                state.proposals_submitted += 1
+
+                # Win/loss
+                effective_wr = opp.estimated_win_rate + (0.07 if boost else 0)
+                if self.rng.random() < effective_wr:
+                    net = self.platforms[opp.platform].apply_win(opp, state, self.rng)
+                    weekly_revenue += net
+                else:
+                    if opp.platform == PlatformName.PPH:
+                        state.pph_losses += 1
+                    elif opp.platform == PlatformName.UPWORK:
+                        state.upwork_losses += 1
+                        # Losing on Upwork slightly decreases JSS (via inactivity)
+                        if self.rng.random() < 0.1:
+                            state.jss_score = max(50, state.jss_score - 0.2)
+
+            # Monthly credit/connect replenishment
+            if week % 4 == 0:
+                state.pph_credits += 150  # Pro subscription monthly
+                state.upwork_connects += 100
+
+            self.results.append(WeekResult(
+                week=week,
+                cash_gbp=state.cash_gbp,
+                weekly_revenue_gbp=weekly_revenue,
+                contracts_won=state.contracts_won,
+                proposals_submitted=state.proposals_submitted,
+                pph_credits_remaining=state.pph_credits,
+                upwork_connects_remaining=state.upwork_connects,
+                jss_score=state.jss_score,
+                fiverr_reviews=state.fiverr_reviews,
+            ))
+
+        return self.results
+
+
+# ============================================================
+# Reporting
+# ============================================================
+def print_report(results: list[WeekResult], strategy_name: str):
+    print(f"\n{'='*70}")
+    print(f"STRATEGY: {strategy_name}")
+    print(f"{'='*70}")
+
+    total_revenue = sum(r.weekly_revenue_gbp for r in results)
+    total_contracts = results[-1].contracts_won if results else 0
+    total_proposals = results[-1].proposals_submitted if results else 0
+
+    print(f"  Total revenue (52 weeks): £{total_revenue:,.0f}")
+    print(f"  Average weekly: £{total_revenue / 52:,.0f}")
+    print(f"  Contracts won: {total_contracts}")
+    print(f"  Proposals submitted: {total_proposals}")
+    if total_proposals > 0:
+        print(f"  Overall win rate: {total_contracts / total_proposals:.1%}")
+
+    # Quarterly breakdown
+    print(f"\n  {'Quarter':<12}{'Revenue':>10}{'Contracts':>12}")
+    for q in range(4):
+        q_weeks = results[q * 13:(q + 1) * 13]
+        q_rev = sum(r.weekly_revenue_gbp for r in q_weeks)
+        q_contracts = (q_weeks[-1].contracts_won - (q_weeks[0].contracts_won if q > 0 else 0))
+        print(f"  Q{q+1:<11}£{q_rev:>9,.0f}{q_contracts:>12}")
+
+    # Monthly cash trajectory
+    print(f"\n  Cash trajectory (month-end):")
+    for m in range(0, 52, 4):
+        if m < len(results):
+            print(f"    Month {m//4 + 1:>2}: £{results[m].cash_gbp:>10,.0f}  "
+                  f"(JSS: {results[m].jss_score:.0f}%, Fiverr reviews: {results[m].fiverr_reviews})")
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    print("=" * 70)
+    print("FREELANCER SIMULATOR — 12-Month Cross-Platform Simulation")
+    print("=" * 70)
+
+    # Define the freelancer
+    profile = FreelancerProfile(
+        name="Alice",
+        hourly_rate_gbp=60,
+        hours_per_week=40,
+        risk_aversion=0.5,
+        skill_level=0.7,
+    )
+
+    # Run three strategies
+    strategies = [
+        (NaiveStrategy(), "Naive (bid everything, no boost)"),
+        (GreedyEVStrategy(), "Greedy EV (bid on highest EV, boost optimally)"),
+        (PortfolioStrategy(), "Portfolio (Greedy EV + Fiverr gig setup)"),
+    ]
+
+    for strategy, name in strategies:
+        sim = Simulation(profile, strategy, n_weeks=52, seed=42)
+        results = sim.run()
+        print_report(results, name)
+
+    # Compare
+    print(f"\n{'='*70}")
+    print(f"STRATEGY COMPARISON")
+    print(f"{'='*70}")
+    print(f"{'Strategy':<45}{'Annual Rev':>12}{'Win Rate':>10}")
+    print("-" * 70)
+    for strategy, name in strategies:
+        sim = Simulation(profile, strategy, n_weeks=52, seed=42)
+        results = sim.run()
+        total_rev = sum(r.weekly_revenue_gbp for r in results)
+        total_props = results[-1].proposals_submitted
+        total_wins = results[-1].contracts_won
+        wr = total_wins / max(total_props, 1)
+        print(f"{name:<45}£{total_rev:>11,.0f}{wr:>9.1%}")
