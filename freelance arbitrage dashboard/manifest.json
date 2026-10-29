@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Freelance EV Arbitrage",
+  "version": "1.0.0",
+  "description": "Computes expected value for freelance job posts on PeoplePerHour, Upwork, and Fiverr. Overlays skip/bid/boost verdicts using a Q-learned bidding policy.",
+  "permissions": ["storage"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.peopleperhour.com/*",
+        "https://www.upwork.com/nx/*",
+        "https://www.upwork.com/job/*",
+        "https://www.upwork.com/fl*",
+        "https://www.fiverr.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
