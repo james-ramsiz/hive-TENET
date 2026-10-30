@@ -82,7 +82,7 @@ def allocate_credits(jobs: list[JobOpportunity], credit_budget: int) -> dict[str
     return {"allocations": allocation, "remaining_credits": remaining, "total_ev": total_ev}
 
 
-# -------------------- demo --------------------
+#  - demo -
 if __name__ == "__main__":
     np.random.seed(7)
     # 20 jobs in the feed this month
