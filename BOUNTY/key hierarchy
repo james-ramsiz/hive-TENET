@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-# -------------------- email normalization --------------------
+# - email normalization -
 def normalize_email(email: str) -> str:
     """
     UID2 normalization rules:
@@ -87,7 +87,7 @@ def _pack_token_header(site_id: int, key_id: int, gen: int, exp: int, id_exp: in
     )
 
 
-# -------------------- operator (minting side) --------------------
+# - operator (minting side) -
 class UID2Operator:
     """
     Runs at TTD (or another trusted operator). Mints tokens and
@@ -181,7 +181,7 @@ class UID2Operator:
         return sk.key  # in real code: encrypt under DSP transport key
 
 
-# -------------------- DSP (decryption side) --------------------
+# - DSP (decryption side) -
 class DSPClient:
     """
     Runs at TTD / any authorized DSP. Holds site keys for publishers
@@ -234,7 +234,7 @@ class DSPClient:
         }
 
 
-# -------------------- demo --------------------
+# - demo -
 if __name__ == "__main__":
     op = UID2Operator()
     op.provision_site(site_id=42)  # publisher "nytimes.com"
