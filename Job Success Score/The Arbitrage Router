@@ -59,7 +59,7 @@ class FreelancerState:
     day_of_week: int = 1                 # 1=Mon ... 7=Sun
 
 
-# -------------------- EV computation --------------------
+# - EV computation -
 def compute_action_ev(
     opp: Opportunity, state: FreelancerState, credit_value_gbp: float = 0.08
 ) -> dict:
@@ -104,7 +104,7 @@ def compute_action_ev(
     }
 
 
-# -------------------- the router --------------------
+# - the router -
 def route_day(
     opportunities: list[Opportunity],
     state: FreelancerState,
@@ -170,7 +170,7 @@ def route_day(
     return schedule
 
 
-# -------------------- demo --------------------
+# - demo -
 if __name__ == "__main__":
     # A realistic morning of opportunities
     opportunities = [
